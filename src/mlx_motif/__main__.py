@@ -73,10 +73,12 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--model-id", default="motif")
     ps.add_argument("--think-mode", default="visible", choices=["visible", "hidden", "captured"])
     ps.set_defaults(
-        func=lambda a: __import__("mlx_motif.server", fromlist=["serve"]).serve(
-            a.model, a.host, a.port, a.model_id, a.think_mode
+        func=lambda a: (
+            __import__("mlx_motif.server", fromlist=["serve"]).serve(
+                a.model, a.host, a.port, a.model_id, a.think_mode
+            )
+            or 0
         )
-        or 0
     )
 
     args = parser.parse_args(argv)

@@ -6,6 +6,48 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.head_ref || '' }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install
+        run: uv sync --extra dev
+
+      - name: Auto-fix lint issues
+        id: autofix
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          uv run ruff check --fix src tests || true
+          uv run ruff format src tests || true
+          if ! git diff --quiet; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit auto-fixes
+        if: steps.autofix.outputs.has_changes == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add -A
+          git diff --staged --quiet || git commit -m "style: auto-fix lint issues"
+          git pull --rebase origin "${{ github.head_ref }}"
+          git push origin "HEAD:${{ github.head_ref }}"
+
+      - name: Lint (strict)
+        run: uv run ruff check src tests
+      - name: Format check (strict)
+        run: uv run ruff format --check src tests
+
   test:
     runs-on: macos-14
     strategy:
@@ -20,7 +62,5 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
       - name: Install
         run: uv sync --extra dev
-      - name: Lint
-        run: uv run ruff check src tests
       - name: Test
         run: uv run pytest -q

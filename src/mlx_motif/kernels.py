@@ -1830,3 +1830,277 @@ def sdpa_dual_v_q4(
         output_dtypes=[q.dtype],
     )[0]
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Dual q4 GEMV (`qmv_dual_q4`) — gate+up MLP fusion
+# --------------------------------------------------------------------------- #
+# STATUS: NEGATIVE RESULT. Kernel is correct but does NOT beat MLX's
+# stock `mx.quantized_matmul × 2` at the decode-time MLP shape on M1 Max.
+# Kept in tree as reference + as the right design for cases where the
+# bandwidth assumption *does* hold (e.g., other Apple chips with smaller
+# L1, or shapes where x doesn't fit in cache).
+#
+# What this attempted. At decode time MotifMLP is `down_proj(act(gate_proj(x))
+# * up_proj(x))`. The gate and up projections are two separate q4 matmuls
+# both reading the SAME `x` (4096-wide). The hypothesis: fuse the two so `x`
+# is loaded into registers once, not twice — same shape of trick as
+# `sdpa_dual_v` (one Q load → two V slabs) applied to MLP.
+#
+# Threadgroup geometry mirrors MLX `qmv_fast_impl`:
+#   2 simdgroups × 32 lanes = 64 threads per threadgroup
+#   Each simdgroup computes 4 output rows ⇒ 8 output rows per threadgroup
+#   For 4-bit, group_size=64: values_per_thread = 16, block_size = 512
+#
+# Why it didn't win on M1 Max:
+# 1. x is 4096 × 2 bytes = 8 KB. M1 Max L1 is 192 KB per core. After the
+#    first matmul, x is hot in L1; the second matmul's "extra" reads of x
+#    are essentially free. The bandwidth-saving thesis was wrong: there
+#    was no x bandwidth to save.
+# 2. The fused kernel doubles per-thread state (result_g[4] + result_u[4]
+#    = 8 fp32 vs MLX's 4) and adds 3 extra pointer chains. Compiler likely
+#    spills, hurting per-iteration throughput.
+# 3. Net measurement (B=1 S=1 IN=4096 OUT=16384, fp16, gs=64): fused 0.24
+#    ms vs 2× sequential 0.22 ms — a 10% loss. At S=4 it's a 7% win
+#    (ratio 0.93×) but at S≥16 it's catastrophic (1.8-3.8× slower) because
+#    MLX's matmul switches to a simdgroup-matrix path my kernel doesn't
+#    mirror.
+#
+# Where this would still be the right design:
+# - Apple chips with smaller L1 where x doesn't stay cached
+# - Shapes where IN > L1 capacity (~96K fp16 elements)
+# - Workloads where we WANT to avoid two dispatches (latency-critical)
+#
+# The actual MLP win on this hardware/shape comes from reducing weight
+# bandwidth (the dominant cost): see the `mlp_lowbit` quantization
+# preset in `quant.py` (q3 gs=32 for MLP weights), which gets a real
+# +X% end-to-end at decode by cutting 25% of weight bytes.
+#
+# Inlined helpers below are 4-bit-only specialisations of MLX's
+# `load_vector` and `qdot` from mlx/backend/metal/kernels/quantized.h.
+# We duplicate rather than `#include` because mx.fast.metal_kernel
+# doesn't expose MLX's internal headers to user kernels.
+
+_QMV_DUAL_HEADER = r"""
+template <typename T, typename U, int values_per_thread>
+inline U load_vector_q4(const device T* x, thread U* x_thread) {
+    U sum = 0;
+    for (int i = 0; i < values_per_thread; i += 4) {
+        sum += float(x[i]) + float(x[i+1]) + float(x[i+2]) + float(x[i+3]);
+        x_thread[i  ] = float(x[i]);
+        x_thread[i+1] = float(x[i+1]) / 16.0f;
+        x_thread[i+2] = float(x[i+2]) / 256.0f;
+        x_thread[i+3] = float(x[i+3]) / 4096.0f;
+    }
+    return sum;
+}
+
+template <typename U, int values_per_thread>
+inline U qdot_q4(const device uint8_t* w,
+                 const thread U* x_thread,
+                 U scale, U bias, U sum) {
+    U accum = 0;
+    const device uint16_t* ws = (const device uint16_t*)w;
+    for (int i = 0; i < (values_per_thread / 4); i++) {
+        accum += (x_thread[4*i  ] * float(ws[i] & 0x000fu) +
+                  x_thread[4*i+1] * float(ws[i] & 0x00f0u) +
+                  x_thread[4*i+2] * float(ws[i] & 0x0f00u) +
+                  x_thread[4*i+3] * float(ws[i] & 0xf000u));
+    }
+    return scale * accum + sum * bias;
+}
+"""
+
+
+_QMV_DUAL_SRC = r"""
+    constexpr int packs_per_thread       = 2;
+    constexpr int num_simdgroups         = 2;
+    constexpr int results_per_simdgroup  = 4;
+    constexpr int pack_factor            = 8;     // bits=4 ⇒ 8 nibbles per uint32
+    constexpr int bytes_per_pack         = 4;
+    constexpr int values_per_thread      = pack_factor * packs_per_thread;  // 16
+    constexpr int simd_size              = 32;
+    constexpr int block_size             = values_per_thread * simd_size;   // 512
+    constexpr int scale_step_per_thread  = GROUP_SIZE / values_per_thread;  // 4 for gs=64
+
+    typedef float U;
+
+    uint3 tid     = threadgroup_position_in_grid;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint simd_lid = thread_index_in_simdgroup;
+
+    const device uint8_t* gate_ws = (const device uint8_t*)gate_data;
+    const device uint8_t* up_ws   = (const device uint8_t*)up_data;
+    const device T*       g_s     = gate_scales;
+    const device T*       g_b     = gate_biases;
+    const device T*       u_s     = up_scales;
+    const device T*       u_b     = up_biases;
+
+    const int in_vec_size_w = IN * bytes_per_pack / pack_factor;
+    const int in_vec_size_g = IN / GROUP_SIZE;
+    const int out_row = tid.y * (num_simdgroups * results_per_simdgroup)
+                      + simd_gid * results_per_simdgroup;
+
+    gate_ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+    g_s     += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    g_b     += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+    up_ws   += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+    u_s     += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+    u_b     += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+
+    const device T* x_p = x + tid.x * IN + simd_lid * values_per_thread;
+    device T* gy_p = gate_y + tid.x * OUT + out_row;
+    device T* uy_p = up_y   + tid.x * OUT + out_row;
+
+    thread U x_thread[values_per_thread];
+    thread U result_g[results_per_simdgroup] = {0};
+    thread U result_u[results_per_simdgroup] = {0};
+
+    for (int k = 0; k < IN; k += block_size) {
+        // ONE x load drives both qdots — the whole reason this kernel exists.
+        U sum = load_vector_q4<T, U, values_per_thread>(x_p, x_thread);
+
+        // Two consecutive single-tensor passes share x_thread but minimise
+        // simultaneous live register pressure (vs interleaving rows).
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            const device uint8_t* gw = gate_ws + row * in_vec_size_w;
+            U gs_v = U(g_s[row * in_vec_size_g]);
+            U gb_v = U(g_b[row * in_vec_size_g]);
+            result_g[row] += qdot_q4<U, values_per_thread>(gw, x_thread, gs_v, gb_v, sum);
+        }
+        for (int row = 0; row < results_per_simdgroup; row++) {
+            const device uint8_t* uw = up_ws + row * in_vec_size_w;
+            U us_v = U(u_s[row * in_vec_size_g]);
+            U ub_v = U(u_b[row * in_vec_size_g]);
+            result_u[row] += qdot_q4<U, values_per_thread>(uw, x_thread, us_v, ub_v, sum);
+        }
+
+        gate_ws += block_size * bytes_per_pack / pack_factor;
+        up_ws   += block_size * bytes_per_pack / pack_factor;
+        g_s     += block_size / GROUP_SIZE;
+        g_b     += block_size / GROUP_SIZE;
+        u_s     += block_size / GROUP_SIZE;
+        u_b     += block_size / GROUP_SIZE;
+        x_p     += block_size;
+    }
+
+    for (int row = 0; row < results_per_simdgroup; row++) {
+        result_g[row] = simd_sum(result_g[row]);
+        result_u[row] = simd_sum(result_u[row]);
+        if (simd_lid == 0) {
+            gy_p[row] = static_cast<T>(result_g[row]);
+            uy_p[row] = static_cast<T>(result_u[row]);
+        }
+    }
+"""
+
+
+def _make_qmv_dual_kernel():
+    return mx.fast.metal_kernel(
+        name="motif_qmv_dual_q4",
+        input_names=[
+            "x",
+            "gate_data", "gate_scales", "gate_biases",
+            "up_data", "up_scales", "up_biases",
+        ],
+        output_names=["gate_y", "up_y"],
+        source=_QMV_DUAL_SRC,
+        header=_QMV_DUAL_HEADER,
+    )
+
+
+_qmv_dual_kernel = None
+
+
+def qmv_dual_q4_reference(
+    x: mx.array,
+    gate_q: tuple,
+    up_q: tuple,
+    group_size: int = 64,
+    bits: int = 4,
+) -> tuple:
+    """Pure-MLX reference: two `mx.quantized_matmul` calls."""
+    gate_y = mx.quantized_matmul(
+        x, *gate_q, transpose=True, group_size=group_size, bits=bits,
+    )
+    up_y = mx.quantized_matmul(
+        x, *up_q, transpose=True, group_size=group_size, bits=bits,
+    )
+    return gate_y, up_y
+
+
+def qmv_dual_q4(
+    x: mx.array,
+    gate_q: tuple,
+    up_q: tuple,
+    group_size: int = 64,
+    bits: int = 4,
+) -> tuple:
+    """Fused gate+up q4 GEMV (decode-time MLP front-half).
+
+    Args:
+        x: activation, shape `(..., IN)`, fp16/bf16/fp32.
+        gate_q, up_q: each is a `(data, scales, biases)` triple from
+            `mx.quantize` of an `(OUT, IN)` weight matrix. Both must
+            share the same OUT/IN dims, group_size, and bit width.
+        group_size: must divide IN and equal `qdot`'s scale_step assumption
+            (64 in the current kernel hard-coding).
+        bits: 4 only for now.
+
+    Returns:
+        `(gate_y, up_y)` — each shape `(..., OUT)`, dtype matches `x`.
+
+    Constraints (asserted):
+        - bits == 4 (the helper inlines the 4-bit `qdot` only)
+        - IN % 512 == 0  (block_size for `qmv_fast`)
+        - OUT % 8 == 0   (one threadgroup emits 8 rows)
+        - group_size == 64 (kernel hard-codes scale_step_per_thread)
+    """
+    if _DISABLE:
+        return qmv_dual_q4_reference(x, gate_q, up_q, group_size, bits)
+
+    assert bits == 4, "qmv_dual_q4 currently 4-bit only"
+    assert group_size == 64, "qmv_dual_q4 currently group_size=64 only"
+
+    gate_data, gate_scales, gate_biases = gate_q
+    up_data, up_scales, up_biases = up_q
+
+    OUT, IN_packed = gate_data.shape[-2], gate_data.shape[-1]
+    IN = IN_packed * (32 // bits)  # 8 for 4-bit
+    assert up_data.shape == gate_data.shape, "gate/up weight shapes must match"
+    assert IN % 512 == 0, f"IN={IN} must be divisible by block_size=512"
+    assert OUT % 8 == 0, f"OUT={OUT} must be divisible by 8 (one threadgroup tile)"
+    assert x.shape[-1] == IN, f"x last dim {x.shape[-1]} != IN {IN}"
+
+    global _qmv_dual_kernel
+    if _qmv_dual_kernel is None:
+        _qmv_dual_kernel = _make_qmv_dual_kernel()
+
+    *lead, in_dim = x.shape
+    rows = 1
+    for n in lead:
+        rows *= n
+    if rows == 0:
+        return mx.zeros((*lead, OUT), dtype=x.dtype), mx.zeros((*lead, OUT), dtype=x.dtype)
+
+    x_flat = x.reshape(rows, IN)
+
+    # Threadgroup: 32 lanes × 2 simdgroups; tid.x = batch row, tid.y = output tile.
+    tiles = OUT // 8
+    threadgroup = (32, 2, 1)
+    grid = (32 * rows, 2 * tiles, 1)
+
+    gate_y, up_y = _qmv_dual_kernel(
+        inputs=[
+            x_flat,
+            gate_data, gate_scales, gate_biases,
+            up_data, up_scales, up_biases,
+        ],
+        template=[("T", x.dtype), ("IN", IN), ("OUT", OUT), ("GROUP_SIZE", group_size)],
+        grid=grid,
+        threadgroup=threadgroup,
+        output_shapes=[(rows, OUT), (rows, OUT)],
+        output_dtypes=[x.dtype, x.dtype],
+    )
+    return gate_y.reshape(*lead, OUT), up_y.reshape(*lead, OUT)

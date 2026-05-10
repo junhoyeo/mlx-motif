@@ -10,6 +10,8 @@ via the `MLX_MOTIF_DISABLE_KERNELS` environment variable.
 Public API:
     polynorm(x, weight, bias, eps) -> mx.array
     polynorm_reference(x, weight, bias, eps) -> mx.array
+    polynorm_mul(gate, up, weight, bias, eps) -> mx.array
+    polynorm_mul_reference(gate, up, weight, bias, eps) -> mx.array
     gda_post(merged, subln_weight, lambda_full, lambda_init, q_groups, gr, eps) -> mx.array
     gda_post_reference(...) -> mx.array
     gda_decode(q1, q2, k1, k2, v1, v2, subln_weight,
@@ -178,6 +180,139 @@ def polynorm(
         output_dtypes=[x.dtype],
     )[0]
     return out.reshape(*x.shape)
+
+
+# --------------------------------------------------------------------------- #
+# Fused PolyNorm × up (MLP gate-and-up fusion)
+# --------------------------------------------------------------------------- #
+#
+# Replaces the two-step `polynorm(gate) * up` in MotifMLP with a single
+# kernel that streams `gate` and `up` once, computes PolyNorm in registers,
+# and writes only the final product. Saves one intermediate write + read of
+# a (B*S, intermediate_size) tensor — at the 12.7B layout that's
+# (B*S, 16384) per layer, ~32 KB/token at bf16, 1.3 MB/token across 40 layers.
+
+_POLYNORM_MUL_SRC = r"""
+    uint row    = threadgroup_position_in_grid.x;
+    uint tid    = thread_position_in_threadgroup.x;
+    uint tgsize = threads_per_threadgroup.x;
+
+    const device T* g_row = gate + row * D;
+    const device T* u_row = up   + row * D;
+    device T*       y_row = y    + row * D;
+
+    // Pass 1: per-thread partial sums of x^2, x^4, x^6 over a strided slice.
+    float s2 = 0.0f, s4 = 0.0f, s6 = 0.0f;
+    for (uint i = tid; i < D; i += tgsize) {
+        float v  = float(g_row[i]);
+        float v2 = v * v;
+        float v4 = v2 * v2;
+        s2 += v2;
+        s4 += v4;
+        s6 += v4 * v2;
+    }
+
+    threadgroup float tg_s2[32], tg_s4[32], tg_s6[32];
+    float r2 = simd_sum(s2), r4 = simd_sum(s4), r6 = simd_sum(s6);
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint lane  = thread_index_in_simdgroup;
+    if (lane == 0) {
+        tg_s2[sg_id] = r2;
+        tg_s4[sg_id] = r4;
+        tg_s6[sg_id] = r6;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg_id == 0) {
+        uint n_sg = simdgroups_per_threadgroup;
+        float v2 = (lane < n_sg) ? tg_s2[lane] : 0.0f;
+        float v4 = (lane < n_sg) ? tg_s4[lane] : 0.0f;
+        float v6 = (lane < n_sg) ? tg_s6[lane] : 0.0f;
+        v2 = simd_sum(v2);
+        v4 = simd_sum(v4);
+        v6 = simd_sum(v6);
+        if (lane == 0) {
+            tg_s2[0] = v2;
+            tg_s4[0] = v4;
+            tg_s6[0] = v6;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_d = 1.0f / float(D);
+    float eps = float(eps_in[0]);
+    float rs2 = metal::rsqrt(tg_s2[0] * inv_d + eps);
+    float rs4 = metal::rsqrt(tg_s4[0] * inv_d + eps);
+    float rs6 = metal::rsqrt(tg_s6[0] * inv_d + eps);
+
+    float w0 = float(weight[0]);
+    float w1 = float(weight[1]);
+    float w2 = float(weight[2]);
+    float b  = float(bias[0]);
+
+    // Pass 2: emit PolyNorm(gate) * up fused.
+    for (uint i = tid; i < D; i += tgsize) {
+        float v  = float(g_row[i]);
+        float v2 = v * v;
+        float v3 = v2 * v;
+        float pn = w0 * (v3 * rs6) + w1 * (v2 * rs4) + w2 * (v * rs2) + b;
+        y_row[i] = T(pn * float(u_row[i]));
+    }
+"""
+
+
+def _make_polynorm_mul_kernel():
+    return mx.fast.metal_kernel(
+        name="motif_polynorm_mul",
+        input_names=["gate", "up", "weight", "bias", "eps_in"],
+        output_names=["y"],
+        source=_POLYNORM_MUL_SRC,
+    )
+
+
+_polynorm_mul_kernel = None
+
+
+def polynorm_mul_reference(
+    gate: mx.array, up: mx.array, weight: mx.array, bias: mx.array, eps: float
+) -> mx.array:
+    """Pure-MLX equivalent: PolyNorm(gate) * up."""
+    return polynorm_reference(gate, weight, bias, eps) * up
+
+
+def polynorm_mul(
+    gate: mx.array, up: mx.array, weight: mx.array, bias: mx.array, eps: float = 1e-6
+) -> mx.array:
+    if _DISABLE:
+        return polynorm_mul_reference(gate, up, weight, bias, eps)
+
+    global _polynorm_mul_kernel
+    if _polynorm_mul_kernel is None:
+        _polynorm_mul_kernel = _make_polynorm_mul_kernel()
+
+    *lead, D = gate.shape
+    rows = 1
+    for n in lead:
+        rows *= n
+    if rows == 0:
+        return mx.zeros_like(gate)
+
+    g_flat = gate.reshape(rows, D)
+    u_flat = up.reshape(rows, D)
+    tg = min(256, max(32, ((D + 31) // 32) * 32))
+    grid = (rows * tg, 1, 1)
+    threadgroup = (tg, 1, 1)
+
+    eps_arr = mx.array([eps], dtype=mx.float32)
+    out = _polynorm_mul_kernel(
+        inputs=[g_flat, u_flat, weight.astype(gate.dtype), bias.astype(gate.dtype), eps_arr],
+        template=[("T", gate.dtype), ("D", D)],
+        grid=grid,
+        threadgroup=threadgroup,
+        output_shapes=[(rows, D)],
+        output_dtypes=[gate.dtype],
+    )[0]
+    return out.reshape(*gate.shape)
 
 
 # --------------------------------------------------------------------------- #

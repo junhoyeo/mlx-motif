@@ -113,6 +113,17 @@ def get_activation(name: str) -> nn.Module:
 
 
 class MotifMLP(nn.Module):
+    """
+    Gated MLP with a poly-norm activation.
+
+    NOTE: a fused `polynorm(gate) * up` kernel exists in `kernels.py`
+    (`polynorm_mul`) but bench-shows ~7% slower than the separate
+    `polynorm + mul` path here on M1 Max. MLX's lazy graph appears to
+    already fuse the elementwise multiply into the down_proj matmul's
+    input handling more effectively than a single big custom kernel.
+    Keeping the simple two-call form as the default.
+    """
+
     def __init__(self, args: ModelArgs):
         super().__init__()
         h, i = args.hidden_size, args.intermediate_size

@@ -1,0 +1,17 @@
+.models/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.coverage
+.DS_Store
+.envrc
+.env
+*.safetensors
+.omc/
+.claude/

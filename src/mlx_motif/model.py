@@ -607,6 +607,12 @@ class Model(nn.Module):
         Two wins stacked:
           1. ~10% on the qkv matmul (sweet-spot output dim)
           2. ~316 µs/layer saved by eliminating the Q split materialisation
+
+        Skips fusion if the three projections were quantized at different
+        bit widths (e.g., the `mixed` preset that keeps q_proj at 6-bit
+        and k/v at 4-bit). Concatenating different-width packed weights
+        is not supported; the per-layer Q origin-first permutation also
+        becomes irrelevant since q_proj stays its own QuantizedLinear.
         """
         if not self.args.is_grouped:
             return
@@ -614,6 +620,13 @@ class Model(nn.Module):
             attn = layer.self_attn
             q, k, v = attn.q_proj, attn.k_proj, attn.v_proj
             quantized = isinstance(q, nn.QuantizedLinear)
+            if quantized and not (q.bits == k.bits == v.bits and
+                                   q.group_size == k.group_size == v.group_size):
+                # Mixed-precision quant: skip fusion. Forward path falls
+                # back to three separate QuantizedLinear calls, which is
+                # ~10% slower at this op but preserves the per-layer bit
+                # budget the convert step chose.
+                continue
             in_dim = q.weight.shape[1] * (32 // q.bits if quantized else 1)
 
             # Permute Q rows so origin heads come first.

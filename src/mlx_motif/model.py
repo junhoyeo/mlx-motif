@@ -379,10 +379,11 @@ class MotifAttention(nn.Module):
             v2 = _repeat(v2, self.kv_repeat, axis=1)
 
         # Available flash kernels:
-        #   gda_decode      : original serial-per-thread (correct, slow)
-        #   sdpa_dual_v     : shared-QK dual-V SDPA (NEW, default at decode)
+        #   gda_decode        : original serial-per-thread (correct, slow)
+        #   sdpa_dual_v       : shared-QK dual-V SDPA (default at decode)
+        #   gda_post_split    : split-input post-reduction (avoids concat)
         # See kernels.py docstrings for design notes.
-        from mlx_motif.kernels import gda_decode, gda_post, sdpa_dual_v
+        from mlx_motif.kernels import gda_decode, gda_post, gda_post_split, sdpa_dual_v
 
         lam = self._lambda_full(mx.float32).reshape(1)
         use_serial_flash = (
@@ -410,10 +411,12 @@ class MotifAttention(nn.Module):
             # Noise call: 8 Q heads, 8 KV heads (gqa=1).
             attn_origin = sdpa_dual_v(q1, k1, v1, v2, self.scale)  # GQA=gr
             attn_noise  = sdpa_dual_v(q2, k2, v1, v2, self.scale)  # GQA=1
-            merged = mx.concatenate([attn_origin, attn_noise], axis=1)
-            out = gda_post(
-                merged, self.subln.weight, lam, self.lambda_init,
-                q_groups, gr, eps=self.args.attn_rms_norm_eps,
+            # Skip the (B, q_origin+q_groups, S, 2d) concat — gda_post_split
+            # reads attn_o and attn_n separately and broadcasts noise heads
+            # via index inside the kernel. Saves a 316us-class allocation.
+            out = gda_post_split(
+                attn_origin, attn_noise, self.subln.weight, lam, self.lambda_init,
+                gr, eps=self.args.attn_rms_norm_eps,
             )
         else:
             if kr == 1:

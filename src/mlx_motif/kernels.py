@@ -422,6 +422,151 @@ def gda_post_reference(
     return diff * rms_inv * subln_weight * (1.0 - lambda_init)
 
 
+# --------------------------------------------------------------------------- #
+# Fused split-input GDA post-reduction (avoids the noise-into-merged concat)
+# --------------------------------------------------------------------------- #
+
+_GDA_POST_SPLIT_SRC = r"""
+    // Same as gda_post but reads attn_o (B, q_origin, S, 2d) and
+    // attn_n (B, q_groups, S, 2d) as separate buffers — saves the
+    // (B, q_origin+q_groups, S, 2d) concat allocation upstream.
+    uint row     = threadgroup_position_in_grid.x;
+    uint tid     = thread_position_in_threadgroup.x;
+    uint tgsize  = threads_per_threadgroup.x;
+
+    uint hs    = (Q_ORIGIN * S);
+    uint b     = row / hs;
+    uint hosx  = row - b * hs;
+    uint h_o   = hosx / S;
+    uint s     = hosx - h_o * S;
+    uint h_n   = h_o / GR;       // noise head index (0..q_groups-1)
+
+    const device T* row_o = attn_o + (((b * Q_ORIGIN + h_o) * S) + s) * CHANNELS;
+    const device T* row_n = attn_n + (((b * Q_GROUPS + h_n) * S) + s) * CHANNELS;
+    device T*       row_y = y      + (((b * Q_ORIGIN + h_o) * S) + s) * CHANNELS;
+
+    float lam   = float(lambda_full[0]);
+    float scale = float(scale_in[0]);
+    float eps   = float(eps_in[0]);
+
+    float ssq = 0.0f;
+    for (uint i = tid; i < CHANNELS; i += tgsize) {
+        float d = float(row_o[i]) - lam * float(row_n[i]);
+        ssq += d * d;
+    }
+
+    threadgroup float tg_partial[32];
+    float r = simd_sum(ssq);
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint lane  = thread_index_in_simdgroup;
+    if (lane == 0) tg_partial[sg_id] = r;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0) {
+        uint n_sg = simdgroups_per_threadgroup;
+        float v = (lane < n_sg) ? tg_partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0) tg_partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_inv = metal::rsqrt(tg_partial[0] / float(CHANNELS) + eps);
+
+    for (uint i = tid; i < CHANNELS; i += tgsize) {
+        float d  = float(row_o[i]) - lam * float(row_n[i]);
+        float sw = float(subln_w[i]);
+        row_y[i] = T(d * rms_inv * sw * scale);
+    }
+"""
+
+
+def _make_gda_post_split_kernel():
+    return mx.fast.metal_kernel(
+        name="motif_gda_post_split",
+        input_names=["attn_o", "attn_n", "subln_w", "lambda_full", "scale_in", "eps_in"],
+        output_names=["y"],
+        source=_GDA_POST_SPLIT_SRC,
+    )
+
+
+_gda_post_split_kernel = None
+
+
+def gda_post_split_reference(
+    attn_o: mx.array,
+    attn_n: mx.array,
+    subln_weight: mx.array,
+    lambda_full: mx.array,
+    lambda_init: float,
+    gr: int,
+    eps: float,
+) -> mx.array:
+    """Pure-MLX reference: matches gda_post_reference but takes split inputs."""
+    n_broadcast = mx.repeat(attn_n, gr, axis=1)
+    diff = attn_o - lambda_full * n_broadcast
+    rms_inv = mx.rsqrt(mx.mean(diff * diff, axis=-1, keepdims=True) + eps)
+    return diff * rms_inv * subln_weight * (1.0 - lambda_init)
+
+
+def gda_post_split(
+    attn_o: mx.array,
+    attn_n: mx.array,
+    subln_weight: mx.array,
+    lambda_full: mx.array,
+    lambda_init: float,
+    gr: int,
+    eps: float = 1e-5,
+) -> mx.array:
+    """
+    Same fused reduction as `gda_post` but reads `attn_o` (B, q_origin, S, 2d)
+    and `attn_n` (B, q_groups, S, 2d) as separate inputs — no upstream
+    `mx.concatenate` needed.
+    """
+    if _DISABLE:
+        return gda_post_split_reference(
+            attn_o, attn_n, subln_weight, lambda_full, lambda_init, gr, eps
+        )
+
+    global _gda_post_split_kernel
+    if _gda_post_split_kernel is None:
+        _gda_post_split_kernel = _make_gda_post_split_kernel()
+
+    B, q_origin, S, channels = attn_o.shape
+    _, q_groups, _, _ = attn_n.shape
+    assert q_origin == q_groups * gr, (
+        f"q_origin={q_origin} != q_groups({q_groups}) * gr({gr})"
+    )
+
+    rows = B * q_origin * S
+    tg = min(256, max(32, ((channels + 31) // 32) * 32))
+    grid = (rows * tg, 1, 1)
+    threadgroup = (tg, 1, 1)
+
+    scale = mx.array([1.0 - lambda_init], dtype=mx.float32)
+    eps_arr = mx.array([eps], dtype=mx.float32)
+
+    out = _gda_post_split_kernel(
+        inputs=[
+            attn_o, attn_n,
+            subln_weight.astype(attn_o.dtype),
+            lambda_full.astype(mx.float32),
+            scale, eps_arr,
+        ],
+        template=[
+            ("T", attn_o.dtype),
+            ("Q_ORIGIN", q_origin),
+            ("Q_GROUPS", q_groups),
+            ("GR", gr),
+            ("S", S),
+            ("CHANNELS", channels),
+        ],
+        grid=grid,
+        threadgroup=threadgroup,
+        output_shapes=[(B, q_origin, S, channels)],
+        output_dtypes=[attn_o.dtype],
+    )[0]
+    return out
+
+
 def gda_post(
     merged: mx.array,
     subln_weight: mx.array,

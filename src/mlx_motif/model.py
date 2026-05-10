@@ -345,20 +345,40 @@ class MotifAttention(nn.Module):
 
         offset = cache.offset if cache is not None else 0
         q = self.rope(q, offset=offset)
-        k = self.rope(k, offset=offset)
 
-        if cache is not None:
-            k, v = cache.update_and_fetch(k, v)
-            k, v = _maybe_dequant_kv(k, v, cache)
+        # 4-slot cache (MotifGroupedKVCache / MotifGroupedQuantizedKVCache)
+        # short-circuits the standard k/v cache + post-fetch split. We split
+        # k/v on the head axis here, RoPE k1/k2 separately, and cache 4 slots.
+        from mlx_motif.cache import MotifGroupedKVCache, MotifGroupedQuantizedKVCache
+        gr = self.grouped_ratio
+        q_groups = self.q_heads // (gr + 1)
+        kr = self.k_ratio
+        k_groups = self.num_kv_heads // (kr + 1)
+        is_4slot = isinstance(cache, (MotifGroupedKVCache, MotifGroupedQuantizedKVCache))
 
-        kv_seq = k.shape[2]
+        if is_4slot:
+            # Pre-cache split.
+            k_pre = k.reshape(B, k_groups, kr + 1, S, d)
+            k1_new = k_pre[:, :, :kr, :, :].reshape(B, k_groups * kr, S, d)
+            k2_new = k_pre[:, :, kr:, :, :].reshape(B, k_groups, S, d)
+            v_pre = v.reshape(B, self.k_noise_heads, 2, S, d)
+            v1_new = v_pre[:, :, 0, :, :]
+            v2_new = v_pre[:, :, 1, :, :]
+            k1_new = self.rope(k1_new, offset=offset)
+            k2_new = self.rope(k2_new, offset=offset)
+            k1, k2, v1, v2 = cache.update_and_fetch_4(k1_new, k2_new, v1_new, v2_new)
+            kv_seq = cache.offset
+        else:
+            k = self.rope(k, offset=offset)
+            if cache is not None:
+                k, v = cache.update_and_fetch(k, v)
+                k, v = _maybe_dequant_kv(k, v, cache)
+            kv_seq = k.shape[2]
 
         # Split q on the head axis. Two layouts:
         #   - origin-first (after fuse_qkv): q is [origin | noise], plain slice
         #   - HF stripe layout: q is [g0_o..g0_o, g0_n, g1_o..g1_o, g1_n, ..],
-        #     which forces a memory-copy reshape (~316 µs/layer).
-        gr = self.grouped_ratio
-        q_groups = self.q_heads // (gr + 1)
+        #     which forces a memory-copy reshape.
         if self._q_origin_first:
             q1 = q[:, : q_groups * gr, :, :]
             q2 = q[:, q_groups * gr :, :, :]
@@ -367,17 +387,15 @@ class MotifAttention(nn.Module):
             q1 = q_[:, :, :gr, :, :].reshape(B, q_groups * gr, S, d)
             q2 = q_[:, :, gr:, :, :].reshape(B, q_groups, S, d)
 
-        # Split k similarly with k_ratio
-        kr = self.k_ratio
-        k_groups = self.num_kv_heads // (kr + 1)
-        k_ = k.reshape(B, k_groups, kr + 1, kv_seq, d)
-        k1 = k_[:, :, :kr, :, :].reshape(B, k_groups * kr, kv_seq, d)
-        k2 = k_[:, :, kr:, :, :].reshape(B, k_groups, kv_seq, d)
-
-        # Split v with grouped_ratio=1 (always two groups of equal size = k_noise_heads each)
-        v_ = v.reshape(B, self.k_noise_heads, 2, kv_seq, d)
-        v1 = v_[:, :, 0, :, :]
-        v2 = v_[:, :, 1, :, :]
+        if not is_4slot:
+            # Split k similarly with k_ratio
+            k_ = k.reshape(B, k_groups, kr + 1, kv_seq, d)
+            k1 = k_[:, :, :kr, :, :].reshape(B, k_groups * kr, kv_seq, d)
+            k2 = k_[:, :, kr:, :, :].reshape(B, k_groups, kv_seq, d)
+            # Split v with grouped_ratio=1 (always two equal halves of k_noise_heads each)
+            v_ = v.reshape(B, self.k_noise_heads, 2, kv_seq, d)
+            v1 = v_[:, :, 0, :, :]
+            v2 = v_[:, :, 1, :, :]
 
         # Concat along the head axis to feed two SDPAs that share a queries-and-keys layout.
         q_f = mx.concatenate([q1, q2], axis=1)
@@ -525,6 +543,36 @@ class Model(nn.Module):
         # matches `num_key_value_heads` for both vanilla and grouped variants
         # (vanilla halves it internally but stores 2× heads of width d).
         return self.args.num_key_value_heads
+
+    def make_cache(self):
+        """Override mlx-lm's default cache construction.
+
+        For grouped-attention layers, return a `MotifGroupedKVCache` (4 slots)
+        if `MLX_MOTIF_4SLOT_CACHE=1`. The 4-slot path lets the per-step head
+        split happen BEFORE caching, so each layer's K and V live as
+        independent k1/k2/v1/v2 tensors instead of being re-sliced post-fetch.
+
+        With `MLX_MOTIF_4SLOT_CACHE=q4` the slots are quantized to 4-bit
+        (group_size=64); `=q8` for 8-bit. Quantized variant trades a per-step
+        dequant for ~4× cache memory at long context.
+        """
+        from mlx_lm.models.cache import KVCache
+        from mlx_motif.cache import MotifGroupedKVCache, MotifGroupedQuantizedKVCache
+
+        env = os.environ.get("MLX_MOTIF_4SLOT_CACHE", "0").lower()
+        use_4slot = env not in ("0", "", "false", "off")
+        caches = []
+        for layer in self.layers:
+            if use_4slot and self.args.is_grouped:
+                if env in ("q4", "4"):
+                    caches.append(MotifGroupedQuantizedKVCache(group_size=64, bits=4))
+                elif env in ("q8", "8"):
+                    caches.append(MotifGroupedQuantizedKVCache(group_size=64, bits=8))
+                else:
+                    caches.append(MotifGroupedKVCache())
+            else:
+                caches.append(KVCache())
+        return caches
 
     @staticmethod
     def _origin_first_perm(q_groups: int, gr: int, d: int) -> mx.array:

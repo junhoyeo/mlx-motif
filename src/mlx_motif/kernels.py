@@ -1,0 +1,343 @@
+"""
+Custom Metal kernels for the Motif port.
+
+Each kernel ships with a pure-MLX reference and a small validator. On the
+M1/M1 Max chips there is a known `mx.fast.metal_kernel` correctness bug
+(ml-explore/mlx#2205); we therefore numerically validate every kernel
+against its reference and fall back to MLX ops if the kernel is disabled
+via the `MLX_MOTIF_DISABLE_KERNELS` environment variable.
+
+Public API:
+    polynorm(x, weight, bias, eps) -> mx.array
+    polynorm_reference(x, weight, bias, eps) -> mx.array
+    gda_post(merged, subln_weight, lambda_full, lambda_init, q_groups, gr, eps) -> mx.array
+    gda_post_reference(...) -> mx.array
+"""
+
+from __future__ import annotations
+
+import os
+
+import mlx.core as mx
+
+_DISABLE = os.environ.get("MLX_MOTIF_DISABLE_KERNELS", "0") not in ("0", "", "false", "False")
+
+
+# --------------------------------------------------------------------------- #
+# PolyNorm
+# --------------------------------------------------------------------------- #
+#
+# y = w0 * (x^3 / sqrt(mean(x^6) + eps))
+#   + w1 * (x^2 / sqrt(mean(x^4) + eps))
+#   + w2 * (x   / sqrt(mean(x^2) + eps))
+#   + b
+#
+# `mean` is over the last axis (channel dim D). One threadgroup per (B*S) row.
+
+
+_POLYNORM_SRC = r"""
+    // Each threadgroup handles one row of length D.
+    uint row = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint tgsize = threads_per_threadgroup.x;
+
+    const device T* xrow = x + row * D;
+    device T*       yrow = y + row * D;
+
+    // Per-thread partial sums of x^2, x^4, x^6 over a strided slice of the row.
+    float s2 = 0.0f, s4 = 0.0f, s6 = 0.0f;
+    for (uint i = tid; i < D; i += tgsize) {
+        float v  = float(xrow[i]);
+        float v2 = v * v;
+        float v4 = v2 * v2;
+        s2 += v2;
+        s4 += v4;
+        s6 += v4 * v2;
+    }
+
+    // Threadgroup reduction via simd_sum + threadgroup buffer.
+    threadgroup float tg_s2[32];
+    threadgroup float tg_s4[32];
+    threadgroup float tg_s6[32];
+
+    float r2 = simd_sum(s2);
+    float r4 = simd_sum(s4);
+    float r6 = simd_sum(s6);
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint lane  = thread_index_in_simdgroup;
+    if (lane == 0) {
+        tg_s2[sg_id] = r2;
+        tg_s4[sg_id] = r4;
+        tg_s6[sg_id] = r6;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Final reduction across simdgroups (handled by the first simdgroup).
+    if (sg_id == 0) {
+        uint n_sg = simdgroups_per_threadgroup;
+        float v2 = (lane < n_sg) ? tg_s2[lane] : 0.0f;
+        float v4 = (lane < n_sg) ? tg_s4[lane] : 0.0f;
+        float v6 = (lane < n_sg) ? tg_s6[lane] : 0.0f;
+        v2 = simd_sum(v2);
+        v4 = simd_sum(v4);
+        v6 = simd_sum(v6);
+        if (lane == 0) {
+            tg_s2[0] = v2;
+            tg_s4[0] = v4;
+            tg_s6[0] = v6;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_d = 1.0f / float(D);
+    float eps = float(eps_in[0]);
+    float rs2 = metal::rsqrt(tg_s2[0] * inv_d + eps);
+    float rs4 = metal::rsqrt(tg_s4[0] * inv_d + eps);
+    float rs6 = metal::rsqrt(tg_s6[0] * inv_d + eps);
+
+    float w0 = float(weight[0]);
+    float w1 = float(weight[1]);
+    float w2 = float(weight[2]);
+    float b  = float(bias[0]);
+
+    for (uint i = tid; i < D; i += tgsize) {
+        float v  = float(xrow[i]);
+        float v2 = v * v;
+        float v3 = v2 * v;
+        float out = w0 * (v3 * rs6) + w1 * (v2 * rs4) + w2 * (v * rs2) + b;
+        yrow[i] = T(out);
+    }
+"""
+
+
+def _make_polynorm_kernel():
+    return mx.fast.metal_kernel(
+        name="motif_polynorm",
+        input_names=["x", "weight", "bias", "eps_in"],
+        output_names=["y"],
+        source=_POLYNORM_SRC,
+    )
+
+
+_polynorm_kernel = None
+
+
+def polynorm_reference(
+    x: mx.array, weight: mx.array, bias: mx.array, eps: float
+) -> mx.array:
+    """Pure-MLX reference, mathematically identical to the kernel."""
+    def _rms(z):
+        return z * mx.rsqrt(mx.mean(z * z, axis=-1, keepdims=True) + eps)
+
+    x2 = x * x
+    x3 = x2 * x
+    return weight[0] * _rms(x3) + weight[1] * _rms(x2) + weight[2] * _rms(x) + bias
+
+
+def polynorm(
+    x: mx.array, weight: mx.array, bias: mx.array, eps: float = 1e-6
+) -> mx.array:
+    """
+    Fused PolyNorm. Falls back to the reference if kernels are disabled.
+
+    Shape contract: `x` is (..., D); `weight` is (3,); `bias` is (1,); reduces
+    over the last axis.
+    """
+    if _DISABLE:
+        return polynorm_reference(x, weight, bias, eps)
+
+    global _polynorm_kernel
+    if _polynorm_kernel is None:
+        _polynorm_kernel = _make_polynorm_kernel()
+
+    *lead, D = x.shape
+    rows = 1
+    for n in lead:
+        rows *= n
+    if rows == 0:
+        return mx.zeros_like(x)
+
+    x_flat = x.reshape(rows, D)
+    # Threadgroup size — multiple of simd width (32). 256 is a good default.
+    tg = min(256, max(32, ((D + 31) // 32) * 32))
+    # MLX `grid` is total thread count (not threadgroup count): `rows` threadgroups
+    # of `tg` threads each ⇒ grid = rows * tg.
+    grid = (rows * tg, 1, 1)
+    threadgroup = (tg, 1, 1)
+
+    eps_arr = mx.array([eps], dtype=mx.float32)
+    out = _polynorm_kernel(
+        inputs=[x_flat, weight.astype(x.dtype), bias.astype(x.dtype), eps_arr],
+        template=[("T", x.dtype), ("D", D)],
+        grid=grid,
+        threadgroup=threadgroup,
+        output_shapes=[(rows, D)],
+        output_dtypes=[x.dtype],
+    )[0]
+    return out.reshape(*x.shape)
+
+
+# --------------------------------------------------------------------------- #
+# Fused post-attention GDA reduction
+# --------------------------------------------------------------------------- #
+#
+# Replaces the 5+ MLX ops that follow the two SDPAs in the Grouped Differential
+# Attention forward:
+#
+#   attn_o      = merged[:, :q_origin]                  # (B, q_origin, S, 2d)
+#   attn_n_grp  = merged[:, q_origin:]                  # (B, q_groups, S, 2d)
+#   attn_n      = repeat(attn_n_grp, gr, axis=1)        # (B, q_origin, S, 2d)
+#   diff        = attn_o - lambda_full * attn_n
+#   out         = SubLN(diff) * (1 - lambda_init)
+#
+# where q_origin = q_groups * gr. Output shape: (B, q_origin, S, 2d). The
+# noise heads `merged[:, q_origin:]` are not produced — they're consumed by
+# the differential subtract.
+
+_GDA_POST_SRC = r"""
+    // Layout: one threadgroup per output row (b, h_o, s). Each row has
+    // CHANNELS = 2 * head_dim contiguous channels.
+    uint row     = threadgroup_position_in_grid.x;
+    uint tid     = thread_position_in_threadgroup.x;
+    uint tgsize  = threads_per_threadgroup.x;
+
+    // Decompose row into (b, h_o, s) using contiguous (B, q_origin, S) layout.
+    uint hs    = (Q_ORIGIN * S);
+    uint b     = row / hs;
+    uint hosx  = row - b * hs;
+    uint h_o   = hosx / S;
+    uint s     = hosx - h_o * S;
+    uint h_n   = Q_ORIGIN + (h_o / GR);   // matching noise head
+
+    // merged is (B, Q_HEADS, S, CHANNELS) where Q_HEADS = Q_ORIGIN + Q_GROUPS.
+    uint q_heads_total = Q_ORIGIN + Q_GROUPS;
+    const device T* row_o = merged + (((b * q_heads_total + h_o) * S) + s) * CHANNELS;
+    const device T* row_n = merged + (((b * q_heads_total + h_n) * S) + s) * CHANNELS;
+    device T*       row_y = y      + (((b * Q_ORIGIN     + h_o) * S) + s) * CHANNELS;
+
+    float lam   = float(lambda_full[0]);
+    float scale = float(scale_in[0]);
+    float eps   = float(eps_in[0]);
+
+    // Pass 1: compute the per-row sum of squares of the differential.
+    float ssq = 0.0f;
+    for (uint i = tid; i < CHANNELS; i += tgsize) {
+        float d = float(row_o[i]) - lam * float(row_n[i]);
+        ssq += d * d;
+    }
+
+    threadgroup float tg_partial[32];
+    float r = simd_sum(ssq);
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint lane  = thread_index_in_simdgroup;
+    if (lane == 0) tg_partial[sg_id] = r;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0) {
+        uint n_sg = simdgroups_per_threadgroup;
+        float v = (lane < n_sg) ? tg_partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0) tg_partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_inv = metal::rsqrt(tg_partial[0] / float(CHANNELS) + eps);
+
+    // Pass 2: emit the SubLN-normalised, scaled output.
+    for (uint i = tid; i < CHANNELS; i += tgsize) {
+        float d  = float(row_o[i]) - lam * float(row_n[i]);
+        float sw = float(subln_w[i]);
+        row_y[i] = T(d * rms_inv * sw * scale);
+    }
+"""
+
+
+def _make_gda_post_kernel():
+    return mx.fast.metal_kernel(
+        name="motif_gda_post",
+        input_names=["merged", "subln_w", "lambda_full", "scale_in", "eps_in"],
+        output_names=["y"],
+        source=_GDA_POST_SRC,
+    )
+
+
+_gda_post_kernel = None
+
+
+def gda_post_reference(
+    merged: mx.array,
+    subln_weight: mx.array,
+    lambda_full: mx.array,
+    lambda_init: float,
+    q_groups: int,
+    gr: int,
+    eps: float,
+) -> mx.array:
+    """Pure-MLX equivalent of the fused post-attention GDA reduction."""
+    q_origin = q_groups * gr
+    attn_o = merged[:, :q_origin]
+    attn_n_grp = merged[:, q_origin:]
+    attn_n = mx.repeat(attn_n_grp, gr, axis=1)
+    diff = attn_o - lambda_full * attn_n
+    rms_inv = mx.rsqrt(mx.mean(diff * diff, axis=-1, keepdims=True) + eps)
+    return diff * rms_inv * subln_weight * (1.0 - lambda_init)
+
+
+def gda_post(
+    merged: mx.array,
+    subln_weight: mx.array,
+    lambda_full: mx.array,
+    lambda_init: float,
+    q_groups: int,
+    gr: int,
+    eps: float = 1e-5,
+) -> mx.array:
+    """
+    Fused post-SDPA GDA reduction. `merged` is the concatenated output of the
+    two-V SDPA call, shape (B, q_groups*gr + q_groups, S, 2*head_dim).
+    Returns the SubLN-normalised differential output (B, q_groups*gr, S, 2*head_dim).
+    """
+    if _DISABLE:
+        return gda_post_reference(
+            merged, subln_weight, lambda_full, lambda_init, q_groups, gr, eps
+        )
+
+    global _gda_post_kernel
+    if _gda_post_kernel is None:
+        _gda_post_kernel = _make_gda_post_kernel()
+
+    B, q_heads, S, channels = merged.shape
+    q_origin = q_groups * gr
+    assert q_heads == q_origin + q_groups, (
+        f"q_heads={q_heads} expected {q_origin}+{q_groups}"
+    )
+
+    rows = B * q_origin * S
+    tg = min(256, max(32, ((channels + 31) // 32) * 32))
+    grid = (rows * tg, 1, 1)
+    threadgroup = (tg, 1, 1)
+
+    scale = mx.array([1.0 - lambda_init], dtype=mx.float32)
+    eps_arr = mx.array([eps], dtype=mx.float32)
+
+    out = _gda_post_kernel(
+        inputs=[
+            merged,
+            subln_weight.astype(merged.dtype),
+            lambda_full.astype(mx.float32),
+            scale,
+            eps_arr,
+        ],
+        template=[
+            ("T", merged.dtype),
+            ("Q_ORIGIN", q_origin),
+            ("Q_GROUPS", q_groups),
+            ("GR", gr),
+            ("S", S),
+            ("CHANNELS", channels),
+        ],
+        grid=grid,
+        threadgroup=threadgroup,
+        output_shapes=[(B, q_origin, S, channels)],
+        output_dtypes=[merged.dtype],
+    )[0]
+    return out

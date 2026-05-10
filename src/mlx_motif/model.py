@@ -74,7 +74,8 @@ class PolyNorm(nn.Module):
 
         y = w0 * norm(x^3) + w1 * norm(x^2) + w2 * norm(x) + b
 
-    where `norm(z) = z / sqrt(mean(z^2) + eps)`.
+    where `norm(z) = z / sqrt(mean(z^2) + eps)`. Uses a fused Metal kernel
+    when available; falls back to plain MLX ops via `MLX_MOTIF_DISABLE_KERNELS=1`.
     """
 
     def __init__(self, eps: float = 1e-6):
@@ -83,18 +84,10 @@ class PolyNorm(nn.Module):
         self.bias = mx.zeros((1,))
         self.eps = eps
 
-    def _norm(self, x: mx.array) -> mx.array:
-        return x * mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
-
     def __call__(self, x: mx.array) -> mx.array:
-        x2 = x * x
-        x3 = x2 * x
-        return (
-            self.weight[0] * self._norm(x3)
-            + self.weight[1] * self._norm(x2)
-            + self.weight[2] * self._norm(x)
-            + self.bias
-        )
+        from mlx_motif.kernels import polynorm
+
+        return polynorm(x, self.weight, self.bias, self.eps)
 
 
 def get_activation(name: str) -> nn.Module:
@@ -347,20 +340,30 @@ class MotifAttention(nn.Module):
         v1_f = mx.concatenate([_repeat(v1, gr, axis=1), v1], axis=1)
         v2_f = mx.concatenate([_repeat(v2, gr, axis=1), v2], axis=1)
 
-        # Two parallel SDPAs sharing Q and K but different V.
-        attn_1 = mx.fast.scaled_dot_product_attention(q_f, k_f, v1_f, scale=self.scale, mask=mask)
-        attn_2 = mx.fast.scaled_dot_product_attention(q_f, k_f, v2_f, scale=self.scale, mask=mask)
+        # Single SDPA that produces both differential branches at once. Q and K
+        # are identical between the two HF SDPAs; only V differs. By stacking
+        # V along the head_dim axis (V_cat = [v1 | v2] of width 2·d) we get
+        # both attn_1 and attn_2 from one attention pass — same softmax weights,
+        # halved memory traffic, halved GEMM dispatch overhead. The output's
+        # first d channels equal the original attn_1, the last d equal attn_2.
+        v_cat = mx.concatenate([v1_f, v2_f], axis=-1)  # (B, q_heads, S, 2d)
+        attn_cat = mx.fast.scaled_dot_product_attention(
+            q_f, k_f, v_cat, scale=self.scale, mask=mask
+        )
+        # Fused post-attention reduction: channel split + λ-subtract + SubLN +
+        # output scaling collapse into a single Metal kernel (5+ launches → 1).
+        from mlx_motif.kernels import gda_post
 
-        # Concatenate channels and split origin / noise groups along the head axis.
-        merged = mx.concatenate([attn_1, attn_2], axis=-1)  # (B, q_heads, S, 2d)
-        attn_o = merged[:, :-q_groups, :, :]              # 32 origin heads
-        attn_n_group = merged[:, -q_groups:, :, :]        # 8 noise heads
-        attn_n = _repeat(attn_n_group, gr, axis=1)        # broadcast to 32
-
-        lam = self._lambda_full(attn_o.dtype)
-        out = attn_o - lam * attn_n
-        out = self.subln(out)
-        out = out * (1.0 - self.lambda_init)
+        lam = self._lambda_full(mx.float32).reshape(1)
+        out = gda_post(
+            attn_cat,
+            self.subln.weight,
+            lam,
+            self.lambda_init,
+            q_groups,
+            gr,
+            eps=self.args.attn_rms_norm_eps,
+        )
 
         # (B, q_groups*gr, S, 2d) -> (B, S, q_groups*gr*2d)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)

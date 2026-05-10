@@ -30,6 +30,7 @@ from mlx_lm.utils import save_config, save_model
 from safetensors import safe_open
 
 from mlx_motif.model import Model, ModelArgs
+from mlx_motif.quant import apply_quant
 
 # Files copied verbatim so the converted dir works with `transformers.AutoTokenizer`.
 _TOKENIZER_FILES = (
@@ -104,6 +105,8 @@ def convert(
     quantize: bool = False,
     q_bits: int = 4,
     q_group_size: int = 64,
+    quant_preset: str = "uniform",
+    q_proj_bits: int = 6,
 ) -> Path:
     src = _resolve_hf_path(hf_path)
     out = Path(out_path)
@@ -116,15 +119,27 @@ def convert(
     weights = _load_hf_weights(src, target_dtype)
     model.load_weights(list(weights.items()), strict=False)
 
+    quant_meta: dict = {}
     if quantize:
-        nn.quantize(model, group_size=q_group_size, bits=q_bits)
+        quant_meta = apply_quant(
+            model,
+            preset=quant_preset,
+            bits=q_bits,
+            group_size=q_group_size,
+            q_bits=q_proj_bits,
+        )
 
     save_model(out, model)
 
     cfg = json.loads((src / "config.json").read_text())
     cfg["model_type"] = "motif"
     if quantize:
-        cfg["quantization"] = {"group_size": q_group_size, "bits": q_bits}
+        # mlx-lm reads the legacy `group_size` / `bits` fields from `quantization`.
+        cfg["quantization"] = {
+            "group_size": q_group_size,
+            "bits": q_bits,
+            **quant_meta,
+        }
     save_config(cfg, out / "config.json")
 
     for fname in _TOKENIZER_FILES:

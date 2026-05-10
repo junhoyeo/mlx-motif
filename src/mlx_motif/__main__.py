@@ -16,6 +16,8 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         quantize=args.quantize,
         q_bits=args.bits,
         q_group_size=args.group_size,
+        quant_preset=args.quant_preset,
+        q_proj_bits=args.q_proj_bits,
     )
     print(f"Wrote MLX checkpoint to {out}")
     return 0
@@ -49,6 +51,9 @@ def main(argv: list[str] | None = None) -> int:
     pc.add_argument("--quantize", action="store_true")
     pc.add_argument("--bits", type=int, default=4)
     pc.add_argument("--group-size", type=int, default=64)
+    pc.add_argument("--quant-preset", default="uniform", choices=["uniform", "mixed"],
+                    help="`mixed` keeps q_proj at --q-proj-bits, rest at --bits")
+    pc.add_argument("--q-proj-bits", type=int, default=6)
     pc.set_defaults(func=_cmd_convert)
 
     pg = sub.add_parser("generate", help="Run generation against a converted MLX model")

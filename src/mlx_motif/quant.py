@@ -59,25 +59,39 @@ def apply_quant(
 ) -> dict:
     """Quantize `model` in-place using the chosen preset.
 
-    Returns a small dict describing what was applied — useful for logging
-    into the converted checkpoint's `config.json`.
+    Returns a dict shaped for `config["quantization"]` that mlx-lm's loader
+    can read back. The top-level `bits`/`group_size` are the *defaults*;
+    per-module overrides go in keys named after their dotted path
+    (`model.layers.0.self_attn.q_proj`) — that's the contract enforced by
+    `mlx_lm.utils.load_model._quantize`.
     """
     if predicate is None:
         if preset == "uniform":
             predicate = _uniform_predicate(bits=bits, group_size=group_size)
-            meta = {"preset": "uniform", "bits": bits, "group_size": group_size}
+            preset_meta = {"preset": "uniform"}
         elif preset == "mixed":
             predicate = _mixed_predicate(bits=bits, q_bits=q_bits, group_size=group_size)
-            meta = {
-                "preset": "mixed",
-                "bits": bits,
-                "q_bits": q_bits,
-                "group_size": group_size,
-            }
+            preset_meta = {"preset": "mixed", "q_bits": q_bits}
         else:
             raise ValueError(f"Unknown quant preset: {preset}")
     else:
-        meta = {"preset": "custom", "group_size": group_size, "bits": bits}
+        preset_meta = {"preset": "custom"}
 
     nn.quantize(model, class_predicate=predicate)
-    return meta
+
+    # Walk the model and emit per-module settings for any QuantizedLinear that
+    # diverges from the top-level defaults. This is what the mlx-lm loader
+    # reads to rebuild the model with matching shapes.
+    overrides: dict = {}
+    for path, module in model.named_modules():
+        if not isinstance(module, nn.QuantizedLinear):
+            continue
+        if module.bits != bits or module.group_size != group_size:
+            overrides[path] = {"group_size": module.group_size, "bits": module.bits}
+
+    return {
+        "group_size": group_size,
+        "bits": bits,
+        **preset_meta,
+        **overrides,
+    }

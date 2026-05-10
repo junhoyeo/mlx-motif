@@ -22,9 +22,21 @@ def _get_motif_classes(config: dict):
     return Model, ModelArgs
 
 
-def load(path: str | Path) -> Tuple[nn.Module, TokenizerWrapper]:
-    """Load a converted MLX Motif checkpoint and its tokenizer."""
+def load(
+    path: str | Path,
+    fuse_qkv: bool = True,
+) -> Tuple[nn.Module, TokenizerWrapper]:
+    """Load a converted MLX Motif checkpoint and its tokenizer.
+
+    Args:
+        path: directory containing `model.safetensors*` and tokenizer files
+        fuse_qkv: if True (default), call `model.fuse_qkv()` after loading
+            so the 3 grouped-attn projections collapse into one QuantizedLinear
+            (~+10% on the per-layer projection cost).
+    """
     path = Path(path)
     model, _ = _mlx_lm_load_model(path, get_model_classes=_get_motif_classes)
+    if fuse_qkv and hasattr(model, "fuse_qkv"):
+        model.fuse_qkv()
     tokenizer = load_tokenizer(path)
     return model, tokenizer

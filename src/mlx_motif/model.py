@@ -227,6 +227,11 @@ class MotifAttention(nn.Module):
         self.o_proj = nn.Linear(
             2 * self.grouped_ratio * self.num_noise_heads * d, h, bias=args.use_bias
         )
+        # Sentinel for fused QKV (set by fuse_qkv() at load time).
+        self.qkv_proj = None
+        self._q_dim = self.q_heads * d
+        self._k_dim = self.num_kv_heads * d
+        self._v_dim = 2 * self.k_noise_heads * d
 
     def _init_vanilla(self, args: ModelArgs) -> None:
         # 2.6B halves heads — see modeling_motif.py:352 in the 2.6B reference.
@@ -315,13 +320,24 @@ class MotifAttention(nn.Module):
         B, S, _ = x.shape
         d = self.head_dim
 
-        q = self.q_proj(x).reshape(B, S, self.q_heads, d).transpose(0, 2, 1, 3)
-        k = self.k_proj(x).reshape(B, S, self.num_kv_heads, d).transpose(0, 2, 1, 3)
-        # v has 2 * k_noise_heads * d along last; reshape to (B, num_kv_heads, S, d) by
-        # treating (2 * k_noise_heads) as the head axis. Matches HF view:
-        #   value_states.view(bsz, q_len, -1, head_dim)
+        # If qkv_proj has been fused at load time, use a single matmul + 3-way
+        # split (saves ~10% on the q/k/v projection cost — hits MLX's
+        # quantized matmul sweet spot at output_dim=q+k+v=9216 vs 3 separate
+        # 5120/2048/2048 calls; see commit history for microbench).
+        if self.qkv_proj is not None:
+            qkv = self.qkv_proj(x)
+            q_flat = qkv[..., : self._q_dim]
+            k_flat = qkv[..., self._q_dim : self._q_dim + self._k_dim]
+            v_flat = qkv[..., self._q_dim + self._k_dim :]
+        else:
+            q_flat = self.q_proj(x)
+            k_flat = self.k_proj(x)
+            v_flat = self.v_proj(x)
+
+        q = q_flat.reshape(B, S, self.q_heads, d).transpose(0, 2, 1, 3)
+        k = k_flat.reshape(B, S, self.num_kv_heads, d).transpose(0, 2, 1, 3)
         v_dim = 2 * self.k_noise_heads
-        v = self.v_proj(x).reshape(B, S, v_dim, d).transpose(0, 2, 1, 3)
+        v = v_flat.reshape(B, S, v_dim, d).transpose(0, 2, 1, 3)
 
         offset = cache.offset if cache is not None else 0
         q = self.rope(q, offset=offset)
@@ -503,6 +519,42 @@ class Model(nn.Module):
         # matches `num_key_value_heads` for both vanilla and grouped variants
         # (vanilla halves it internally but stores 2× heads of width d).
         return self.args.num_key_value_heads
+
+    def fuse_qkv(self) -> None:
+        """Fuse `q_proj`, `k_proj`, `v_proj` of every grouped-attention layer
+        into a single `qkv_proj` linear (concatenated along the output axis).
+
+        Cuts ~10% off the per-layer projection cost by hitting MLX's
+        quantized matmul sweet spot (single 4096→9216 op vs three smaller
+        ops). Call after `load_weights`.
+        """
+        if not self.args.is_grouped:
+            return
+        for layer in self.model.layers:
+            attn = layer.self_attn
+            q, k, v = attn.q_proj, attn.k_proj, attn.v_proj
+            quantized = isinstance(q, nn.QuantizedLinear)
+            in_dim = q.weight.shape[1] * (32 // q.bits if quantized else 1)
+            out_dim = (q.weight.shape[0] if quantized else q.weight.shape[0]) + \
+                      (k.weight.shape[0] if quantized else k.weight.shape[0]) + \
+                      (v.weight.shape[0] if quantized else v.weight.shape[0])
+            if quantized:
+                fused = nn.QuantizedLinear(
+                    in_dim, out_dim, bias=False,
+                    group_size=q.group_size, bits=q.bits, mode=q.mode,
+                )
+                fused.weight = mx.concatenate([q.weight, k.weight, v.weight], axis=0)
+                fused.scales = mx.concatenate([q.scales, k.scales, v.scales], axis=0)
+                fused.biases = mx.concatenate([q.biases, k.biases, v.biases], axis=0)
+            else:
+                fused = nn.Linear(in_dim, out_dim, bias=False)
+                fused.weight = mx.concatenate([q.weight, k.weight, v.weight], axis=0)
+            attn.qkv_proj = fused
+            # Drop the originals so they don't double the parameter count
+            # in `model.parameters()`.
+            attn.q_proj = nn.Identity()
+            attn.k_proj = nn.Identity()
+            attn.v_proj = nn.Identity()
 
     def sanitize(self, weights: dict) -> dict:
         """Strip any unsupported buffers (rotary inv_freq) and pass through."""

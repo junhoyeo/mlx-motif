@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Optional
 
 import mlx.core as mx
@@ -126,11 +127,11 @@ def get_activation(name: str) -> nn.Module:
 class MotifMLP(nn.Module):
     """Gated MLP with a poly-norm activation.
 
-    The simple `down_proj(act(gate) * up)` form is the fastest path on
-    M-series GPUs — see commits c4f2c03 (custom kernel: -7%) and the
-    `mx.compile` attempt (-47% from per-call recompile churn). MLX's
-    lazy graph already fuses the elementwise chain into the down_proj
-    matmul pipeline.
+    Plain `down_proj(act(gate) * up)` form is the fastest end-to-end path
+    on M-series GPUs. MLX's lazy graph optimizer fuses the elementwise
+    chain across many decoder layers in ways that an `mx.compile` of a
+    single MLP block actively *prevents* (-4% end-to-end despite +12%
+    in the isolated MLP microbench).
     """
 
     def __init__(self, args: ModelArgs):
@@ -403,18 +404,22 @@ class MotifAttention(nn.Module):
             )
         elif use_dual_v:
             # Custom kernel: shared QK, dual V, in one Metal pass.
-            # Build the full q_f / k_f layout (with origin/noise repeats)
-            # but skip the V concat — the kernel reads v1, v2 separately and
-            # writes 2D-wide attention output directly.
+            # Split into two separate calls (origin: 32 heads, noise: 8 heads)
+            # — empirically 8% faster than one fused 40-head call because the
+            # smaller per-call workload pipelines better and avoids the
+            # head-axis concat allocation for q_f.
             if kr == 1:
-                k_f = mx.concatenate([_repeat(k1, gr, axis=1), k2], axis=1)
+                k1_o = _repeat(k1, gr, axis=1)
             else:
-                k_f = mx.concatenate([k1, k2], axis=1)
-            v1_f = mx.concatenate([_repeat(v1, gr, axis=1), v1], axis=1)
-            v2_f = mx.concatenate([_repeat(v2, gr, axis=1), v2], axis=1)
-            attn_cat = sdpa_dual_v(q_f, k_f, v1_f, v2_f, self.scale)
+                k1_o = k1
+            v1_o = _repeat(v1, gr, axis=1)
+            v2_o = _repeat(v2, gr, axis=1)
+
+            attn_origin = sdpa_dual_v(q1, k1_o, v1_o, v2_o, self.scale)
+            attn_noise  = sdpa_dual_v(q2, k2,   v1,   v2,   self.scale)
+            merged = mx.concatenate([attn_origin, attn_noise], axis=1)
             out = gda_post(
-                attn_cat, self.subln.weight, lam, self.lambda_init,
+                merged, self.subln.weight, lam, self.lambda_init,
                 q_groups, gr, eps=self.args.attn_rms_norm_eps,
             )
         else:

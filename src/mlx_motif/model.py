@@ -195,34 +195,44 @@ def _resolve_attention_path(
 
     Decision order (first match wins):
 
-    1. SERIAL_FLASH — ``MLX_MOTIF_FLASH_DECODE != 0`` AND single-token
-       decode with no GQA repeat and k_ratio == 1.
+    1. SERIAL_FLASH — ``MLX_MOTIF_FLASH_DECODE != 0`` AND single-token decode
+       with no GQA repeat and ``k_ratio == 1``. Note: this path does NOT gate
+       on ``fused_rope`` — the gda_decode kernel handles per-branch RoPE
+       internally, which is its reason to exist.
     2. QUANT_SDPA   — cache is ``MotifGroupedQuantizedKVCache`` AND
-       ``MLX_MOTIF_QUANT_SDPA != 0`` AND same decode conditions as above.
-    3. DUAL_V       — ``MLX_MOTIF_DUAL_V != 0`` AND same decode conditions.
+       ``MLX_MOTIF_QUANT_SDPA != 0`` AND same decode conditions AND
+       ``not fused_rope`` (kernel consumes post-RoPE q/k from rope() call).
+    3. DUAL_V       — ``MLX_MOTIF_DUAL_V != 0`` AND same decode conditions
+       AND ``not fused_rope`` (same reason as QUANT_SDPA).
     4. FALLBACK     — everything else (prefill, GQA repeat, k_ratio > 1, …).
     """
     from mlx_motif.cache import MotifGroupedQuantizedKVCache
 
     _is_falsy = ("0", "", "false", "False")
 
-    decode_eligible = S == 1 and kv_repeat == 1 and kr == 1 and not fused_rope
+    # Single-token decode shape preconditions shared by all three custom
+    # paths. The `not fused_rope` guard is intentionally NOT in here — it
+    # only applies to QUANT_SDPA and DUAL_V (which consume post-RoPE q/k
+    # tensors), not to SERIAL_FLASH (which does its own RoPE internally).
+    decode_shape_ok = S == 1 and kv_repeat == 1 and kr == 1
 
     if (
-        decode_eligible
+        decode_shape_ok
         and env.get("MLX_MOTIF_FLASH_DECODE", "0") not in _is_falsy
     ):
         return AttnPath.SERIAL_FLASH
 
     if (
-        decode_eligible
+        decode_shape_ok
+        and not fused_rope
         and isinstance(cache, MotifGroupedQuantizedKVCache)
         and env.get("MLX_MOTIF_QUANT_SDPA", "1") not in _is_falsy
     ):
         return AttnPath.QUANT_SDPA
 
     if (
-        decode_eligible
+        decode_shape_ok
+        and not fused_rope
         and env.get("MLX_MOTIF_DUAL_V", "1") not in _is_falsy
     ):
         return AttnPath.DUAL_V

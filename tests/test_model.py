@@ -291,6 +291,39 @@ class TestResolveAttentionPath:
         )
         assert path is AttnPath.FALLBACK
 
+    def test_serial_flash_wins_even_with_fused_rope(self):
+        """SERIAL_FLASH (gda_decode) handles per-branch RoPE internally,
+        which is its reason to exist. It must NOT be blocked by
+        ``fused_rope=True``. Regression guard: the original branch in
+        main was ``if use_serial_flash and S == 1 and kv_repeat == 1
+        and kr == 1`` — explicitly NOT including ``not fused_rope``.
+        """
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="1")
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(), S=1, kv_repeat=1, kr=1,
+            fused_rope=True, env=env,
+        )
+        assert path is AttnPath.SERIAL_FLASH
+
+    def test_quant_sdpa_blocked_by_fused_rope(self):
+        """QUANT_SDPA consumes post-RoPE q/k from the standard rope() call
+        — fused-rope routes around that, so this kernel must fall through."""
+        env = _stub_env(MLX_MOTIF_QUANT_SDPA="1")
+        path = _resolve_attention_path(
+            cache=_quant_4slot_cache(), S=1, kv_repeat=1, kr=1,
+            fused_rope=True, env=env,
+        )
+        assert path is AttnPath.FALLBACK
+
+    def test_dual_v_blocked_by_fused_rope(self):
+        """DUAL_V — same reason as QUANT_SDPA above."""
+        env = _stub_env()  # MLX_MOTIF_DUAL_V defaults to "1"
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(), S=1, kv_repeat=1, kr=1,
+            fused_rope=True, env=env,
+        )
+        assert path is AttnPath.FALLBACK
+
     def test_fallback_when_dual_v_disabled(self):
         env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_DUAL_V="0")
         path = _resolve_attention_path(

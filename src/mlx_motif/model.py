@@ -15,6 +15,7 @@ Both share PolyNorm activation (arXiv:2411.03884) and per-head SubLN over
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -344,37 +345,54 @@ class MotifAttention(nn.Module):
             v1 = _repeat(v1, self.kv_repeat, axis=1)
             v2 = _repeat(v2, self.kv_repeat, axis=1)
 
-        if kr == 1:
-            k_f = mx.concatenate([_repeat(k1, gr, axis=1), k2], axis=1)
-        else:
-            k_f = mx.concatenate([k1, k2], axis=1)
-        v1_f = mx.concatenate([_repeat(v1, gr, axis=1), v1], axis=1)
-        v2_f = mx.concatenate([_repeat(v2, gr, axis=1), v2], axis=1)
-
-        # Single SDPA that produces both differential branches at once. Q and K
-        # are identical between the two HF SDPAs; only V differs. By stacking
-        # V along the head_dim axis (V_cat = [v1 | v2] of width 2·d) we get
-        # both attn_1 and attn_2 from one attention pass — same softmax weights,
-        # halved memory traffic, halved GEMM dispatch overhead. The output's
-        # first d channels equal the original attn_1, the last d equal attn_2.
-        v_cat = mx.concatenate([v1_f, v2_f], axis=-1)  # (B, q_heads, S, 2d)
-        attn_cat = mx.fast.scaled_dot_product_attention(
-            q_f, k_f, v_cat, scale=self.scale, mask=mask
-        )
-        # Fused post-attention reduction: channel split + λ-subtract + SubLN +
-        # output scaling collapse into a single Metal kernel (5+ launches → 1).
-        from mlx_motif.kernels import gda_post
+        # OPT-IN: a flash-style fused decode kernel exists in `kernels.py`
+        # (gda_decode). It streams through KV in one pass and produces the
+        # SubLN-normalised differential output directly, but the current
+        # implementation uses a serial-per-thread KV loop which loses to MLX's
+        # simdgroup-matmul-based vectorized SDPA on M-series GPUs (~2.7× slower
+        # at 12.7B-q4). Keep the fallback as the default; turn the kernel on
+        # via `MLX_MOTIF_FLASH_DECODE=1` for benchmarking / future work.
+        from mlx_motif.kernels import gda_decode, gda_post
 
         lam = self._lambda_full(mx.float32).reshape(1)
-        out = gda_post(
-            attn_cat,
-            self.subln.weight,
-            lam,
-            self.lambda_init,
-            q_groups,
-            gr,
-            eps=self.args.attn_rms_norm_eps,
+        use_flash_decode = (
+            os.environ.get("MLX_MOTIF_FLASH_DECODE", "0") not in ("0", "", "false", "False")
+            and S == 1
+            and self.kv_repeat == 1
+            and kr == 1
+            and not self.args.fused_rope
         )
+
+        if use_flash_decode:
+            out = gda_decode(
+                q1, q2, k1, k2, v1, v2,
+                self.subln.weight,
+                lam,
+                self.lambda_init,
+                gr,
+                self.scale,
+                eps=self.args.attn_rms_norm_eps,
+            )
+        else:
+            if kr == 1:
+                k_f = mx.concatenate([_repeat(k1, gr, axis=1), k2], axis=1)
+            else:
+                k_f = mx.concatenate([k1, k2], axis=1)
+            v1_f = mx.concatenate([_repeat(v1, gr, axis=1), v1], axis=1)
+            v2_f = mx.concatenate([_repeat(v2, gr, axis=1), v2], axis=1)
+            v_cat = mx.concatenate([v1_f, v2_f], axis=-1)
+            attn_cat = mx.fast.scaled_dot_product_attention(
+                q_f, k_f, v_cat, scale=self.scale, mask=mask
+            )
+            out = gda_post(
+                attn_cat,
+                self.subln.weight,
+                lam,
+                self.lambda_init,
+                q_groups,
+                gr,
+                eps=self.args.attn_rms_norm_eps,
+            )
 
         # (B, q_groups*gr, S, 2d) -> (B, S, q_groups*gr*2d)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, -1)

@@ -214,6 +214,31 @@ The hypothesis was wrong. `x` is 8 KB and M1 Max's L1 is 192 KB per core, so aft
 
 **Both kept in tree as documented negative results.** The `qmv_dual_q4` kernel is correct and may win on hardware with smaller L1 (M3/M4 maybe) or on shapes where x exceeds cache. The `mlp_lowbit` preset infrastructure is wired through the converter and ready to A/B against future bit-width combos. Neither is on by default.
 
+## Sanity-check: am I wrong, or is this consensus?
+
+Before declaring a research direction dead, you should check whether the rest of the field agrees. I ran a survey of public MLX/Metal repos to see if anyone had shipped what I was trying to ship.
+
+**Headline finding: nobody has publicly shipped a reproducible, end-to-end MLP speed win for a dense 7-13B transformer on MLX/Metal that beats the default two-matmul path.** The kernel design space is mostly empty here, not because nobody's looked, but because everyone who has reached the same conclusion.
+
+Concrete data points from the survey:
+
+| Project | Approach | Result | Notes |
+|---|---|---|---|
+| [`Hmbown/ZMLX`](https://github.com/Hmbown/ZMLX) | Fused SwiGLU gate+up GEMV (decode, S≤32) | **+7.5%** Qwen-9B-q4 on **M4 Max** | The single counter-example. **No M1 Max numbers exist.** Their dense-model wins are modest (+4-8%); the headline +12% is on a MoE. M4 Max has substantially more L2 + ~28% more memory bandwidth than M1 Max — exactly the regime where the activation-in-L1 effect *stops* dominating. |
+| [llama.cpp Metal](https://github.com/ggml-org/llama.cpp) | None (no fused MLP shipped) | n/a | Same structure as us — individual `ggml_mul_mat` per projection. The fused-MLP issue tracked in their bug list is a CUDA regression, not a Metal optimization. They've converged on the same conclusion. |
+| [`mlx-lm` LEARNED_QUANTS](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LEARNED_QUANTS.md) | Sensitivity-based bit assignment (4-bit low / 5-bit high) | Uniform across attention/MLP | Official preset library doesn't differentiate MLP vs attention bits. My `mlp_lowbit` experiment is more aggressive than anything they've shipped. |
+| [`jjang-ai/jangq`](https://github.com/jjang-ai/jangq) | 2-4 bit MLP, 6-8 bit attention | Wins, but only on **MoE** | The MoE attention:MLP parameter ratio makes the trade obvious. No dense 7-13B benchmark. |
+| [Apple's M5 writeup](https://machinelearning.apple.com/research/exploring-llms-mlx-m5) | Hardware (not kernel) | **+19-27%** decode M5-vs-M4 | Source: 28% memory bandwidth bump + Metal 4 TensorOps. Apple themselves frame decode as bandwidth-bound, not fusion-bound. |
+| [Apple Recurrent Drafter](https://machinelearning.apple.com/research/recurrent-drafter) | Speculative decoding, ~500M-1B RNN draft | **2.3×** on Vicuna-7B/13B (M1/M2) | The actual practical path forward at this scale. Architecture/training problem, not a kernel problem. |
+
+What this means concretely:
+
+1. **The negative result on M1 Max is consensus, not contrarian.** Everyone who's tried fused MLP on Apple Silicon at this scale has reached the same conclusion. My session-end "I'd stop iterating in good conscience" is the right call.
+2. **The qmv_dual_q4 kernel is worth re-running on M3/M4.** The ZMLX +7.5% on M4 Max is direct evidence that the design CAN win on different silicon. That's the next experiment worth doing, but it requires hardware I don't have.
+3. **The next 2× at this model scale is speculative decoding, not kernel work.** Apple's ReDrafter pattern with a sub-1B drafter is the credible path. That's outside the "custom Metal kernel" design space I've been operating in this session — it's an architecture and training problem.
+
+So the candid blog conclusion: I'm not the first person to try fusing MLP on Apple Silicon, and I'm not the first to find it doesn't win on the popular shapes on the older silicon. The wins exist (ZMLX proves it), but they live on hardware I don't have and on shapes I'm not running.
+
 ## What this teaches us about MLP on M1 Max
 
 Decode-time MLP at the Motif 12.7B shape (4096↔16384) appears to be **Pareto-optimal under MLX's current dispatch**. Both the bandwidth-side approaches (fuse to share x; lower bits to read fewer weight bytes) failed end-to-end despite winning their respective microbenches. The transfer from "isolated kernel works" to "real model is faster" is broken by:

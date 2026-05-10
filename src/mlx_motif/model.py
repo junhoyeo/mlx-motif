@@ -323,8 +323,7 @@ class MotifAttention(nn.Module):
 
         # If qkv_proj has been fused at load time, use a single matmul + 3-way
         # split (saves ~10% on the q/k/v projection cost — hits MLX's
-        # quantized matmul sweet spot at output_dim=q+k+v=9216 vs 3 separate
-        # 5120/2048/2048 calls; see commit history for microbench).
+        # quantized matmul sweet spot at output_dim=q+k+v=9216).
         if self.qkv_proj is not None:
             qkv = self.qkv_proj(x)
             q_flat = qkv[..., : self._q_dim]
@@ -339,6 +338,10 @@ class MotifAttention(nn.Module):
         k = k_flat.reshape(B, S, self.num_kv_heads, d).transpose(0, 2, 1, 3)
         v_dim = 2 * self.k_noise_heads
         v = v_flat.reshape(B, S, v_dim, d).transpose(0, 2, 1, 3)
+        # If fuse_qkv() permuted Q rows to origin-first, the q tensor already
+        # has [origin-heads | noise-heads] layout — q1 / q2 below become
+        # contiguous slices (zero-copy) instead of stride-pattern reshapes.
+        self._q_origin_first = getattr(self, "_qkv_origin_first", False)
 
         offset = cache.offset if cache is not None else 0
         q = self.rope(q, offset=offset)
@@ -350,12 +353,19 @@ class MotifAttention(nn.Module):
 
         kv_seq = k.shape[2]
 
-        # Split q on the head axis: stripe layout [gr origin | 1 noise] per group.
+        # Split q on the head axis. Two layouts:
+        #   - origin-first (after fuse_qkv): q is [origin | noise], plain slice
+        #   - HF stripe layout: q is [g0_o..g0_o, g0_n, g1_o..g1_o, g1_n, ..],
+        #     which forces a memory-copy reshape (~316 µs/layer).
         gr = self.grouped_ratio
         q_groups = self.q_heads // (gr + 1)
-        q_ = q.reshape(B, q_groups, gr + 1, S, d)
-        q1 = q_[:, :, :gr, :, :].reshape(B, q_groups * gr, S, d)
-        q2 = q_[:, :, gr:, :, :].reshape(B, q_groups, S, d)
+        if self._q_origin_first:
+            q1 = q[:, : q_groups * gr, :, :]
+            q2 = q[:, q_groups * gr :, :, :]
+        else:
+            q_ = q.reshape(B, q_groups, gr + 1, S, d)
+            q1 = q_[:, :, :gr, :, :].reshape(B, q_groups * gr, S, d)
+            q2 = q_[:, :, gr:, :, :].reshape(B, q_groups, S, d)
 
         # Split k similarly with k_ratio
         kr = self.k_ratio
@@ -521,13 +531,39 @@ class Model(nn.Module):
         # (vanilla halves it internally but stores 2× heads of width d).
         return self.args.num_key_value_heads
 
+    @staticmethod
+    def _origin_first_perm(q_groups: int, gr: int, d: int) -> mx.array:
+        """Build the row permutation that maps the HF head-stripe layout
+        `[g0_o1, g0_o2, .., g0_o<gr>, g0_n, g1_o1, ..]` (per d-element block)
+        to the origin-first layout `[g0_o1..g7_o4, g0_n..g7_n]`.
+
+        Returns an int32 index tensor of shape `(q_heads * d,)` suitable for
+        `weight = weight[perm]` row-permutation.
+        """
+        # New head order: [g0_o1, g0_o2, .., g_<groups-1>_o<gr>, g0_n, .., g_<groups-1>_n]
+        new_to_old_head = []
+        # origin heads: gr per group, q_groups groups
+        for g in range(q_groups):
+            for p in range(gr):
+                new_to_old_head.append(g * (gr + 1) + p)
+        # noise heads: 1 per group, after origin
+        for g in range(q_groups):
+            new_to_old_head.append(g * (gr + 1) + gr)
+        # Expand to row indices (each head spans d rows of the weight matrix).
+        rows = []
+        for h in new_to_old_head:
+            rows.extend(range(h * d, (h + 1) * d))
+        return mx.array(rows, dtype=mx.int32)
+
     def fuse_qkv(self) -> None:
         """Fuse `q_proj`, `k_proj`, `v_proj` of every grouped-attention layer
-        into a single `qkv_proj` linear (concatenated along the output axis).
+        into a single `qkv_proj` linear (concatenated along the output axis),
+        AND permute Q rows from HF's head-stripe layout to origin-first so
+        the per-forward q1/q2 split becomes zero-copy views.
 
-        Cuts ~10% off the per-layer projection cost by hitting MLX's
-        quantized matmul sweet spot (single 4096→9216 op vs three smaller
-        ops). Call after `load_weights`.
+        Two wins stacked:
+          1. ~10% on the qkv matmul (sweet-spot output dim)
+          2. ~316 µs/layer saved by eliminating the Q split materialisation
         """
         if not self.args.is_grouped:
             return
@@ -536,26 +572,34 @@ class Model(nn.Module):
             q, k, v = attn.q_proj, attn.k_proj, attn.v_proj
             quantized = isinstance(q, nn.QuantizedLinear)
             in_dim = q.weight.shape[1] * (32 // q.bits if quantized else 1)
-            out_dim = (q.weight.shape[0] if quantized else q.weight.shape[0]) + \
-                      (k.weight.shape[0] if quantized else k.weight.shape[0]) + \
-                      (v.weight.shape[0] if quantized else v.weight.shape[0])
+
+            # Permute Q rows so origin heads come first.
+            d = attn.head_dim
+            q_groups = attn.num_noise_heads
+            gr = attn.grouped_ratio
+            perm = self._origin_first_perm(q_groups, gr, d)
+            q_w = q.weight[perm]
+            if quantized:
+                q_s = q.scales[perm]
+                q_b = q.biases[perm]
+
+            out_dim = q.weight.shape[0] + k.weight.shape[0] + v.weight.shape[0]
             if quantized:
                 fused = nn.QuantizedLinear(
                     in_dim, out_dim, bias=False,
                     group_size=q.group_size, bits=q.bits, mode=q.mode,
                 )
-                fused.weight = mx.concatenate([q.weight, k.weight, v.weight], axis=0)
-                fused.scales = mx.concatenate([q.scales, k.scales, v.scales], axis=0)
-                fused.biases = mx.concatenate([q.biases, k.biases, v.biases], axis=0)
+                fused.weight = mx.concatenate([q_w, k.weight, v.weight], axis=0)
+                fused.scales = mx.concatenate([q_s, k.scales, v.scales], axis=0)
+                fused.biases = mx.concatenate([q_b, k.biases, v.biases], axis=0)
             else:
                 fused = nn.Linear(in_dim, out_dim, bias=False)
-                fused.weight = mx.concatenate([q.weight, k.weight, v.weight], axis=0)
+                fused.weight = mx.concatenate([q_w, k.weight, v.weight], axis=0)
             attn.qkv_proj = fused
-            # Drop the originals so they don't double the parameter count
-            # in `model.parameters()`.
             attn.q_proj = nn.Identity()
             attn.k_proj = nn.Identity()
             attn.v_proj = nn.Identity()
+            attn._qkv_origin_first = True
 
     def sanitize(self, weights: dict) -> dict:
         """Strip any unsupported buffers (rotary inv_freq) and pass through."""

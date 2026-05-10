@@ -414,16 +414,11 @@ class MotifAttention(nn.Module):
                 gr, self.scale, eps=self.args.attn_rms_norm_eps,
             )
         elif use_dual_v:
-            # Custom kernel: shared QK, dual V with native GQA broadcast.
-            # Origin call: 32 Q heads with 8 KV heads (gqa=4) — kernel
-            # broadcasts internally via `kv_head_idx = head_idx / GQA_FACTOR`,
-            # so we avoid materializing the repeated 32-head K/V tensors.
-            # Noise call: 8 Q heads, 8 KV heads (gqa=1).
-            attn_origin = sdpa_dual_v(q1, k1, v1, v2, self.scale)  # GQA=gr
-            attn_noise  = sdpa_dual_v(q2, k2, v1, v2, self.scale)  # GQA=1
-            # Skip the (B, q_origin+q_groups, S, 2d) concat — gda_post_split
-            # reads attn_o and attn_n separately and broadcasts noise heads
-            # via index inside the kernel. Saves a 316us-class allocation.
+            # Custom kernel: shared QK, dual V SDPA with native GQA.
+            # Origin call: GQA=gr (kernel broadcasts k1/v1/v2 internally).
+            # Noise call:  GQA=1.
+            attn_origin = sdpa_dual_v(q1, k1, v1, v2, self.scale)
+            attn_noise  = sdpa_dual_v(q2, k2, v1, v2, self.scale)
             out = gda_post_split(
                 attn_origin, attn_noise, self.subln.weight, lam, self.lambda_init,
                 gr, eps=self.args.attn_rms_norm_eps,

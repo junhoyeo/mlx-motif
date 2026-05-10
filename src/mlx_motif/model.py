@@ -124,15 +124,13 @@ def get_activation(name: str) -> nn.Module:
 
 
 class MotifMLP(nn.Module):
-    """
-    Gated MLP with a poly-norm activation.
+    """Gated MLP with a poly-norm activation.
 
-    NOTE: a fused `polynorm(gate) * up` kernel exists in `kernels.py`
-    (`polynorm_mul`) but bench-shows ~7% slower than the separate
-    `polynorm + mul` path here on M1 Max. MLX's lazy graph appears to
-    already fuse the elementwise multiply into the down_proj matmul's
-    input handling more effectively than a single big custom kernel.
-    Keeping the simple two-call form as the default.
+    The simple `down_proj(act(gate) * up)` form is the fastest path on
+    M-series GPUs — see commits c4f2c03 (custom kernel: -7%) and the
+    `mx.compile` attempt (-47% from per-call recompile churn). MLX's
+    lazy graph already fuses the elementwise chain into the down_proj
+    matmul pipeline.
     """
 
     def __init__(self, args: ModelArgs):
@@ -363,33 +361,45 @@ class MotifAttention(nn.Module):
             v1 = _repeat(v1, self.kv_repeat, axis=1)
             v2 = _repeat(v2, self.kv_repeat, axis=1)
 
-        # OPT-IN: a flash-style fused decode kernel exists in `kernels.py`
-        # (gda_decode). It streams through KV in one pass and produces the
-        # SubLN-normalised differential output directly, but the current
-        # implementation uses a serial-per-thread KV loop which loses to MLX's
-        # simdgroup-matmul-based vectorized SDPA on M-series GPUs (~2.7× slower
-        # at 12.7B-q4). Keep the fallback as the default; turn the kernel on
-        # via `MLX_MOTIF_FLASH_DECODE=1` for benchmarking / future work.
-        from mlx_motif.kernels import gda_decode, gda_post
+        # Available flash kernels:
+        #   gda_decode      : original serial-per-thread (correct, slow)
+        #   sdpa_dual_v     : shared-QK dual-V SDPA (NEW, default at decode)
+        # See kernels.py docstrings for design notes.
+        from mlx_motif.kernels import gda_decode, gda_post, sdpa_dual_v
 
         lam = self._lambda_full(mx.float32).reshape(1)
-        use_flash_decode = (
+        use_serial_flash = (
             os.environ.get("MLX_MOTIF_FLASH_DECODE", "0") not in ("0", "", "false", "False")
+        )
+        use_dual_v = (
+            os.environ.get("MLX_MOTIF_DUAL_V", "1") not in ("0", "", "false", "False")
             and S == 1
             and self.kv_repeat == 1
             and kr == 1
             and not self.args.fused_rope
         )
 
-        if use_flash_decode:
+        if use_serial_flash and S == 1 and self.kv_repeat == 1 and kr == 1:
             out = gda_decode(
                 q1, q2, k1, k2, v1, v2,
-                self.subln.weight,
-                lam,
-                self.lambda_init,
-                gr,
-                self.scale,
-                eps=self.args.attn_rms_norm_eps,
+                self.subln.weight, lam, self.lambda_init,
+                gr, self.scale, eps=self.args.attn_rms_norm_eps,
+            )
+        elif use_dual_v:
+            # Custom kernel: shared QK, dual V, in one Metal pass.
+            # Build the full q_f / k_f layout (with origin/noise repeats)
+            # but skip the V concat — the kernel reads v1, v2 separately and
+            # writes 2D-wide attention output directly.
+            if kr == 1:
+                k_f = mx.concatenate([_repeat(k1, gr, axis=1), k2], axis=1)
+            else:
+                k_f = mx.concatenate([k1, k2], axis=1)
+            v1_f = mx.concatenate([_repeat(v1, gr, axis=1), v1], axis=1)
+            v2_f = mx.concatenate([_repeat(v2, gr, axis=1), v2], axis=1)
+            attn_cat = sdpa_dual_v(q_f, k_f, v1_f, v2_f, self.scale)
+            out = gda_post(
+                attn_cat, self.subln.weight, lam, self.lambda_init,
+                q_groups, gr, eps=self.args.attn_rms_norm_eps,
             )
         else:
             if kr == 1:
@@ -403,13 +413,8 @@ class MotifAttention(nn.Module):
                 q_f, k_f, v_cat, scale=self.scale, mask=mask
             )
             out = gda_post(
-                attn_cat,
-                self.subln.weight,
-                lam,
-                self.lambda_init,
-                q_groups,
-                gr,
-                eps=self.args.attn_rms_norm_eps,
+                attn_cat, self.subln.weight, lam, self.lambda_init,
+                q_groups, gr, eps=self.args.attn_rms_norm_eps,
             )
 
         # (B, q_groups*gr, S, 2d) -> (B, S, q_groups*gr*2d)

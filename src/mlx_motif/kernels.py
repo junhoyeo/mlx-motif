@@ -17,6 +17,8 @@ Public API:
     gda_decode(q1, q2, k1, k2, v1, v2, subln_weight,
                lambda_full, lambda_init, gr, eps) -> mx.array
     gda_decode_reference(...) -> mx.array
+    sdpa_dual_v(q, k, v1, v2, scale) -> mx.array     # NEW: shared QK, dual V
+    sdpa_dual_v_reference(q, k, v1, v2, scale) -> mx.array
 """
 
 from __future__ import annotations
@@ -482,7 +484,208 @@ def gda_post(
 
 
 # --------------------------------------------------------------------------- #
-# Flash-style fused GDA decode (S=1)
+# Shared-QK, dual-V SDPA decode (`sdpa_dual_v`)
+# --------------------------------------------------------------------------- #
+#
+# Custom Metal kernel that performs ONE softmax(Q·Kᵀ) computation and applies
+# the resulting attention weights to TWO independent V tensors (V1, V2) in a
+# single pass. Output: cat([attn·V1, attn·V2], axis=-1) — shape (B, H, 1, 2·D).
+#
+# Why this exists:
+#   `mx.fast.scaled_dot_product_attention` requires `query_head_dim ==
+#   value_head_dim` and only ships templates for D=V ∈ {64, 96, 128, 256}
+#   (see `mlx/backend/metal/scaled_dot_product_attention.cpp:618-621`). For
+#   the GDA grouped variant we need V of width 2·D=256 paired with D=128
+#   K — that combination falls back to the slow generic SDPA path.
+#
+#   Calling MLX SDPA twice with V=128 (once per V slab) avoids the fallback
+#   but recomputes Q·Kᵀ + softmax (~50% of the per-call work) twice. This
+#   kernel computes the QK-and-softmax exactly once and accumulates into TWO
+#   V slabs in the same KV loop, so each KV step does:
+#     - 1 partial-dot for QK score (same as MLX)
+#     - 2 weighted-V updates (vs MLX's 1)
+#   That's roughly 1.5× MLX's per-step compute but produces 2× the output —
+#   net ~25% saving over the two-call approach.
+#
+# Threadgroup layout matches MLX's `sdpa_vector`: BN=32 simdgroups × BD=32
+# lanes = 1024 threads. Per-thread persistent state stays at 10 fp32
+# (q[4] + o1[4] + o2[4] - actually 12, but transient k[4] is reused) so
+# we don't blow the register-pressure cap that the 4-V flash variant hit.
+#
+# Channel coverage: each simdgroup g produces v_per_thread=D/BD=4 channels
+# at output offsets `[g*4, g*4+4)` (V1 slab) and `[D + g*4, D + g*4+4)`
+# (V2 slab). 32 simdgroups × 4 channels × 2 slabs = 2D ✓.
+
+_SDPA_DUAL_V_SRC = r"""
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int qk_per_thread = D / BD;
+    constexpr int v_per_thread  = D / BD;
+
+    typedef float U;
+
+    uint head_idx = threadgroup_position_in_grid.x;     // batch*H linear index
+    uint sg_gid   = simdgroup_index_in_threadgroup;
+    uint sg_lid   = thread_index_in_simdgroup;
+
+    // Pointer setup (each tensor is (B*H, K, D), stored contiguously).
+    const device T* q_p  = q  + head_idx * D                   + sg_lid * qk_per_thread;
+    const device T* k_p  = k  + head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * qk_per_thread;
+    const device T* v1_p = v1 + head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
+    const device T* v2_p = v2 + head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
+    device T*       y_p  = y  + head_idx * (2 * D);
+
+    float scale = float(scale_in[0]);
+
+    // Per-lane Q (scaled once).
+    thread U q_r[qk_per_thread];
+    for (int j = 0; j < qk_per_thread; ++j) {
+        q_r[j] = scale * U(q_p[j]);
+    }
+
+    // Per-lane V accumulators — two slabs, v_per_thread channels each.
+    thread U o1[v_per_thread];
+    thread U o2[v_per_thread];
+    for (int j = 0; j < v_per_thread; ++j) { o1[j] = 0; o2[j] = 0; }
+
+    // -1e30 instead of -INF so fast::exp(-INF - finite) doesn't return NaN
+    // on M-series (lesson from commits 6922acb / acc2de7).
+    U max_score = U(-1e30f);
+    U sum_exp_score = U(0);
+
+    int kv_stride = BN * D;
+    for (int p = sg_gid; p < KV_SEQ; p += BN) {
+        // Load this lane's K slice.
+        thread U k_r[qk_per_thread];
+        for (int j = 0; j < qk_per_thread; ++j) k_r[j] = U(k_p[j]);
+
+        // QK dot, then simd_sum across the 32-lane simdgroup.
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; ++j) score += q_r[j] * k_r[j];
+        score = simd_sum(score);
+
+        // Online softmax update.
+        U new_max = max(max_score, score);
+        U fac = metal::fast::exp(max_score - new_max);
+        U exp_score = metal::fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * fac + exp_score;
+
+        // Update BOTH V accumulators with the same softmax weight.
+        for (int j = 0; j < v_per_thread; ++j) {
+            o1[j] = o1[j] * fac + exp_score * U(v1_p[j]);
+            o2[j] = o2[j] * fac + exp_score * U(v2_p[j]);
+        }
+
+        k_p  += kv_stride;
+        v1_p += kv_stride;
+        v2_p += kv_stride;
+    }
+
+    // Cross-simdgroup max/sum reduce — exact MLX SDPA pattern.
+    threadgroup U max_scores[BN];
+    threadgroup U sum_exp_scores[BN];
+    threadgroup U outputs[BN * BD];
+
+    if (sg_lid == 0) {
+        max_scores[sg_gid] = max_score;
+        sum_exp_scores[sg_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U lane_max = max_scores[sg_lid];
+    U new_max = simd_max(lane_max);
+    U lane_factor = metal::fast::exp(lane_max - new_max);
+    U lane_sum = simd_sum(sum_exp_scores[sg_lid] * lane_factor);
+
+    // Reduce both V slabs across simdgroups.
+    for (int i = 0; i < v_per_thread; ++i) {
+        // V1 slab
+        outputs[sg_lid * BD + sg_gid] = o1[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o1[i] = simd_sum(outputs[sg_gid * BD + sg_lid] * lane_factor);
+        o1[i] = (lane_sum == 0) ? o1[i] : (o1[i] / lane_sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // V2 slab
+        outputs[sg_lid * BD + sg_gid] = o2[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o2[i] = simd_sum(outputs[sg_gid * BD + sg_lid] * lane_factor);
+        o2[i] = (lane_sum == 0) ? o2[i] : (o2[i] / lane_sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Lane 0 of each simdgroup writes its v_per_thread channels of each slab.
+    if (sg_lid == 0) {
+        for (int i = 0; i < v_per_thread; ++i) {
+            y_p[sg_gid * v_per_thread + i] = T(o1[i]);
+            y_p[D + sg_gid * v_per_thread + i] = T(o2[i]);
+        }
+    }
+"""
+
+
+def _make_sdpa_dual_v_kernel():
+    return mx.fast.metal_kernel(
+        name="motif_sdpa_dual_v",
+        input_names=["q", "k", "v1", "v2", "scale_in"],
+        output_names=["y"],
+        source=_SDPA_DUAL_V_SRC,
+    )
+
+
+_sdpa_dual_v_kernel = None
+
+
+def sdpa_dual_v_reference(
+    q: mx.array, k: mx.array, v1: mx.array, v2: mx.array, scale: float
+) -> mx.array:
+    """Pure-MLX equivalent: cat(SDPA(q,k,v1), SDPA(q,k,v2), axis=-1)."""
+    a1 = mx.fast.scaled_dot_product_attention(q, k, v1, scale=scale)
+    a2 = mx.fast.scaled_dot_product_attention(q, k, v2, scale=scale)
+    return mx.concatenate([a1, a2], axis=-1)
+
+
+def sdpa_dual_v(
+    q: mx.array, k: mx.array, v1: mx.array, v2: mx.array, scale: float
+) -> mx.array:
+    """
+    Shared-QK, dual-V SDPA. `q,k` shape (B, H, 1, D); `v1,v2` shape (B, H, K, D).
+    Returns (B, H, 1, 2·D) = cat([SDPA(q,k,v1), SDPA(q,k,v2)], axis=-1).
+    Decode-only (S=1).
+    """
+    if _DISABLE:
+        return sdpa_dual_v_reference(q, k, v1, v2, scale)
+
+    global _sdpa_dual_v_kernel
+    if _sdpa_dual_v_kernel is None:
+        _sdpa_dual_v_kernel = _make_sdpa_dual_v_kernel()
+
+    B, H, S_q, D = q.shape
+    _, _, KV, _ = k.shape
+    assert S_q == 1, "sdpa_dual_v is decode-only"
+    assert D % 32 == 0, f"D={D} must be a multiple of 32"
+    assert v1.shape == v2.shape == (B, H, KV, D), "v1,v2 must match (B,H,K,D)"
+    assert k.shape[-1] == D, "K head_dim must match Q"
+
+    rows = B * H
+    tg = 32 * 32  # BN * BD = 1024
+    grid = (rows * tg, 1, 1)
+    threadgroup = (tg, 1, 1)
+
+    scale_arr = mx.array([scale], dtype=mx.float32)
+    out = _sdpa_dual_v_kernel(
+        inputs=[q, k, v1, v2, scale_arr],
+        template=[("T", q.dtype), ("D", D), ("KV_SEQ", KV)],
+        grid=grid,
+        threadgroup=threadgroup,
+        output_shapes=[(B, H, 1, 2 * D)],
+        output_dtypes=[q.dtype],
+    )[0]
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Flash-style fused GDA decode (S=1)  -- legacy slow version, kept for ref
 # --------------------------------------------------------------------------- #
 #
 # Replaces the entire grouped-attention pipeline at decode time:

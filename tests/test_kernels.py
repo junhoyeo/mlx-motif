@@ -7,8 +7,10 @@ import numpy as np
 import pytest
 
 from mlx_motif.kernels import (
-    polynorm, polynorm_reference,
-    polynorm_mul, polynorm_mul_reference,
+    polynorm,
+    polynorm_mul,
+    polynorm_mul_reference,
+    polynorm_reference,
 )
 
 
@@ -27,8 +29,9 @@ def test_polynorm_matches_reference(shape, dtype):
     # Bf16/fp16 have looser tolerances than fp32 due to accumulation noise.
     rtol = {mx.float32: 1e-4, mx.float16: 5e-2, mx.bfloat16: 5e-2}[dtype]
     atol = {mx.float32: 1e-4, mx.float16: 5e-2, mx.bfloat16: 5e-2}[dtype]
-    assert np.allclose(np.array(ref.astype(mx.float32)), np.array(got.astype(mx.float32)),
-                       rtol=rtol, atol=atol), (
+    assert np.allclose(
+        np.array(ref.astype(mx.float32)), np.array(got.astype(mx.float32)), rtol=rtol, atol=atol
+    ), (
         f"polynorm mismatch shape={shape} dtype={dtype}: "
         f"max diff={np.max(np.abs(np.array(ref.astype(mx.float32)) - np.array(got.astype(mx.float32)))):.4e}"
     )
@@ -49,8 +52,9 @@ def test_polynorm_mul_matches_reference(shape, dtype):
 
     rtol = {mx.float32: 1e-4, mx.bfloat16: 5e-2}[dtype]
     atol = {mx.float32: 1e-4, mx.bfloat16: 5e-2}[dtype]
-    assert np.allclose(np.array(ref.astype(mx.float32)), np.array(got.astype(mx.float32)),
-                       rtol=rtol, atol=atol), (
+    assert np.allclose(
+        np.array(ref.astype(mx.float32)), np.array(got.astype(mx.float32)), rtol=rtol, atol=atol
+    ), (
         f"polynorm_mul mismatch shape={shape} dtype={dtype}: "
         f"max diff={np.max(np.abs(np.array(ref.astype(mx.float32)) - np.array(got.astype(mx.float32)))):.4e}"
     )

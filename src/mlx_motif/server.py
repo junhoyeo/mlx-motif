@@ -39,8 +39,6 @@ import sys
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional
-
 
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
@@ -61,7 +59,7 @@ class ThinkFilter:
             raise ValueError(f"unknown think_mode: {mode}")
         self.mode = mode
         self.in_think = False
-        self.buffer = ""        # carries cross-chunk partial-tag text
+        self.buffer = ""  # carries cross-chunk partial-tag text
         self.captured = ""
 
     def feed(self, text: str) -> str:
@@ -83,26 +81,26 @@ class ThinkFilter:
                     consume = self.buffer[: len(self.buffer) - keep_partial]
                     if self.mode == "captured":
                         self.captured += consume
-                    self.buffer = self.buffer[len(self.buffer) - keep_partial:]
+                    self.buffer = self.buffer[len(self.buffer) - keep_partial :]
                     return "".join(out)
                 else:
                     inside = self.buffer[:close_idx]
                     if self.mode == "captured":
                         self.captured += inside
                     self.in_think = False
-                    self.buffer = self.buffer[close_idx + len(_THINK_CLOSE):]
+                    self.buffer = self.buffer[close_idx + len(_THINK_CLOSE) :]
             else:
                 open_idx = self.buffer.find(_THINK_OPEN)
                 if open_idx < 0:
                     keep_partial = self._partial_tag_suffix(self.buffer, _THINK_OPEN)
                     emit_now = self.buffer[: len(self.buffer) - keep_partial]
                     out.append(emit_now)
-                    self.buffer = self.buffer[len(self.buffer) - keep_partial:]
+                    self.buffer = self.buffer[len(self.buffer) - keep_partial :]
                     return "".join(out)
                 else:
                     out.append(self.buffer[:open_idx])
                     self.in_think = True
-                    self.buffer = self.buffer[open_idx + len(_THINK_OPEN):]
+                    self.buffer = self.buffer[open_idx + len(_THINK_OPEN) :]
 
         return "".join(out)
 
@@ -125,7 +123,10 @@ def _make_messages_text(messages: list[dict], tokenizer) -> str:
         except Exception:
             pass
     # Fallback: simple role: content concatenation.
-    return "".join(f"{m.get('role', 'user')}: {m.get('content', '')}\n" for m in messages) + "assistant: "
+    return (
+        "".join(f"{m.get('role', 'user')}: {m.get('content', '')}\n" for m in messages)
+        + "assistant: "
+    )
 
 
 def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
@@ -151,10 +152,13 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
 
         def do_GET(self):
             if self.path == "/v1/models":
-                return self._send_json(200, {
-                    "object": "list",
-                    "data": [{"id": model_id, "object": "model", "created": int(time.time())}],
-                })
+                return self._send_json(
+                    200,
+                    {
+                        "object": "list",
+                        "data": [{"id": model_id, "object": "model", "created": int(time.time())}],
+                    },
+                )
             self._send_json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
@@ -185,6 +189,7 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
             # `temp` is the mlx-lm sampler control; 0 → greedy.
             if temperature > 0:
                 from mlx_lm.sample_utils import make_sampler
+
                 kwargs["sampler"] = make_sampler(temp=temperature)
 
             if stream:
@@ -194,16 +199,22 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
                         out = filt.feed(r.text)
                         if out:
                             chunk = {
-                                "id": req_id, "object": "chat.completion.chunk",
-                                "created": created, "model": model_id,
-                                "choices": [{"index": 0, "delta": {"content": out}, "finish_reason": None}],
+                                "id": req_id,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": model_id,
+                                "choices": [
+                                    {"index": 0, "delta": {"content": out}, "finish_reason": None}
+                                ],
                             }
                             self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
                             self.wfile.flush()
                     # final chunk with optional captured reasoning
                     final = {
-                        "id": req_id, "object": "chat.completion.chunk",
-                        "created": created, "model": model_id,
+                        "id": req_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_id,
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                     }
                     if think_mode == "captured" and filt.captured:
@@ -220,17 +231,23 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
                     full += filt.feed(r.text)
                     last = r
                 payload = {
-                    "id": req_id, "object": "chat.completion",
-                    "created": created, "model": model_id,
-                    "choices": [{
-                        "index": 0,
-                        "message": {"role": "assistant", "content": full},
-                        "finish_reason": (last.finish_reason if last else "stop"),
-                    }],
+                    "id": req_id,
+                    "object": "chat.completion",
+                    "created": created,
+                    "model": model_id,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": full},
+                            "finish_reason": (last.finish_reason if last else "stop"),
+                        }
+                    ],
                     "usage": {
                         "prompt_tokens": (last.prompt_tokens if last else 0),
                         "completion_tokens": (last.generation_tokens if last else 0),
-                        "total_tokens": ((last.prompt_tokens + last.generation_tokens) if last else 0),
+                        "total_tokens": (
+                            (last.prompt_tokens + last.generation_tokens) if last else 0
+                        ),
                     },
                 }
                 if think_mode == "captured" and filt.captured:
@@ -240,14 +257,22 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
     return APIHandler
 
 
-def serve(model_path: str, host: str = "127.0.0.1", port: int = 8080,
-          model_id: str = "motif", think_mode: str = "visible") -> None:
+def serve(
+    model_path: str,
+    host: str = "127.0.0.1",
+    port: int = 8080,
+    model_id: str = "motif",
+    think_mode: str = "visible",
+) -> None:
     from mlx_motif import load
+
     print(f"Loading model from {model_path} …", file=sys.stderr)
     model, tokenizer = load(model_path)
     handler_cls = _make_handler(model, tokenizer, model_id, think_mode)
     httpd = HTTPServer((host, port), handler_cls)
-    print(f"Serving {model_id} (think_mode={think_mode}) on http://{host}:{port}/v1", file=sys.stderr)
+    print(
+        f"Serving {model_id} (think_mode={think_mode}) on http://{host}:{port}/v1", file=sys.stderr
+    )
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -260,9 +285,12 @@ def main():
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8080)
     p.add_argument("--model-id", default="motif", help="Identifier reported in /v1/models")
-    p.add_argument("--think-mode", default="visible",
-                   choices=["visible", "hidden", "captured"],
-                   help="Default reasoning-trace handling (overridable per-request)")
+    p.add_argument(
+        "--think-mode",
+        default="visible",
+        choices=["visible", "hidden", "captured"],
+        help="Default reasoning-trace handling (overridable per-request)",
+    )
     args = p.parse_args()
     serve(args.model, args.host, args.port, args.model_id, args.think_mode)
 

@@ -88,8 +88,10 @@ class MotifGroupedKVCache(_BaseCache):
             return self.k1, self.k2, self.v1, self.v2
         o = self.offset
         return (
-            self.k1[..., :o, :], self.k2[..., :o, :],
-            self.v1[..., :o, :], self.v2[..., :o, :],
+            self.k1[..., :o, :],
+            self.k2[..., :o, :],
+            self.v1[..., :o, :],
+            self.v2[..., :o, :],
         )
 
     @state.setter
@@ -115,7 +117,7 @@ class MotifGroupedKVCache(_BaseCache):
     def make_mask(self, *args, **kwargs):
         return create_attention_mask(*args, offset=self.offset, **kwargs)
 
-    def to_quantized(self, group_size: int = 64, bits: int = 8) -> "MotifGroupedQuantizedKVCache":
+    def to_quantized(self, group_size: int = 64, bits: int = 8) -> MotifGroupedQuantizedKVCache:
         """Switch to the quantized variant — keeps the 4 slots, quantizes them."""
         new = MotifGroupedQuantizedKVCache(group_size=group_size, bits=bits)
         if self.offset > 0:
@@ -162,13 +164,19 @@ class MotifGroupedQuantizedKVCache(_BaseCache):
             if self.k1 is not None:
                 # trim to the live region then concat fresh space
                 if prev % self.step != 0:
+
                     def _trim(t):
                         return tuple(x[..., :prev, :] for x in t)
-                    self.k1 = _trim(self.k1); self.k2 = _trim(self.k2)
-                    self.v1 = _trim(self.v1); self.v2 = _trim(self.v2)
+
+                    self.k1 = _trim(self.k1)
+                    self.k2 = _trim(self.k2)
+                    self.v1 = _trim(self.v1)
+                    self.v2 = _trim(self.v2)
                 fresh = self._init_quant(B, H, new_len, D, dtype)
+
                 def _expand(t, f):
                     return tuple(mx.concatenate([t[i], f[i]], axis=-2) for i in range(3))
+
                 self.k1 = _expand(self.k1, fresh)
                 self.k2 = _expand(self.k2, fresh)
                 self.v1 = _expand(self.v1, fresh)
@@ -197,18 +205,21 @@ class MotifGroupedQuantizedKVCache(_BaseCache):
 
         self.offset += S
         o = self.offset
+
         # Dequantize the live region for downstream attention kernel.
         def _deq(slot):
             return mx.dequantize(
-                slot[0][..., :o, :], slot[1][..., :o, :], slot[2][..., :o, :],
-                group_size=self.group_size, bits=self.bits,
+                slot[0][..., :o, :],
+                slot[1][..., :o, :],
+                slot[2][..., :o, :],
+                group_size=self.group_size,
+                bits=self.bits,
             )
+
         return _deq(self.k1), _deq(self.k2), _deq(self.v1), _deq(self.v2)
 
     def update_and_fetch(self, keys, values):
-        raise NotImplementedError(
-            "MotifGroupedQuantizedKVCache requires update_and_fetch_4."
-        )
+        raise NotImplementedError("MotifGroupedQuantizedKVCache requires update_and_fetch_4.")
 
     @property
     def state(self):

@@ -12,20 +12,20 @@ from mlx_motif.kernels import sdpa_dual_v_2pass, sdpa_dual_v_reference
 @pytest.mark.parametrize(
     "B,H_q,H_kv,KV,d",
     [
-        (1, 8, 8, 64, 128),     # gqa=1, short (=BLOCKS*2)
-        (1, 32, 8, 64, 128),    # 12.7B GQA gqa=4
-        (1, 32, 8, 256, 128),   # medium KV
+        (1, 8, 8, 64, 128),  # gqa=1, short (=BLOCKS*2)
+        (1, 32, 8, 64, 128),  # 12.7B GQA gqa=4
+        (1, 32, 8, 256, 128),  # medium KV
         (1, 32, 8, 1024, 128),  # long KV (where 2-pass should shine)
         (1, 32, 8, 4096, 128),  # very long KV
-        (2, 16, 8, 128, 128),   # batched
+        (2, 16, 8, 128, 128),  # batched
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
 def test_sdpa_dual_v_2pass_matches_reference(B, H_q, H_kv, KV, d, dtype):
     mx.random.seed(0)
-    scale = 1.0 / (d ** 0.5)
-    q  = (mx.random.normal((B, H_q, 1, d)) * 0.1).astype(dtype)
-    k  = (mx.random.normal((B, H_kv, KV, d)) * 0.1).astype(dtype)
+    scale = 1.0 / (d**0.5)
+    q = (mx.random.normal((B, H_q, 1, d)) * 0.1).astype(dtype)
+    k = (mx.random.normal((B, H_kv, KV, d)) * 0.1).astype(dtype)
     v1 = (mx.random.normal((B, H_kv, KV, d)) * 0.5).astype(dtype)
     v2 = (mx.random.normal((B, H_kv, KV, d)) * 0.5).astype(dtype)
 

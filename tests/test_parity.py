@@ -15,7 +15,6 @@ Example:
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import mlx.core as mx
 import numpy as np

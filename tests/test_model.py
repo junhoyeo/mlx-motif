@@ -43,8 +43,8 @@ def _grouped_args(**overrides) -> ModelArgs:
         hidden_size=64,
         num_hidden_layers=2,
         intermediate_size=128,
-        num_attention_heads=10,   # = 5 * 2 noise heads
-        num_key_value_heads=4,    # = 2 * (1 + k_ratio)  with k_ratio=1
+        num_attention_heads=10,  # = 5 * 2 noise heads
+        num_key_value_heads=4,  # = 2 * (1 + k_ratio)  with k_ratio=1
         num_noise_heads=2,
         k_ratio=1,
         vocab_size=128,

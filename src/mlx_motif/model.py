@@ -16,9 +16,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass, field
-from functools import partial
-from typing import Optional
+from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -60,21 +58,21 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     max_position_embeddings: int = 8192
-    head_dim: Optional[int] = None
-    num_noise_heads: Optional[int] = None
+    head_dim: int | None = None
+    num_noise_heads: int | None = None
     k_ratio: int = 1
     attn_rms_norm_eps: float = 1e-5
     tie_word_embeddings: bool = False
-    rope_scaling: Optional[dict] = None
+    rope_scaling: dict | None = None
     hidden_act: str = "poly_norm"
     use_bias: bool = False
     expanded: bool = False
-    sliding_window: Optional[int] = None
+    sliding_window: int | None = None
     use_sliding_window: bool = False
-    max_window_layers: Optional[int] = None
+    max_window_layers: int | None = None
     fused_rope: bool = False
-    bos_token_id: Optional[int] = None
-    eos_token_id: Optional[int] = None
+    bos_token_id: int | None = None
+    eos_token_id: int | None = None
 
     @property
     def is_grouped(self) -> bool:
@@ -184,7 +182,7 @@ class MotifAttention(nn.Module):
         self.args = args
         self.layer_idx = layer_idx
         self.head_dim = args.head_dim or (args.hidden_size // args.num_attention_heads)
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (layer_idx - 1))
 
         if args.is_grouped:
@@ -214,7 +212,9 @@ class MotifAttention(nn.Module):
     def _init_grouped(self, args: ModelArgs) -> None:
         self.num_noise_heads = args.num_noise_heads
         self.num_kv_heads = args.num_key_value_heads
-        self.grouped_ratio = (args.num_attention_heads - self.num_noise_heads) // self.num_noise_heads
+        self.grouped_ratio = (
+            args.num_attention_heads - self.num_noise_heads
+        ) // self.num_noise_heads
         self.q_heads = (self.grouped_ratio + 1) * self.num_noise_heads
         self.k_ratio = args.k_ratio
         self.k_noise_heads = self.num_kv_heads // (self.k_ratio + 1)
@@ -240,7 +240,6 @@ class MotifAttention(nn.Module):
         self.num_heads = args.num_attention_heads // 2
         self.num_kv_heads = args.num_key_value_heads // 2
         self.n_rep = self.num_heads // self.num_kv_heads
-        d = self.head_dim
         self.q_proj = nn.Linear(h, h, bias=args.use_bias)
         self.k_proj = nn.Linear(h, h // self.n_rep, bias=args.use_bias)
         self.v_proj = nn.Linear(h, h // self.n_rep, bias=args.use_bias)
@@ -258,7 +257,7 @@ class MotifAttention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,
+        mask: mx.array | None = None,
         cache=None,
     ) -> mx.array:
         if self.args.is_grouped:
@@ -277,7 +276,7 @@ class MotifAttention(nn.Module):
         # heads for the attention matmul.
         B, S, _ = x.shape
         d = self.head_dim
-        H = self.num_heads      # halved (effective DiffAttn heads)
+        H = self.num_heads  # halved (effective DiffAttn heads)
         Hk = self.num_kv_heads  # halved (effective DiffAttn KV heads)
 
         q = self.q_proj(x).reshape(B, S, 2 * H, d).transpose(0, 2, 1, 3)
@@ -350,6 +349,7 @@ class MotifAttention(nn.Module):
         # short-circuits the standard k/v cache + post-fetch split. We split
         # k/v on the head axis here, RoPE k1/k2 separately, and cache 4 slots.
         from mlx_motif.cache import MotifGroupedKVCache, MotifGroupedQuantizedKVCache
+
         gr = self.grouped_ratio
         q_groups = self.q_heads // (gr + 1)
         kr = self.k_ratio
@@ -414,8 +414,11 @@ class MotifAttention(nn.Module):
         from mlx_motif.kernels import gda_decode, gda_post, gda_post_split, sdpa_dual_v
 
         lam = self._lambda_full(mx.float32).reshape(1)
-        use_serial_flash = (
-            os.environ.get("MLX_MOTIF_FLASH_DECODE", "0") not in ("0", "", "false", "False")
+        use_serial_flash = os.environ.get("MLX_MOTIF_FLASH_DECODE", "0") not in (
+            "0",
+            "",
+            "false",
+            "False",
         )
         use_dual_v = (
             os.environ.get("MLX_MOTIF_DUAL_V", "1") not in ("0", "", "false", "False")
@@ -427,19 +430,33 @@ class MotifAttention(nn.Module):
 
         if use_serial_flash and S == 1 and self.kv_repeat == 1 and kr == 1:
             out = gda_decode(
-                q1, q2, k1, k2, v1, v2,
-                self.subln.weight, lam, self.lambda_init,
-                gr, self.scale, eps=self.args.attn_rms_norm_eps,
+                q1,
+                q2,
+                k1,
+                k2,
+                v1,
+                v2,
+                self.subln.weight,
+                lam,
+                self.lambda_init,
+                gr,
+                self.scale,
+                eps=self.args.attn_rms_norm_eps,
             )
         elif use_dual_v:
             # Custom kernel: shared QK, dual V SDPA with native GQA.
             # Origin call: GQA=gr (kernel broadcasts k1/v1/v2 internally).
             # Noise call:  GQA=1.
             attn_origin = sdpa_dual_v(q1, k1, v1, v2, self.scale)
-            attn_noise  = sdpa_dual_v(q2, k2, v1, v2, self.scale)
+            attn_noise = sdpa_dual_v(q2, k2, v1, v2, self.scale)
             out = gda_post_split(
-                attn_origin, attn_noise, self.subln.weight, lam, self.lambda_init,
-                gr, eps=self.args.attn_rms_norm_eps,
+                attn_origin,
+                attn_noise,
+                self.subln.weight,
+                lam,
+                self.lambda_init,
+                gr,
+                eps=self.args.attn_rms_norm_eps,
             )
         else:
             if kr == 1:
@@ -453,8 +470,13 @@ class MotifAttention(nn.Module):
                 q_f, k_f, v_cat, scale=self.scale, mask=mask
             )
             out = gda_post(
-                attn_cat, self.subln.weight, lam, self.lambda_init,
-                q_groups, gr, eps=self.args.attn_rms_norm_eps,
+                attn_cat,
+                self.subln.weight,
+                lam,
+                self.lambda_init,
+                q_groups,
+                gr,
+                eps=self.args.attn_rms_norm_eps,
             )
 
         # (B, q_groups*gr, S, 2d) -> (B, S, q_groups*gr*2d)
@@ -491,7 +513,7 @@ class MotifModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
+        mask: mx.array | None = None,
         cache=None,
     ) -> mx.array:
         h = self.embed_tokens(inputs)
@@ -499,7 +521,7 @@ class MotifModel(nn.Module):
             mask = create_attention_mask(h, cache)
         if cache is None:
             cache = [None] * len(self.layers)
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(self.layers, cache, strict=False):
             h = layer(h, mask=mask, cache=c)
         return self.norm(h)
 
@@ -521,7 +543,7 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
+        mask: mx.array | None = None,
         cache=None,
     ) -> mx.array:
         h = self.model(inputs, mask=mask, cache=cache)
@@ -557,12 +579,13 @@ class Model(nn.Module):
         dequant for ~4× cache memory at long context.
         """
         from mlx_lm.models.cache import KVCache
+
         from mlx_motif.cache import MotifGroupedKVCache, MotifGroupedQuantizedKVCache
 
         env = os.environ.get("MLX_MOTIF_4SLOT_CACHE", "0").lower()
         use_4slot = env not in ("0", "", "false", "off")
         caches = []
-        for layer in self.layers:
+        for _layer in self.layers:
             if use_4slot and self.args.is_grouped:
                 if env in ("q4", "4"):
                     caches.append(MotifGroupedQuantizedKVCache(group_size=64, bits=4))
@@ -620,8 +643,9 @@ class Model(nn.Module):
             attn = layer.self_attn
             q, k, v = attn.q_proj, attn.k_proj, attn.v_proj
             quantized = isinstance(q, nn.QuantizedLinear)
-            if quantized and not (q.bits == k.bits == v.bits and
-                                   q.group_size == k.group_size == v.group_size):
+            if quantized and not (
+                q.bits == k.bits == v.bits and q.group_size == k.group_size == v.group_size
+            ):
                 # Mixed-precision quant: skip fusion. Forward path falls
                 # back to three separate QuantizedLinear calls, which is
                 # ~10% slower at this op but preserves the per-layer bit
@@ -642,8 +666,12 @@ class Model(nn.Module):
             out_dim = q.weight.shape[0] + k.weight.shape[0] + v.weight.shape[0]
             if quantized:
                 fused = nn.QuantizedLinear(
-                    in_dim, out_dim, bias=False,
-                    group_size=q.group_size, bits=q.bits, mode=q.mode,
+                    in_dim,
+                    out_dim,
+                    bias=False,
+                    group_size=q.group_size,
+                    bits=q.bits,
+                    mode=q.mode,
                 )
                 fused.weight = mx.concatenate([q_w, k.weight, v.weight], axis=0)
                 fused.scales = mx.concatenate([q_s, k.scales, v.scales], axis=0)

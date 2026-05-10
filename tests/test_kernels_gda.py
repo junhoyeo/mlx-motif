@@ -12,10 +12,10 @@ from mlx_motif.kernels import gda_post, gda_post_reference
 @pytest.mark.parametrize(
     "B,q_groups,gr,S,d",
     [
-        (1, 2, 4, 4, 16),     # tiny smoke
-        (1, 8, 4, 1, 128),    # decode shape (12.7B layout)
-        (2, 8, 4, 7, 128),    # batched + multi-step
-        (1, 8, 4, 32, 128),   # short prefill (12.7B)
+        (1, 2, 4, 4, 16),  # tiny smoke
+        (1, 8, 4, 1, 128),  # decode shape (12.7B layout)
+        (2, 8, 4, 7, 128),  # batched + multi-step
+        (1, 8, 4, 32, 128),  # short prefill (12.7B)
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])

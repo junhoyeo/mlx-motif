@@ -12,10 +12,10 @@ from mlx_motif.kernels import gda_post_split, gda_post_split_reference
 @pytest.mark.parametrize(
     "B,q_groups,gr,S,d",
     [
-        (1, 8, 4, 1, 128),    # 12.7B decode
-        (1, 8, 4, 32, 128),   # short prefill
-        (2, 4, 4, 1, 128),    # batched
-        (1, 2, 4, 1, 64),     # smaller d
+        (1, 8, 4, 1, 128),  # 12.7B decode
+        (1, 8, 4, 32, 128),  # short prefill
+        (2, 4, 4, 1, 128),  # batched
+        (1, 2, 4, 1, 64),  # smaller d
     ],
 )
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])

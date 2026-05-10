@@ -524,16 +524,19 @@ _SDPA_DUAL_V_SRC = r"""
 
     typedef float U;
 
-    uint head_idx = threadgroup_position_in_grid.x;     // batch*H linear index
+    uint head_idx = threadgroup_position_in_grid.x;     // batch*Q_HEADS linear index
     uint sg_gid   = simdgroup_index_in_threadgroup;
     uint sg_lid   = thread_index_in_simdgroup;
 
-    // Pointer setup (each tensor is (B*H, K, D), stored contiguously).
-    const device T* q_p  = q  + head_idx * D                   + sg_lid * qk_per_thread;
-    const device T* k_p  = k  + head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * qk_per_thread;
-    const device T* v1_p = v1 + head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
-    const device T* v2_p = v2 + head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
-    device T*       y_p  = y  + head_idx * (2 * D);
+    // GQA broadcast: each `GQA_FACTOR` consecutive Q heads share one (K, V*) head.
+    // For GQA_FACTOR=1 this is the standard one-to-one mapping.
+    uint kv_head_idx = head_idx / uint(GQA_FACTOR);
+
+    const device T* q_p  = q  + head_idx    * D                       + sg_lid * qk_per_thread;
+    const device T* k_p  = k  + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * qk_per_thread;
+    const device T* v1_p = v1 + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
+    const device T* v2_p = v2 + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
+    device T*       y_p  = y  + head_idx    * (2 * D);
 
     float scale = float(scale_in[0]);
 
@@ -649,25 +652,39 @@ def sdpa_dual_v(
     q: mx.array, k: mx.array, v1: mx.array, v2: mx.array, scale: float
 ) -> mx.array:
     """
-    Shared-QK, dual-V SDPA. `q,k` shape (B, H, 1, D); `v1,v2` shape (B, H, K, D).
-    Returns (B, H, 1, 2·D) = cat([SDPA(q,k,v1), SDPA(q,k,v2)], axis=-1).
-    Decode-only (S=1).
+    Shared-QK, dual-V SDPA with native GQA broadcast.
+
+    `q` shape (B, H_q, 1, D); `k, v1, v2` shape (B, H_kv, K, D).
+    Each gqa_factor=H_q/H_kv consecutive Q heads share one (K, V*) head.
+    Returns (B, H_q, 1, 2·D) = cat([SDPA(q,k,v1), SDPA(q,k,v2)], axis=-1).
+
+    Decode-only (S=1). For GQA_FACTOR=1 this is plain dual-V SDPA.
     """
     if _DISABLE:
+        # Reference path: explicit repeat then 2 SDPAs.
+        H_q = q.shape[1]
+        H_kv = k.shape[1]
+        gqa = H_q // H_kv
+        if gqa > 1:
+            k = mx.repeat(k, gqa, axis=1)
+            v1 = mx.repeat(v1, gqa, axis=1)
+            v2 = mx.repeat(v2, gqa, axis=1)
         return sdpa_dual_v_reference(q, k, v1, v2, scale)
 
     global _sdpa_dual_v_kernel
     if _sdpa_dual_v_kernel is None:
         _sdpa_dual_v_kernel = _make_sdpa_dual_v_kernel()
 
-    B, H, S_q, D = q.shape
-    _, _, KV, _ = k.shape
+    B, H_q, S_q, D = q.shape
+    _, H_kv, KV, _ = k.shape
     assert S_q == 1, "sdpa_dual_v is decode-only"
     assert D % 32 == 0, f"D={D} must be a multiple of 32"
-    assert v1.shape == v2.shape == (B, H, KV, D), "v1,v2 must match (B,H,K,D)"
+    assert H_q % H_kv == 0, f"H_q={H_q} must be a multiple of H_kv={H_kv}"
+    gqa_factor = H_q // H_kv
+    assert v1.shape == v2.shape == (B, H_kv, KV, D), "v1,v2 must match (B, H_kv, K, D)"
     assert k.shape[-1] == D, "K head_dim must match Q"
 
-    rows = B * H
+    rows = B * H_q
     tg = 32 * 32  # BN * BD = 1024
     grid = (rows * tg, 1, 1)
     threadgroup = (tg, 1, 1)
@@ -675,10 +692,10 @@ def sdpa_dual_v(
     scale_arr = mx.array([scale], dtype=mx.float32)
     out = _sdpa_dual_v_kernel(
         inputs=[q, k, v1, v2, scale_arr],
-        template=[("T", q.dtype), ("D", D), ("KV_SEQ", KV)],
+        template=[("T", q.dtype), ("D", D), ("KV_SEQ", KV), ("GQA_FACTOR", gqa_factor)],
         grid=grid,
         threadgroup=threadgroup,
-        output_shapes=[(B, H, 1, 2 * D)],
+        output_shapes=[(B, H_q, 1, 2 * D)],
         output_dtypes=[q.dtype],
     )[0]
     return out

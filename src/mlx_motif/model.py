@@ -403,20 +403,13 @@ class MotifAttention(nn.Module):
                 gr, self.scale, eps=self.args.attn_rms_norm_eps,
             )
         elif use_dual_v:
-            # Custom kernel: shared QK, dual V, in one Metal pass.
-            # Split into two separate calls (origin: 32 heads, noise: 8 heads)
-            # — empirically 8% faster than one fused 40-head call because the
-            # smaller per-call workload pipelines better and avoids the
-            # head-axis concat allocation for q_f.
-            if kr == 1:
-                k1_o = _repeat(k1, gr, axis=1)
-            else:
-                k1_o = k1
-            v1_o = _repeat(v1, gr, axis=1)
-            v2_o = _repeat(v2, gr, axis=1)
-
-            attn_origin = sdpa_dual_v(q1, k1_o, v1_o, v2_o, self.scale)
-            attn_noise  = sdpa_dual_v(q2, k2,   v1,   v2,   self.scale)
+            # Custom kernel: shared QK, dual V with native GQA broadcast.
+            # Origin call: 32 Q heads with 8 KV heads (gqa=4) — kernel
+            # broadcasts internally via `kv_head_idx = head_idx / GQA_FACTOR`,
+            # so we avoid materializing the repeated 32-head K/V tensors.
+            # Noise call: 8 Q heads, 8 KV heads (gqa=1).
+            attn_origin = sdpa_dual_v(q1, k1, v1, v2, self.scale)  # GQA=gr
+            attn_noise  = sdpa_dual_v(q2, k2, v1, v2, self.scale)  # GQA=1
             merged = mx.concatenate([attn_origin, attn_noise], axis=1)
             out = gda_post(
                 merged, self.subln.weight, lam, self.lambda_init,

@@ -369,6 +369,78 @@ def gda_post(
 #   v2: (B, q_groups, K, d)   noise V (the second d channels)
 #
 # Output: (B, q_origin, 1, 2*d) — ready for the existing reshape + o_proj.
+#
+# ----------------------------------------------------------------------------
+# WHY THE NAIVE PORT OF MLX `sdpa_vector` DOESN'T BEAT MLX (yet):
+# ----------------------------------------------------------------------------
+# Studied `mlx/backend/metal/kernels/sdpa_vector.h` (vanilla SDPA decode):
+#
+#   threadgroup geometry: BN × BD = 32 × 32 = 1024 threads
+#   per-thread persistent state: q[4] + o[4] + (max, sum)  ≈ 10 fp32 (~40B)
+#   per-thread transient state:  k[4]                        ≈ 4 fp32
+#   channel coverage: BN * v_per_thread = 32 * (V/BD=4) = V (=128 for d=128)
+#
+# Differential attention forces TWO independent online softmaxes (q1·k1 and
+# q2·k2 produce DIFFERENT softmax denominators) and produces 2D output
+# channels. The cleanest port multiplies per-thread persistent state by ~2:
+#
+#   q1[4] + q2[4] + o_origin[v_pt] + o_noise[v_pt] + (m_o, s_o, m_n, s_n)
+#
+# With BN=BD=32 and V_total=2D=256, v_per_thread = V_total/BD = 8, giving
+# 4+4+8+8+4 = 28 fp32 (~112B) per thread — about 2.8× MLX vanilla. M1 Max's
+# `maxTotalThreadsPerThreadgroup` collapses to 896 at this register
+# pressure, so 1024 threads won't launch (verified empirically).
+#
+# Reducing to BN=16 keeps us under the cap but BREAKS channel coverage:
+# `BN * v_per_thread = 16 * 8 = 128 ≠ 256`, so the cross-simdgroup
+# transpose would only emit half the output channels.
+#
+# Three viable paths for a future iteration, in increasing complexity:
+#
+# 1. Two-pass kernel à la MLX `sdpa_vector_2pass_1` / `_2pass_2`. First
+#    pass writes per-block (max, sum, partial output) for both branches to
+#    global memory; second pass merges across blocks and emits the
+#    differential output. Register pressure drops because partials live
+#    in global, not registers. Adds one global write + one extra dispatch.
+#
+# 2. Two-kernel split: vanilla MLX SDPA shape but called twice (one per
+#    branch), each writing 2D-wide output to scratch; a tiny third kernel
+#    does the differential subtract + SubLN. Equivalent to current path
+#    in op count but kernel selection avoids the V-cat materialisation.
+#
+# 3. Custom register-pressure-aware design that reduces persistent state to
+#    fit BN=BD=32. Possibilities: spill output accumulators to threadgroup
+#    memory (32KB ceiling on M1 — tight but feasible), or use fp16 V
+#    accumulators (precision concern, especially with later SubLN).
+#
+# Until one of those lands, we ship the slow-but-correct serial kernel
+# below behind `MLX_MOTIF_FLASH_DECODE=1` so the call site, the
+# correctness reference, and the perf baseline all stay in tree. The
+# default decode path is the V-stacked SDPA + `gda_post` fusion, which
+# already gives +10.7% over the Phase 1 baseline (34.5 → 38.2 tok/s).
+#
+# ----------------------------------------------------------------------------
+# DECODE-TIME PROFILE (M1 Max, 12.7B-q4, single-token isolated benchmarks):
+# ----------------------------------------------------------------------------
+#   q_proj 4096 -> 5120 (q4)        328 µs   (10%)
+#   k_proj 4096 -> 2048 (q4)        288 µs   ( 9%)
+#   v_proj 4096 -> 2048 (q4)        288 µs   ( 9%)
+#   o_proj 8192 -> 4096 (q4)        437 µs   (13%)
+#   mlp gate 4096 -> 16384 (q4)     522 µs   (16%)
+#   mlp up   4096 -> 16384 (q4)     522 µs   (16%)
+#   mlp down 16384 -> 4096 (q4)     584 µs   (18%)
+#   SDPA q40 k16 v16(2d)            316 µs   (10%)
+#
+# Attention is *only 10%* of decode time per layer. The MLP path (gate +
+# up + down) is 50%. Even a perfect flash GDA kernel would save at most
+# 10% per token; the realistic ceiling for further attention work is
+# small. The bigger remaining targets are MLP fusion and quantized KV
+# (which would also need the custom cache class noted in model.py).
+#
+# Confirms: the current default decode path is essentially optimal for
+# the attention component. Any future flash-GDA work should focus on
+# *prefill* (long S) where attention compute is much larger.
+# ----------------------------------------------------------------------------
 
 
 _GDA_DECODE_SRC = r"""

@@ -271,6 +271,8 @@ Documented honestly because they're useful priors for the next person:
 | 2-pass dual-V (à la MLX `sdpa_vector_2pass_*`) | slower at every KV; right design for 1-Q-head models | `ab50df7` |
 | 4-slot quantized cache via dequant fetch | 15% memory saved, 12% slower (no in-kernel quant read) — **superseded** by `sdpa_dual_v_q4` (commit `e741102`) | `295ecf0` |
 | Composable q4 chain (3× `mx.quantized_matmul` + softmax + 2× attn@V) | Capped at +1% vs fp16 `sdpa_dual_v` at KV=8192. Confirmed compute-bound; motivated the hand-written kernel. | `f630dac` |
+| `qmv_dual_q4` — fused gate+up GEMV (shared `x` register reuse) | -9% at S=1, -77% at S=16. `x` already lives in L1 between MLX qmm calls so "shared load" buys nothing. Kept as reference for chips with smaller L1. | `54dabb5` |
+| `mlp_lowbit` preset — q3/gs=32 for MLP weights | -31% at p500 e2e + 10% PPL regression on Motif 12.7B, despite +31% per-call microbench. Extra scale/bias overhead absorbs the bandwidth saving. Kept opt-in for hardware/model A/B. | `b6a9c77` |
 
 ## Limitations / known issues
 
@@ -303,6 +305,10 @@ For ground truth on the math, see:
 ## Commit trail of optimizations
 
 ```
+b6a9c77  feat(quant): mlp_lowbit preset (NEGATIVE — kept opt-in)
+54dabb5  feat(kernels): qmv_dual_q4 fused gate+up GEMV (NEGATIVE — kept ref)
+1d2c950  docs(blog): quantized attention on M1 Max — where the win actually lives
+3372a01  docs(readme): refresh status table, negative-results, commit trail
 b362de6  feat(model): wire sdpa_dual_v_q4 into _forward_grouped + docs
 e741102  feat(kernels): sdpa_dual_v_q4 — quantized-input shared-QK dual-V SDPA
 9e062ae  docs(kernels): design + skeleton for sdpa_dual_v_q4

@@ -181,10 +181,56 @@ What this actually says:
 
 So the goalpost-shift framing from earlier was conservative. The kernel doesn't just beat the dequant-bridge baseline — at the workload it was designed for (long context with quantized cache), it beats *everything*. The microbench undersold it because it isolated attention from the rest of the layer's bandwidth competition.
 
-## Next moves
+## I tried the MLP. It didn't work.
 
-The MLP block is still the biggest remaining target on this codebase, and (per the analyst pass I ran in parallel) the highest-EV direction is a custom Metal kernel that does the **same shared-input/dual-output trick `sdpa_dual_v` uses, but for MLP**: load `x` once into registers, compute `gate_dot` and `up_dot` in parallel (two `qdot` calls sharing one `load_vector`), pipe through PolyNorm + multiply in registers, emit only the gated activation. Estimated +6-10% end-to-end. About a week of work.
+Following the analyst's recommendation, I went after MLP next via two paths in parallel:
 
-Symmetric to the attention kernel that just shipped, in the right way: **load activation once, compute two outputs, write less.**
+**Path 1 — fused `qmv_dual_q4` kernel.** A custom Metal kernel that does the exact shared-input/dual-output trick `sdpa_dual_v` uses, applied to MLP: load activation `x` into registers once, run two parallel `qdot`s against `gate_w` and `up_w`. Mirrors MLX's `qmv_fast_impl` threadgroup geometry exactly.
 
-The lesson stands: on Apple Silicon, **attention is the loud part, but MLP is the heavy part.** The next round of optimization probably isn't another attention kernel.
+Result (in-chain bench, fp16, 128-call batches):
+
+| S | sequential `mx.qmm × 2` | `qmv_dual_q4` | ratio |
+|---|---|---|---|
+| 1  | 0.220 ms | 0.240 ms | 1.09× (slower) |
+| 4  | 0.624 ms | 0.577 ms | 0.93× (faster) |
+| 16 | 1.236 ms | 2.185 ms | 1.77× (much slower) |
+| 64 | 2.302 ms | 8.733 ms | 3.79× (catastrophic) |
+
+The hypothesis was wrong. `x` is 8 KB and M1 Max's L1 is 192 KB per core, so after the first matmul, `x` is hot in L1 — the second matmul's "extra" reads of x are essentially free already. The bandwidth-saving thesis assumed L1 wasn't doing its job. Plus the doubled per-thread state (8 fp32 results vs MLX's 4) caused enough register pressure to slow the inner loop. At S>1, MLX's matmul switches to a simdgroup-matrix path my kernel doesn't mirror — that's why the regression grows with batch.
+
+**Path 2 — `mlp_lowbit` quant preset (q3/gs=32 for MLP).** Per-call microbench at MLP shape showed q3+gs=32 is **31% faster** than q4+gs=64 (0.37 vs 0.50 ms). So I added a quant preset that drops gate/up/down to q3+gs=32 while keeping attention at q4+gs=64, converted the actual 12.7B model with it, and ran end-to-end:
+
+| Throughput | p500 | p3000 |
+|---|---|---|
+| q4 baseline       | 25.91 tok/s | 12.24 tok/s |
+| `mlp_lowbit`      | 17.89 tok/s | 13.85 tok/s |
+
+| Perplexity (bundled corpus) | PPL |
+|---|---|
+| q4 baseline | 12.381 |
+| `mlp_lowbit` | 13.656 (+10% relative regression) |
+
+`mlp_lowbit` is **31% slower at p500** and within the noise band at p3000 (mlplow runs spanned 6.25 / 13.85 / 24.14 — ~4× spread suggesting thermal throttling). The +31% per-call microbench win does not survive integration. Two costs absorb it: ~+800 MB resident-memory overhead from doubled scale/bias entries at gs=32 (40 layers × 3 matmuls × 2 MB extra each), and apparent per-call dispatch overhead in MLX's q3 path that's higher than q4. Plus a real quality cost: +10% PPL relative.
+
+**Both kept in tree as documented negative results.** The `qmv_dual_q4` kernel is correct and may win on hardware with smaller L1 (M3/M4 maybe) or on shapes where x exceeds cache. The `mlp_lowbit` preset infrastructure is wired through the converter and ready to A/B against future bit-width combos. Neither is on by default.
+
+## What this teaches us about MLP on M1 Max
+
+Decode-time MLP at the Motif 12.7B shape (4096↔16384) appears to be **Pareto-optimal under MLX's current dispatch**. Both the bandwidth-side approaches (fuse to share x; lower bits to read fewer weight bytes) failed end-to-end despite winning their respective microbenches. The transfer from "isolated kernel works" to "real model is faster" is broken by:
+
+- L1 cache already absorbing the obvious "shared activation" reuse
+- Compiler register pressure when fused kernels exceed MLX's tightly-tuned per-thread budget
+- MLX's per-call dispatch overhead being non-trivial relative to a single GEMV at this shape
+- Lazy graph fusion across the MLP chain that custom kernels disrupt
+- Memory-overhead-driven cache pressure that erases bit-width savings
+
+The remaining doors that *might* still open:
+- **Architectural changes**: smaller `intermediate_size` with more layers, mixture-of-experts, etc. — out of scope for an inference port.
+- **Speculative decoding with a tiny draft model**: if the draft is fast enough, the target's MLP cost matters less per accepted token. The 2.6B → 12.7B draft already wires up but accept rate isn't high enough. Sub-1B Motif draft would help.
+- **Different chips**: M3/M4 with shifted compute/bandwidth ratios may flip both directions back to wins. Worth re-running both negative-result kernels on a different chip before considering them dead.
+
+So the candid update is: the MLP didn't have an easy lever on this hardware. The earlier "+6-10% from gate+up fusion" estimate was wrong because L1 was already doing the work the fusion was supposed to do.
+
+That itself is the lesson — **on a well-tuned modern matmul library, the obvious shared-resource fusions often don't win because the cache is already eating that reuse for free.** The wins on attention were in places MLX *wasn't* covering (the dual-V shape, the quantized-input reads). For MLP, MLX covers the obvious shapes, so wins require either non-obvious tricks (still searching) or stepping outside the kernel-only design space (architecture, draft models, hardware).
+
+The lesson stands, but with an addendum: on Apple Silicon, **attention is the loud part, MLP is the heavy part — but the heavy part is also tighter to optimize because MLX has been tuned for it.**

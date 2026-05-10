@@ -62,6 +62,16 @@ def main(argv: list[str] | None = None) -> int:
     pg.add_argument("--max-tokens", type=int, default=128)
     pg.set_defaults(func=_cmd_generate)
 
+    ps = sub.add_parser("serve", help="Run an OpenAI-compatible HTTP server")
+    ps.add_argument("--model", required=True, help="Path to converted MLX checkpoint")
+    ps.add_argument("--host", default="127.0.0.1")
+    ps.add_argument("--port", type=int, default=8080)
+    ps.add_argument("--model-id", default="motif")
+    ps.add_argument("--think-mode", default="visible",
+                    choices=["visible", "hidden", "captured"])
+    ps.set_defaults(func=lambda a: __import__("mlx_motif.server", fromlist=["serve"])
+                    .serve(a.model, a.host, a.port, a.model_id, a.think_mode) or 0)
+
     args = parser.parse_args(argv)
     return args.func(args)
 

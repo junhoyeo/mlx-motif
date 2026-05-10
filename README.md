@@ -29,7 +29,8 @@ Output is **byte-identical** between the kernel and reference paths — verified
 | 4a — Fused PolyNorm + GDA-post Metal kernels | done |
 | 4b — Custom shared-QK dual-V SDPA + variants | done (the headline win) |
 | 4c — 4-slot KV cache (memory savings at xlong) | done (opt-in via env) |
-| 5 — OpenAI-compatible server with `<think>` streaming | not started |
+| 4d — Quantized-input attention kernel (`sdpa_dual_v_q4`) | done (auto-engages with quant cache, beats dequant→fp16 by 27-43% at KV ≥ 1024) |
+| 5 — OpenAI-compatible server with `<think>` streaming | done (`mlx-motif serve --think-mode visible|hidden|captured`) |
 | 6 — HF Hub release + blog | not started |
 
 ## Install
@@ -268,7 +269,8 @@ Documented honestly because they're useful priors for the next person:
 | `mx.fast.SDPA` with quantized KV via dequant bridge | even-or-slower at all tested contexts | `ac95834`, `54c5c62` |
 | Single-call 40-head dual_v vs split origin/noise | split is +8% (smaller calls pipeline better) | `91c9a79` |
 | 2-pass dual-V (à la MLX `sdpa_vector_2pass_*`) | slower at every KV; right design for 1-Q-head models | `ab50df7` |
-| 4-slot quantized cache via dequant fetch | 15% memory saved, 12% slower (no in-kernel quant read) | `295ecf0` |
+| 4-slot quantized cache via dequant fetch | 15% memory saved, 12% slower (no in-kernel quant read) — **superseded** by `sdpa_dual_v_q4` (commit `e741102`) | `295ecf0` |
+| Composable q4 chain (3× `mx.quantized_matmul` + softmax + 2× attn@V) | Capped at +1% vs fp16 `sdpa_dual_v` at KV=8192. Confirmed compute-bound; motivated the hand-written kernel. | `f630dac` |
 
 ## Limitations / known issues
 
@@ -301,6 +303,12 @@ For ground truth on the math, see:
 ## Commit trail of optimizations
 
 ```
+b362de6  feat(model): wire sdpa_dual_v_q4 into _forward_grouped + docs
+e741102  feat(kernels): sdpa_dual_v_q4 — quantized-input shared-QK dual-V SDPA
+9e062ae  docs(kernels): design + skeleton for sdpa_dual_v_q4
+0e3f9fc  feat(server): OpenAI-compatible HTTP server with <think> stream filter
+b25f8af  feat(eval): perplexity script + finding: mixed-quant ≈ uniform q4
+f630dac  docs(kernels): bench notes — composable q4 chain doesn't beat sdpa_dual_v
 295ecf0  feat(cache): MotifGroupedKVCache + MotifGroupedQuantizedKVCache (4-slot)
 ab50df7  feat(kernels): 2-pass dual_v variant — correct, slower than single-pass
 3c92927  perf(model): drop the KV-size heuristic — native GQA wins everywhere

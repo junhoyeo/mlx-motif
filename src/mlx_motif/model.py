@@ -14,6 +14,7 @@ Both share PolyNorm activation (arXiv:2411.03884) and per-head SubLN over
 
 from __future__ import annotations
 
+import enum
 import math
 import os
 from dataclasses import dataclass, field
@@ -156,6 +157,77 @@ def _repeat(x: mx.array, n_rep: int, axis: int = 1) -> mx.array:
     if n_rep == 1:
         return x
     return mx.repeat(x, repeats=n_rep, axis=axis)
+
+
+# --------------------------------------------------------------------------- #
+# Attention-path resolution
+# --------------------------------------------------------------------------- #
+
+
+class AttnPath(enum.Enum):
+    """Which kernel + cache-fetch strategy to use in _forward_grouped.
+
+    SERIAL_FLASH — legacy gda_decode (single-token serial-per-thread flash).
+    QUANT_SDPA   — sdpa_dual_v_q4: K/V stay quantized through the kernel.
+    DUAL_V       — sdpa_dual_v: fp16 K/V, shared-QK dual-V kernel.
+    FALLBACK     — stacked SDPA + scalar gda_post (prefill / GQA repeat path).
+    """
+
+    SERIAL_FLASH = "gda_decode"
+    QUANT_SDPA = "sdpa_dual_v_q4"
+    DUAL_V = "sdpa_dual_v"
+    FALLBACK = "stacked_sdpa"
+
+
+def _resolve_attention_path(
+    cache,
+    S: int,
+    kv_repeat: int,
+    kr: int,
+    fused_rope: bool,
+    env=os.environ,
+) -> AttnPath:
+    """Choose the kernel + cache-fetch strategy for one forward step.
+
+    Pure function of its arguments — no global side-effects. Pass a plain
+    dict (or any object with a `.get(name, default)` method) for `env` to
+    control the feature flags in tests.
+
+    Decision order (first match wins):
+
+    1. SERIAL_FLASH — ``MLX_MOTIF_FLASH_DECODE != 0`` AND single-token
+       decode with no GQA repeat and k_ratio == 1.
+    2. QUANT_SDPA   — cache is ``MotifGroupedQuantizedKVCache`` AND
+       ``MLX_MOTIF_QUANT_SDPA != 0`` AND same decode conditions as above.
+    3. DUAL_V       — ``MLX_MOTIF_DUAL_V != 0`` AND same decode conditions.
+    4. FALLBACK     — everything else (prefill, GQA repeat, k_ratio > 1, …).
+    """
+    from mlx_motif.cache import MotifGroupedQuantizedKVCache
+
+    _is_falsy = ("0", "", "false", "False")
+
+    decode_eligible = S == 1 and kv_repeat == 1 and kr == 1 and not fused_rope
+
+    if (
+        decode_eligible
+        and env.get("MLX_MOTIF_FLASH_DECODE", "0") not in _is_falsy
+    ):
+        return AttnPath.SERIAL_FLASH
+
+    if (
+        decode_eligible
+        and isinstance(cache, MotifGroupedQuantizedKVCache)
+        and env.get("MLX_MOTIF_QUANT_SDPA", "1") not in _is_falsy
+    ):
+        return AttnPath.QUANT_SDPA
+
+    if (
+        decode_eligible
+        and env.get("MLX_MOTIF_DUAL_V", "1") not in _is_falsy
+    ):
+        return AttnPath.DUAL_V
+
+    return AttnPath.FALLBACK
 
 
 class MotifAttention(nn.Module):
@@ -346,9 +418,6 @@ class MotifAttention(nn.Module):
         offset = cache.offset if cache is not None else 0
         q = self.rope(q, offset=offset)
 
-        # 4-slot cache (MotifGroupedKVCache / MotifGroupedQuantizedKVCache)
-        # short-circuits the standard k/v cache + post-fetch split. We split
-        # k/v on the head axis here, RoPE k1/k2 separately, and cache 4 slots.
         from mlx_motif.cache import MotifGroupedKVCache, MotifGroupedQuantizedKVCache
         gr = self.grouped_ratio
         q_groups = self.q_heads // (gr + 1)
@@ -356,25 +425,22 @@ class MotifAttention(nn.Module):
         k_groups = self.num_kv_heads // (kr + 1)
         is_4slot = isinstance(cache, (MotifGroupedKVCache, MotifGroupedQuantizedKVCache))
 
-        # Use the quantized-input attention kernel (sdpa_dual_v_q4) when the
-        # cache is quantized AND we're in single-token decode. This skips the
-        # per-step `mx.dequantize` of K/V1/V2 (3 ops per layer per token) by
-        # reading the packed bits directly inside the attention kernel.
-        # At KV ≥ 1024 this is 27-43% faster than dequant→sdpa_dual_v
-        # (bench in commit history); at KV < 1024 it can regress 5-25% so we
-        # gate it behind an env flag (default: on for any quantized cache).
-        use_quant_sdpa = (
-            isinstance(cache, MotifGroupedQuantizedKVCache)
-            and S == 1
-            and self.kv_repeat == 1
-            and kr == 1
-            and not self.args.fused_rope
-            and os.environ.get("MLX_MOTIF_QUANT_SDPA", "1") not in ("0", "", "false", "False")
+        # Single decision point: resolve which kernel + cache-fetch to use.
+        # Both the cache-fetch branch below and the kernel-selection branch
+        # further down key off the same `path` value — no condition is
+        # re-evaluated independently.
+        path = _resolve_attention_path(
+            cache, S, self.kv_repeat, kr, self.args.fused_rope,
         )
-        k1_q = k2_q = v1_q = v2_q = None  # filled in only on the quant-input path
+
+        # ------------------------------------------------------------------ #
+        # Cache fetch — shape depends on path
+        # ------------------------------------------------------------------ #
+
+        k1_q = k2_q = v1_q = v2_q = None  # quantized triples; QUANT_SDPA only
 
         if is_4slot:
-            # Pre-cache split.
+            # Pre-cache split: RoPE k1/k2 before writing to 4-slot cache.
             k_pre = k.reshape(B, k_groups, kr + 1, S, d)
             k1_new = k_pre[:, :, :kr, :, :].reshape(B, k_groups * kr, S, d)
             k2_new = k_pre[:, :, kr:, :, :].reshape(B, k_groups, S, d)
@@ -383,15 +449,13 @@ class MotifAttention(nn.Module):
             v2_new = v_pre[:, :, 1, :, :]
             k1_new = self.rope(k1_new, offset=offset)
             k2_new = self.rope(k2_new, offset=offset)
-            if use_quant_sdpa:
-                # Cache fetch returns raw quantized triples for sdpa_dual_v_q4.
+            if path is AttnPath.QUANT_SDPA:
+                # Return raw quantized triples; sdpa_dual_v_q4 reads packed
+                # bits directly — no per-step mx.dequantize.
                 k1_q, k2_q, v1_q, v2_q = cache.update_and_fetch_4_quantized(
                     k1_new, k2_new, v1_new, v2_new,
                 )
-                # k1/k2/v1/v2 are still set for shape introspection downstream
-                # (kv_seq + GQA branch decisions); use small placeholders that
-                # the dual-v-q4 kernel ignores.
-                k1 = k2 = v1 = v2 = None
+                k1 = k2 = v1 = v2 = None  # unused on this path
             else:
                 k1, k2, v1, v2 = cache.update_and_fetch_4(k1_new, k2_new, v1_new, v2_new)
             kv_seq = cache.offset
@@ -401,6 +465,10 @@ class MotifAttention(nn.Module):
                 k, v = cache.update_and_fetch(k, v)
                 k, v = _maybe_dequant_kv(k, v, cache)
             kv_seq = k.shape[2]
+
+        # ------------------------------------------------------------------ #
+        # Q / K / V splits
+        # ------------------------------------------------------------------ #
 
         # Split q on the head axis. Two layouts:
         #   - origin-first (after fuse_qkv): q is [origin | noise], plain slice
@@ -433,6 +501,10 @@ class MotifAttention(nn.Module):
             v1 = _repeat(v1, self.kv_repeat, axis=1)
             v2 = _repeat(v2, self.kv_repeat, axis=1)
 
+        # ------------------------------------------------------------------ #
+        # Kernel selection — keyed off the same `path` computed above
+        # ------------------------------------------------------------------ #
+
         # Available flash kernels:
         #   gda_decode        : original serial-per-thread (correct, slow)
         #   sdpa_dual_v       : shared-QK dual-V SDPA (default at decode)
@@ -444,24 +516,14 @@ class MotifAttention(nn.Module):
         )
 
         lam = self._lambda_full(mx.float32).reshape(1)
-        use_serial_flash = (
-            os.environ.get("MLX_MOTIF_FLASH_DECODE", "0") not in ("0", "", "false", "False")
-        )
-        use_dual_v = (
-            os.environ.get("MLX_MOTIF_DUAL_V", "1") not in ("0", "", "false", "False")
-            and S == 1
-            and self.kv_repeat == 1
-            and kr == 1
-            and not self.args.fused_rope
-        )
 
-        if use_serial_flash and S == 1 and self.kv_repeat == 1 and kr == 1:
+        if path is AttnPath.SERIAL_FLASH:
             out = gda_decode(
                 q1, q2, k1, k2, v1, v2,
                 self.subln.weight, lam, self.lambda_init,
                 gr, self.scale, eps=self.args.attn_rms_norm_eps,
             )
-        elif use_quant_sdpa:
+        elif path is AttnPath.QUANT_SDPA:
             # Quantized-input fast path: K, V1, V2 stay packed all the way
             # into the attention kernel — no per-step `mx.dequantize`. The
             # kernel does mask-without-shift for QK (MLX qdot trick) plus
@@ -478,7 +540,7 @@ class MotifAttention(nn.Module):
                 attn_origin, attn_noise, self.subln.weight, lam, self.lambda_init,
                 gr, eps=self.args.attn_rms_norm_eps,
             )
-        elif use_dual_v:
+        elif path is AttnPath.DUAL_V:
             # Custom kernel: shared QK, dual V SDPA with native GQA.
             # Origin call: GQA=gr (kernel broadcasts k1/v1/v2 internally).
             # Noise call:  GQA=1.
@@ -488,7 +550,7 @@ class MotifAttention(nn.Module):
                 attn_origin, attn_noise, self.subln.weight, lam, self.lambda_init,
                 gr, eps=self.args.attn_rms_norm_eps,
             )
-        else:
+        else:  # AttnPath.FALLBACK
             if kr == 1:
                 k_f = mx.concatenate([_repeat(k1, gr, axis=1), k2], axis=1)
             else:

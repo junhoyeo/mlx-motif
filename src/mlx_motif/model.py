@@ -23,6 +23,12 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs, create_attention_mask
 from mlx_lm.models.rope_utils import initialize_rope
 
+# NOTE: QuantizedKVCache support is intentionally absent. The differential
+# pattern requires per-head K/V slicing after cache fetch, which the
+# quantized triples (data, scales, biases) returned by `QuantizedKVCache`
+# do not support. A future custom cache class with separate k1/k2/v1/v2
+# slots would unlock it.
+
 
 # --------------------------------------------------------------------------- #
 # Config
@@ -257,9 +263,14 @@ class MotifAttention(nn.Module):
         q = self.rope(q, offset=offset)
         k = self.rope(k, offset=offset)
 
+        # NOTE: vanilla differential attention is *not* compatible with
+        # QuantizedKVCache. After cache fetch, K is an opaque quantized triple,
+        # which blocks the per-row stripe-split that the differential subtract
+        # depends on (and V here has 2·d width per logical head, which the
+        # quantized SDPA wrapper does not support paired with d-wide K). Keep
+        # this path on the standard KVCache contract.
         if cache is not None:
             k, v = cache.update_and_fetch(k, v)
-
         kv_seq = k.shape[2]
 
         # Recover (B, Hk, S, 2d) — see `_init_vanilla` shape derivation.

@@ -18,6 +18,8 @@ def _cmd_convert(args: argparse.Namespace) -> int:
         q_group_size=args.group_size,
         quant_preset=args.quant_preset,
         q_proj_bits=args.q_proj_bits,
+        mlp_bits=args.mlp_bits,
+        mlp_group_size=args.mlp_group_size,
     )
     print(f"Wrote MLX checkpoint to {out}")
     return 0
@@ -51,9 +53,16 @@ def main(argv: list[str] | None = None) -> int:
     pc.add_argument("--quantize", action="store_true")
     pc.add_argument("--bits", type=int, default=4)
     pc.add_argument("--group-size", type=int, default=64)
-    pc.add_argument("--quant-preset", default="uniform", choices=["uniform", "mixed"],
-                    help="`mixed` keeps q_proj at --q-proj-bits, rest at --bits")
+    pc.add_argument("--quant-preset", default="uniform",
+                    choices=["uniform", "mixed", "mlp_lowbit"],
+                    help=("`mixed` keeps q_proj at --q-proj-bits, rest at --bits; "
+                          "`mlp_lowbit` drops MLP projections to --mlp-bits/--mlp-group-size, "
+                          "rest at --bits/--group-size"))
     pc.add_argument("--q-proj-bits", type=int, default=6)
+    pc.add_argument("--mlp-bits", type=int, default=3,
+                    help="bit width for gate_proj/up_proj/down_proj under the mlp_lowbit preset")
+    pc.add_argument("--mlp-group-size", type=int, default=32,
+                    help="group_size for MLP weights under the mlp_lowbit preset")
     pc.set_defaults(func=_cmd_convert)
 
     pg = sub.add_parser("generate", help="Run generation against a converted MLX model")

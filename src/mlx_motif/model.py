@@ -356,6 +356,23 @@ class MotifAttention(nn.Module):
         k_groups = self.num_kv_heads // (kr + 1)
         is_4slot = isinstance(cache, (MotifGroupedKVCache, MotifGroupedQuantizedKVCache))
 
+        # Use the quantized-input attention kernel (sdpa_dual_v_q4) when the
+        # cache is quantized AND we're in single-token decode. This skips the
+        # per-step `mx.dequantize` of K/V1/V2 (3 ops per layer per token) by
+        # reading the packed bits directly inside the attention kernel.
+        # At KV ≥ 1024 this is 27-43% faster than dequant→sdpa_dual_v
+        # (bench in commit history); at KV < 1024 it can regress 5-25% so we
+        # gate it behind an env flag (default: on for any quantized cache).
+        use_quant_sdpa = (
+            isinstance(cache, MotifGroupedQuantizedKVCache)
+            and S == 1
+            and self.kv_repeat == 1
+            and kr == 1
+            and not self.args.fused_rope
+            and os.environ.get("MLX_MOTIF_QUANT_SDPA", "1") not in ("0", "", "false", "False")
+        )
+        k1_q = k2_q = v1_q = v2_q = None  # filled in only on the quant-input path
+
         if is_4slot:
             # Pre-cache split.
             k_pre = k.reshape(B, k_groups, kr + 1, S, d)
@@ -366,7 +383,17 @@ class MotifAttention(nn.Module):
             v2_new = v_pre[:, :, 1, :, :]
             k1_new = self.rope(k1_new, offset=offset)
             k2_new = self.rope(k2_new, offset=offset)
-            k1, k2, v1, v2 = cache.update_and_fetch_4(k1_new, k2_new, v1_new, v2_new)
+            if use_quant_sdpa:
+                # Cache fetch returns raw quantized triples for sdpa_dual_v_q4.
+                k1_q, k2_q, v1_q, v2_q = cache.update_and_fetch_4_quantized(
+                    k1_new, k2_new, v1_new, v2_new,
+                )
+                # k1/k2/v1/v2 are still set for shape introspection downstream
+                # (kv_seq + GQA branch decisions); use small placeholders that
+                # the dual-v-q4 kernel ignores.
+                k1 = k2 = v1 = v2 = None
+            else:
+                k1, k2, v1, v2 = cache.update_and_fetch_4(k1_new, k2_new, v1_new, v2_new)
             kv_seq = cache.offset
         else:
             k = self.rope(k, offset=offset)
@@ -411,7 +438,10 @@ class MotifAttention(nn.Module):
         #   sdpa_dual_v       : shared-QK dual-V SDPA (default at decode)
         #   gda_post_split    : split-input post-reduction (avoids concat)
         # See kernels.py docstrings for design notes.
-        from mlx_motif.kernels import gda_decode, gda_post, gda_post_split, sdpa_dual_v
+        from mlx_motif.kernels import (
+            gda_decode, gda_post, gda_post_split,
+            sdpa_dual_v, sdpa_dual_v_q4,
+        )
 
         lam = self._lambda_full(mx.float32).reshape(1)
         use_serial_flash = (
@@ -430,6 +460,23 @@ class MotifAttention(nn.Module):
                 q1, q2, k1, k2, v1, v2,
                 self.subln.weight, lam, self.lambda_init,
                 gr, self.scale, eps=self.args.attn_rms_norm_eps,
+            )
+        elif use_quant_sdpa:
+            # Quantized-input fast path: K, V1, V2 stay packed all the way
+            # into the attention kernel — no per-step `mx.dequantize`. The
+            # kernel does mask-without-shift for QK (MLX qdot trick) plus
+            # in-register dequant for V. See `sdpa_dual_v_q4` docstring.
+            attn_origin = sdpa_dual_v_q4(
+                q1, k1_q, v1_q, v2_q, self.scale,
+                group_size=cache.group_size, bits=cache.bits,
+            )
+            attn_noise = sdpa_dual_v_q4(
+                q2, k2_q, v1_q, v2_q, self.scale,
+                group_size=cache.group_size, bits=cache.bits,
+            )
+            out = gda_post_split(
+                attn_origin, attn_noise, self.subln.weight, lam, self.lambda_init,
+                gr, eps=self.args.attn_rms_norm_eps,
             )
         elif use_dual_v:
             # Custom kernel: shared QK, dual V SDPA with native GQA.

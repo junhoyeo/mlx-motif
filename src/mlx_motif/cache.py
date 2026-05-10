@@ -183,6 +183,33 @@ class MotifGroupedQuantizedKVCache(_BaseCache):
         """Quantize the 4 incoming slices and append; return dequantized
         slices of the live cache region (so the fp16/bf16 attention kernel
         consumes unchanged inputs)."""
+        self._update_4(k1, k2, v1, v2)
+        o = self.offset
+        # Dequantize the live region for downstream attention kernel.
+        def _deq(slot):
+            return mx.dequantize(
+                slot[0][..., :o, :], slot[1][..., :o, :], slot[2][..., :o, :],
+                group_size=self.group_size, bits=self.bits,
+            )
+        return _deq(self.k1), _deq(self.k2), _deq(self.v1), _deq(self.v2)
+
+    def update_and_fetch_4_quantized(self, k1, k2, v1, v2):
+        """Quantize the 4 incoming slices and append; return live-region
+        slices of each slot as raw quantized triples `(data, scales, biases)`.
+
+        This is the bandwidth-saving path: the consumer (a quant-input
+        attention kernel like `sdpa_dual_v_q4`) reads packed 4/8-bit
+        memory directly without paying the per-step `mx.dequantize` cost.
+        """
+        self._update_4(k1, k2, v1, v2)
+        o = self.offset
+        def _live(slot):
+            return (
+                slot[0][..., :o, :], slot[1][..., :o, :], slot[2][..., :o, :],
+            )
+        return _live(self.k1), _live(self.k2), _live(self.v1), _live(self.v2)
+
+    def _update_4(self, k1, k2, v1, v2):
         B, H, S, D = k1.shape
         prev = self.offset
         self._grow(B, H, S, D, k1.dtype)
@@ -196,14 +223,6 @@ class MotifGroupedQuantizedKVCache(_BaseCache):
             slot[2][..., prev : prev + S, :] = q_biases
 
         self.offset += S
-        o = self.offset
-        # Dequantize the live region for downstream attention kernel.
-        def _deq(slot):
-            return mx.dequantize(
-                slot[0][..., :o, :], slot[1][..., :o, :], slot[2][..., :o, :],
-                group_size=self.group_size, bits=self.bits,
-            )
-        return _deq(self.k1), _deq(self.k2), _deq(self.v1), _deq(self.v2)
 
     def update_and_fetch(self, keys, values):
         raise NotImplementedError(

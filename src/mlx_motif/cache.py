@@ -185,8 +185,10 @@ class MotifGroupedKVCache(MotifGroupedKVCacheBase):
             return self.k1, self.k2, self.v1, self.v2
         o = self.offset
         return (
-            self.k1[..., :o, :], self.k2[..., :o, :],
-            self.v1[..., :o, :], self.v2[..., :o, :],
+            self.k1[..., :o, :],
+            self.k2[..., :o, :],
+            self.v1[..., :o, :],
+            self.v2[..., :o, :],
         )
 
     @state.setter
@@ -265,12 +267,17 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
         consumes unchanged inputs)."""
         self._update_4(k1, k2, v1, v2)
         o = self.offset
+
         # Dequantize the live region for downstream attention kernel.
         def _deq(slot):
             return mx.dequantize(
-                slot[0][..., :o, :], slot[1][..., :o, :], slot[2][..., :o, :],
-                group_size=self.group_size, bits=self.bits,
+                slot[0][..., :o, :],
+                slot[1][..., :o, :],
+                slot[2][..., :o, :],
+                group_size=self.group_size,
+                bits=self.bits,
             )
+
         return _deq(self.k1), _deq(self.k2), _deq(self.v1), _deq(self.v2)
 
     def update_and_fetch_4_quantized(self, k1, k2, v1, v2):
@@ -283,10 +290,14 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
         """
         self._update_4(k1, k2, v1, v2)
         o = self.offset
+
         def _live(slot):
             return (
-                slot[0][..., :o, :], slot[1][..., :o, :], slot[2][..., :o, :],
+                slot[0][..., :o, :],
+                slot[1][..., :o, :],
+                slot[2][..., :o, :],
             )
+
         return _live(self.k1), _live(self.k2), _live(self.v1), _live(self.v2)
 
     def _update_4(self, k1, k2, v1, v2):

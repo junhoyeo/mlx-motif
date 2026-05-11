@@ -108,10 +108,9 @@ def _make_polynorm_kernel():
 _polynorm_kernel = None
 
 
-def polynorm_reference(
-    x: mx.array, weight: mx.array, bias: mx.array, eps: float
-) -> mx.array:
+def polynorm_reference(x: mx.array, weight: mx.array, bias: mx.array, eps: float) -> mx.array:
     """Pure-MLX reference, mathematically identical to the kernel."""
+
     def _rms(z):
         return z * mx.rsqrt(mx.mean(z * z, axis=-1, keepdims=True) + eps)
 
@@ -120,9 +119,7 @@ def polynorm_reference(
     return weight[0] * _rms(x3) + weight[1] * _rms(x2) + weight[2] * _rms(x) + bias
 
 
-def polynorm(
-    x: mx.array, weight: mx.array, bias: mx.array, eps: float = 1e-6
-) -> mx.array:
+def polynorm(x: mx.array, weight: mx.array, bias: mx.array, eps: float = 1e-6) -> mx.array:
     """
     Fused PolyNorm. Falls back to the reference if kernels are disabled.
 
@@ -350,8 +347,11 @@ _dequant_probe_kernel = None
 
 
 def _dequant_probe(
-    data: mx.array, scales: mx.array, biases: mx.array,
-    group_size: int = 64, bits: int = 4,
+    data: mx.array,
+    scales: mx.array,
+    biases: mx.array,
+    group_size: int = 64,
+    bits: int = 4,
 ) -> mx.array:
     """Metal-kernel dequant. Public only as a test helper.
 
@@ -529,8 +529,12 @@ def _make_qmv_dual_kernel():
         name="motif_qmv_dual_q4",
         input_names=[
             "x",
-            "gate_data", "gate_scales", "gate_biases",
-            "up_data", "up_scales", "up_biases",
+            "gate_data",
+            "gate_scales",
+            "gate_biases",
+            "up_data",
+            "up_scales",
+            "up_biases",
         ],
         output_names=["gate_y", "up_y"],
         source=_QMV_DUAL_SRC,
@@ -550,10 +554,18 @@ def qmv_dual_q4_reference(
 ) -> tuple:
     """Pure-MLX reference: two `mx.quantized_matmul` calls."""
     gate_y = mx.quantized_matmul(
-        x, *gate_q, transpose=True, group_size=group_size, bits=bits,
+        x,
+        *gate_q,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
     )
     up_y = mx.quantized_matmul(
-        x, *up_q, transpose=True, group_size=group_size, bits=bits,
+        x,
+        *up_q,
+        transpose=True,
+        group_size=group_size,
+        bits=bits,
     )
     return gate_y, up_y
 
@@ -622,8 +634,12 @@ def qmv_dual_q4(
     gate_y, up_y = _qmv_dual_kernel(
         inputs=[
             x_flat,
-            gate_data, gate_scales, gate_biases,
-            up_data, up_scales, up_biases,
+            gate_data,
+            gate_scales,
+            gate_biases,
+            up_data,
+            up_scales,
+            up_biases,
         ],
         template=[("T", x.dtype), ("IN", IN), ("OUT", OUT), ("GROUP_SIZE", group_size)],
         grid=grid,

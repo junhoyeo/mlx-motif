@@ -67,7 +67,10 @@ _MLP_PROJ_NAMES = (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj")
 
 
 def _mlp_lowbit_predicate(
-    bits: int, group_size: int, mlp_bits: int, mlp_group_size: int,
+    bits: int,
+    group_size: int,
+    mlp_bits: int,
+    mlp_group_size: int,
 ) -> Callable:
     """Lower-bit MLP projections; everything else at the (bits, group_size) default."""
 
@@ -108,12 +111,15 @@ def apply_quant(
             preset_meta = {"preset": "mixed", "q_bits": q_bits}
         elif preset == "mlp_lowbit":
             predicate = _mlp_lowbit_predicate(
-                bits=bits, group_size=group_size,
-                mlp_bits=mlp_bits, mlp_group_size=mlp_group_size,
+                bits=bits,
+                group_size=group_size,
+                mlp_bits=mlp_bits,
+                mlp_group_size=mlp_group_size,
             )
             preset_meta = {
                 "preset": "mlp_lowbit",
-                "mlp_bits": mlp_bits, "mlp_group_size": mlp_group_size,
+                "mlp_bits": mlp_bits,
+                "mlp_group_size": mlp_group_size,
             }
         else:
             raise ValueError(f"Unknown quant preset: {preset}")

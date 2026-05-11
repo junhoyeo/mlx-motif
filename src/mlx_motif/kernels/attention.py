@@ -266,8 +266,11 @@ def sdpa_dual_v_2pass(
     p1, p2, maxs, sums = _dual_v_pass1_kernel(
         inputs=[q, k, v1, v2, scale_arr],
         template=[
-            ("T", q.dtype), ("D", D), ("KV_SEQ", KV),
-            ("GQA_FACTOR", gqa_factor), ("BLOCKS", BLOCKS),
+            ("T", q.dtype),
+            ("D", D),
+            ("KV_SEQ", KV),
+            ("GQA_FACTOR", gqa_factor),
+            ("BLOCKS", BLOCKS),
         ],
         grid=pass1_grid,
         threadgroup=pass1_threadgroup,
@@ -455,9 +458,7 @@ def sdpa_dual_v_reference(
     return mx.concatenate([a1, a2], axis=-1)
 
 
-def sdpa_dual_v(
-    q: mx.array, k: mx.array, v1: mx.array, v2: mx.array, scale: float
-) -> mx.array:
+def sdpa_dual_v(q: mx.array, k: mx.array, v1: mx.array, v2: mx.array, scale: float) -> mx.array:
     """
     Shared-QK, dual-V SDPA with native GQA broadcast.
 
@@ -691,9 +692,15 @@ def _make_sdpa_dual_v_q4_kernel():
         name="motif_sdpa_dual_v_q4",
         input_names=[
             "q",
-            "k_data", "k_scales", "k_biases",
-            "v1_data", "v1_scales", "v1_biases",
-            "v2_data", "v2_scales", "v2_biases",
+            "k_data",
+            "k_scales",
+            "k_biases",
+            "v1_data",
+            "v1_scales",
+            "v1_biases",
+            "v2_data",
+            "v2_scales",
+            "v2_biases",
             "scale_in",
         ],
         output_names=["y"],
@@ -789,9 +796,15 @@ def sdpa_dual_v_q4(
     out = _sdpa_dual_v_q4_kernel(
         inputs=[
             q,
-            k_data, k_scales, k_biases,
-            v1_data, v1_scales, v1_biases,
-            v2_data, v2_scales, v2_biases,
+            k_data,
+            k_scales,
+            k_biases,
+            v1_data,
+            v1_scales,
+            v1_biases,
+            v2_data,
+            v2_scales,
+            v2_biases,
             scale_arr,
         ],
         template=[

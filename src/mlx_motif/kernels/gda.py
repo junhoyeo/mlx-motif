@@ -221,9 +221,7 @@ def gda_post_split(
 
     B, q_origin, S, channels = attn_o.shape
     _, q_groups, _, _ = attn_n.shape
-    assert q_origin == q_groups * gr, (
-        f"q_origin={q_origin} != q_groups({q_groups}) * gr({gr})"
-    )
+    assert q_origin == q_groups * gr, f"q_origin={q_origin} != q_groups({q_groups}) * gr({gr})"
 
     rows = B * q_origin * S
     tg = min(256, max(32, ((channels + 31) // 32) * 32))
@@ -235,10 +233,12 @@ def gda_post_split(
 
     out = _gda_post_split_kernel(
         inputs=[
-            attn_o, attn_n,
+            attn_o,
+            attn_n,
             subln_weight.astype(attn_o.dtype),
             lambda_full.astype(mx.float32),
-            scale, eps_arr,
+            scale,
+            eps_arr,
         ],
         template=[
             ("T", attn_o.dtype),
@@ -271,9 +271,7 @@ def gda_post(
     Returns the SubLN-normalised differential output (B, q_groups*gr, S, 2*head_dim).
     """
     if _DISABLE:
-        return gda_post_reference(
-            merged, subln_weight, lambda_full, lambda_init, q_groups, gr, eps
-        )
+        return gda_post_reference(merged, subln_weight, lambda_full, lambda_init, q_groups, gr, eps)
 
     global _gda_post_kernel
     if _gda_post_kernel is None:
@@ -281,9 +279,7 @@ def gda_post(
 
     B, q_heads, S, channels = merged.shape
     q_origin = q_groups * gr
-    assert q_heads == q_origin + q_groups, (
-        f"q_heads={q_heads} expected {q_origin}+{q_groups}"
-    )
+    assert q_heads == q_origin + q_groups, f"q_heads={q_heads} expected {q_origin}+{q_groups}"
 
     rows = B * q_origin * S
     tg = min(256, max(32, ((channels + 31) // 32) * 32))
@@ -519,8 +515,17 @@ def _make_gda_decode_kernel():
     return mx.fast.metal_kernel(
         name="motif_gda_decode",
         input_names=[
-            "q1", "q2", "k1", "k2", "v1", "v2",
-            "subln_w", "lambda_full", "scale_in", "scale_out_in", "eps_in",
+            "q1",
+            "q2",
+            "k1",
+            "k2",
+            "v1",
+            "v2",
+            "subln_w",
+            "lambda_full",
+            "scale_in",
+            "scale_out_in",
+            "eps_in",
         ],
         output_names=["y"],
         source=_GDA_DECODE_SRC,
@@ -531,9 +536,12 @@ _gda_decode_kernel = None
 
 
 def gda_decode_reference(
-    q1: mx.array, q2: mx.array,
-    k1: mx.array, k2: mx.array,
-    v1: mx.array, v2: mx.array,
+    q1: mx.array,
+    q2: mx.array,
+    k1: mx.array,
+    k2: mx.array,
+    v1: mx.array,
+    v2: mx.array,
     subln_weight: mx.array,
     lambda_full: mx.array,
     lambda_init: float,
@@ -544,7 +552,7 @@ def gda_decode_reference(
     """Pure MLX equivalent of `gda_decode`. S = 1 only."""
     # Concatenate V channels: each branch's V becomes a 2·d-wide slab.
     v_origin = mx.concatenate([v1, v2], axis=-1)  # (B, q_groups, K, 2d)
-    v_noise = v_origin                              # noise branch shares the same V
+    v_noise = v_origin  # noise branch shares the same V
 
     # attn_o per origin head: SDPA(q1[h_o], k1[group], v_origin[group])
     # We compute per-group then broadcast back across `gr` origin heads.
@@ -566,9 +574,12 @@ def gda_decode_reference(
 
 
 def gda_decode(
-    q1: mx.array, q2: mx.array,
-    k1: mx.array, k2: mx.array,
-    v1: mx.array, v2: mx.array,
+    q1: mx.array,
+    q2: mx.array,
+    k1: mx.array,
+    k2: mx.array,
+    v1: mx.array,
+    v2: mx.array,
     subln_weight: mx.array,
     lambda_full: mx.array,
     lambda_init: float,
@@ -602,10 +613,17 @@ def gda_decode(
 
     out = _gda_decode_kernel(
         inputs=[
-            q1, q2, k1, k2, v1, v2,
+            q1,
+            q2,
+            k1,
+            k2,
+            v1,
+            v2,
             subln_weight.astype(q1.dtype),
             lambda_full.astype(mx.float32),
-            scale_in, scale_out, eps_arr,
+            scale_in,
+            scale_out,
+            eps_arr,
         ],
         template=[
             ("T", q1.dtype),

@@ -53,16 +53,29 @@ def main(argv: list[str] | None = None) -> int:
     pc.add_argument("--quantize", action="store_true")
     pc.add_argument("--bits", type=int, default=4)
     pc.add_argument("--group-size", type=int, default=64)
-    pc.add_argument("--quant-preset", default="uniform",
-                    choices=["uniform", "mixed", "mlp_lowbit"],
-                    help=("`mixed` keeps q_proj at --q-proj-bits, rest at --bits; "
-                          "`mlp_lowbit` drops MLP projections to --mlp-bits/--mlp-group-size, "
-                          "rest at --bits/--group-size"))
+    pc.add_argument(
+        "--quant-preset",
+        default="uniform",
+        choices=["uniform", "mixed", "mlp_lowbit"],
+        help=(
+            "`mixed` keeps q_proj at --q-proj-bits, rest at --bits; "
+            "`mlp_lowbit` drops MLP projections to --mlp-bits/--mlp-group-size, "
+            "rest at --bits/--group-size"
+        ),
+    )
     pc.add_argument("--q-proj-bits", type=int, default=6)
-    pc.add_argument("--mlp-bits", type=int, default=3,
-                    help="bit width for gate_proj/up_proj/down_proj under the mlp_lowbit preset")
-    pc.add_argument("--mlp-group-size", type=int, default=32,
-                    help="group_size for MLP weights under the mlp_lowbit preset")
+    pc.add_argument(
+        "--mlp-bits",
+        type=int,
+        default=3,
+        help="bit width for gate_proj/up_proj/down_proj under the mlp_lowbit preset",
+    )
+    pc.add_argument(
+        "--mlp-group-size",
+        type=int,
+        default=32,
+        help="group_size for MLP weights under the mlp_lowbit preset",
+    )
     pc.set_defaults(func=_cmd_convert)
 
     pg = sub.add_parser("generate", help="Run generation against a converted MLX model")
@@ -76,10 +89,15 @@ def main(argv: list[str] | None = None) -> int:
     ps.add_argument("--host", default="127.0.0.1")
     ps.add_argument("--port", type=int, default=8080)
     ps.add_argument("--model-id", default="motif")
-    ps.add_argument("--think-mode", default="visible",
-                    choices=["visible", "hidden", "captured"])
-    ps.set_defaults(func=lambda a: __import__("mlx_motif.server", fromlist=["serve"])
-                    .serve(a.model, a.host, a.port, a.model_id, a.think_mode) or 0)
+    ps.add_argument("--think-mode", default="visible", choices=["visible", "hidden", "captured"])
+    ps.set_defaults(
+        func=lambda a: (
+            __import__("mlx_motif.server", fromlist=["serve"]).serve(
+                a.model, a.host, a.port, a.model_id, a.think_mode
+            )
+            or 0
+        )
+    )
 
     args = parser.parse_args(argv)
     return args.func(args)

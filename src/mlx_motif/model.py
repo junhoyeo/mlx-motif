@@ -214,10 +214,7 @@ def _resolve_attention_path(
     # tensors), not to SERIAL_FLASH (which does its own RoPE internally).
     decode_shape_ok = S == 1 and kv_repeat == 1 and kr == 1
 
-    if (
-        decode_shape_ok
-        and env.get("MLX_MOTIF_FLASH_DECODE", "0") not in _is_falsy
-    ):
+    if decode_shape_ok and env.get("MLX_MOTIF_FLASH_DECODE", "0") not in _is_falsy:
         return AttnPath.SERIAL_FLASH
 
     if (
@@ -228,11 +225,7 @@ def _resolve_attention_path(
     ):
         return AttnPath.QUANT_SDPA
 
-    if (
-        decode_shape_ok
-        and not fused_rope
-        and env.get("MLX_MOTIF_DUAL_V", "1") not in _is_falsy
-    ):
+    if decode_shape_ok and not fused_rope and env.get("MLX_MOTIF_DUAL_V", "1") not in _is_falsy:
         return AttnPath.DUAL_V
 
     return AttnPath.FALLBACK
@@ -264,7 +257,7 @@ class MotifAttention(nn.Module):
         self.args = args
         self.layer_idx = layer_idx
         self.head_dim = args.head_dim or (args.hidden_size // args.num_attention_heads)
-        self.scale = self.head_dim ** -0.5
+        self.scale = self.head_dim**-0.5
         self.lambda_init = 0.8 - 0.6 * math.exp(-0.3 * (layer_idx - 1))
 
         if args.is_grouped:
@@ -294,7 +287,9 @@ class MotifAttention(nn.Module):
     def _init_grouped(self, args: ModelArgs) -> None:
         self.num_noise_heads = args.num_noise_heads
         self.num_kv_heads = args.num_key_value_heads
-        self.grouped_ratio = (args.num_attention_heads - self.num_noise_heads) // self.num_noise_heads
+        self.grouped_ratio = (
+            args.num_attention_heads - self.num_noise_heads
+        ) // self.num_noise_heads
         self.q_heads = (self.grouped_ratio + 1) * self.num_noise_heads
         self.k_ratio = args.k_ratio
         self.k_noise_heads = self.num_kv_heads // (self.k_ratio + 1)
@@ -356,7 +351,7 @@ class MotifAttention(nn.Module):
         # heads for the attention matmul.
         B, S, _ = x.shape
         d = self.head_dim
-        H = self.num_heads      # halved (effective DiffAttn heads)
+        H = self.num_heads  # halved (effective DiffAttn heads)
         Hk = self.num_kv_heads  # halved (effective DiffAttn KV heads)
 
         q = self.q_proj(x).reshape(B, S, 2 * H, d).transpose(0, 2, 1, 3)
@@ -426,6 +421,7 @@ class MotifAttention(nn.Module):
         q = self.rope(q, offset=offset)
 
         from mlx_motif.cache import MotifGroupedKVCache, MotifGroupedQuantizedKVCache
+
         gr = self.grouped_ratio
         q_groups = self.q_heads // (gr + 1)
         kr = self.k_ratio
@@ -437,7 +433,11 @@ class MotifAttention(nn.Module):
         # further down key off the same `path` value — no condition is
         # re-evaluated independently.
         path = _resolve_attention_path(
-            cache, S, self.kv_repeat, kr, self.args.fused_rope,
+            cache,
+            S,
+            self.kv_repeat,
+            kr,
+            self.args.fused_rope,
         )
 
         # ------------------------------------------------------------------ #
@@ -460,7 +460,10 @@ class MotifAttention(nn.Module):
                 # Return raw quantized triples; sdpa_dual_v_q4 reads packed
                 # bits directly — no per-step mx.dequantize.
                 k1_q, k2_q, v1_q, v2_q = cache.update_and_fetch_4_quantized(
-                    k1_new, k2_new, v1_new, v2_new,
+                    k1_new,
+                    k2_new,
+                    v1_new,
+                    v2_new,
                 )
                 k1 = k2 = v1 = v2 = None  # unused on this path
             else:
@@ -529,9 +532,18 @@ class MotifAttention(nn.Module):
 
         if path is AttnPath.SERIAL_FLASH:
             out = gda_decode(
-                q1, q2, k1, k2, v1, v2,
-                self.subln.weight, lam, self.lambda_init,
-                gr, self.scale, eps=self.args.attn_rms_norm_eps,
+                q1,
+                q2,
+                k1,
+                k2,
+                v1,
+                v2,
+                self.subln.weight,
+                lam,
+                self.lambda_init,
+                gr,
+                self.scale,
+                eps=self.args.attn_rms_norm_eps,
             )
         elif path is AttnPath.QUANT_SDPA:
             # Quantized-input fast path: K, V1, V2 stay packed all the way
@@ -539,26 +551,46 @@ class MotifAttention(nn.Module):
             # kernel does mask-without-shift for QK (MLX qdot trick) plus
             # in-register dequant for V. See `sdpa_dual_v_q4` docstring.
             attn_origin = sdpa_dual_v_q4(
-                q1, k1_q, v1_q, v2_q, self.scale,
-                group_size=cache.group_size, bits=cache.bits,
+                q1,
+                k1_q,
+                v1_q,
+                v2_q,
+                self.scale,
+                group_size=cache.group_size,
+                bits=cache.bits,
             )
             attn_noise = sdpa_dual_v_q4(
-                q2, k2_q, v1_q, v2_q, self.scale,
-                group_size=cache.group_size, bits=cache.bits,
+                q2,
+                k2_q,
+                v1_q,
+                v2_q,
+                self.scale,
+                group_size=cache.group_size,
+                bits=cache.bits,
             )
             out = gda_post_split(
-                attn_origin, attn_noise, self.subln.weight, lam, self.lambda_init,
-                gr, eps=self.args.attn_rms_norm_eps,
+                attn_origin,
+                attn_noise,
+                self.subln.weight,
+                lam,
+                self.lambda_init,
+                gr,
+                eps=self.args.attn_rms_norm_eps,
             )
         elif path is AttnPath.DUAL_V:
             # Custom kernel: shared QK, dual V SDPA with native GQA.
             # Origin call: GQA=gr (kernel broadcasts k1/v1/v2 internally).
             # Noise call:  GQA=1.
             attn_origin = sdpa_dual_v(q1, k1, v1, v2, self.scale)
-            attn_noise  = sdpa_dual_v(q2, k2, v1, v2, self.scale)
+            attn_noise = sdpa_dual_v(q2, k2, v1, v2, self.scale)
             out = gda_post_split(
-                attn_origin, attn_noise, self.subln.weight, lam, self.lambda_init,
-                gr, eps=self.args.attn_rms_norm_eps,
+                attn_origin,
+                attn_noise,
+                self.subln.weight,
+                lam,
+                self.lambda_init,
+                gr,
+                eps=self.args.attn_rms_norm_eps,
             )
         else:  # AttnPath.FALLBACK
             if kr == 1:
@@ -572,8 +604,13 @@ class MotifAttention(nn.Module):
                 q_f, k_f, v_cat, scale=self.scale, mask=mask
             )
             out = gda_post(
-                attn_cat, self.subln.weight, lam, self.lambda_init,
-                q_groups, gr, eps=self.args.attn_rms_norm_eps,
+                attn_cat,
+                self.subln.weight,
+                lam,
+                self.lambda_init,
+                q_groups,
+                gr,
+                eps=self.args.attn_rms_norm_eps,
             )
 
         # (B, q_groups*gr, S, 2d) -> (B, S, q_groups*gr*2d)
@@ -740,8 +777,9 @@ class Model(nn.Module):
             attn = layer.self_attn
             q, k, v = attn.q_proj, attn.k_proj, attn.v_proj
             quantized = isinstance(q, nn.QuantizedLinear)
-            if quantized and not (q.bits == k.bits == v.bits and
-                                   q.group_size == k.group_size == v.group_size):
+            if quantized and not (
+                q.bits == k.bits == v.bits and q.group_size == k.group_size == v.group_size
+            ):
                 # Mixed-precision quant: skip fusion. Forward path falls
                 # back to three separate QuantizedLinear calls, which is
                 # ~10% slower at this op but preserves the per-layer bit
@@ -762,8 +800,12 @@ class Model(nn.Module):
             out_dim = q.weight.shape[0] + k.weight.shape[0] + v.weight.shape[0]
             if quantized:
                 fused = nn.QuantizedLinear(
-                    in_dim, out_dim, bias=False,
-                    group_size=q.group_size, bits=q.bits, mode=q.mode,
+                    in_dim,
+                    out_dim,
+                    bias=False,
+                    group_size=q.group_size,
+                    bits=q.bits,
+                    mode=q.mode,
                 )
                 fused.weight = mx.concatenate([q_w, k.weight, v.weight], axis=0)
                 fused.scales = mx.concatenate([q_s, k.scales, v.scales], axis=0)

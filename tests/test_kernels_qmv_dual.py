@@ -15,9 +15,9 @@ from mlx_motif.kernels import qmv_dual_q4, qmv_dual_q4_reference
 _SHAPES = [
     # (B, S, IN, OUT) — must satisfy IN % 512 == 0 and OUT % 8 == 0
     (1, 1, 4096, 16384),  # production MLP shape (Motif 12.7B gate/up)
-    (1, 1, 4096,    16),  # tiny OUT
-    (1, 1,  512,  4096),  # tiny IN
-    (1, 1, 2048,  8192),  # half-size MLP
+    (1, 1, 4096, 16),  # tiny OUT
+    (1, 1, 512, 4096),  # tiny IN
+    (1, 1, 2048, 8192),  # half-size MLP
     (1, 4, 4096, 16384),  # multi-token (prefill)
     (2, 1, 4096, 16384),  # batch
 ]
@@ -62,10 +62,12 @@ def test_qmv_dual_independent_outputs():
     mx.random.seed(0)
     B, S, IN, OUT = 1, 1, 4096, 16384
     x = mx.random.normal((B, S, IN)).astype(mx.float16)
-    gate_q = mx.quantize((mx.random.normal((OUT, IN)) * 0.02).astype(mx.float16),
-                         group_size=64, bits=4)
-    up_q = mx.quantize((mx.random.normal((OUT, IN)) * 0.02).astype(mx.float16),
-                       group_size=64, bits=4)
+    gate_q = mx.quantize(
+        (mx.random.normal((OUT, IN)) * 0.02).astype(mx.float16), group_size=64, bits=4
+    )
+    up_q = mx.quantize(
+        (mx.random.normal((OUT, IN)) * 0.02).astype(mx.float16), group_size=64, bits=4
+    )
     g, u = qmv_dual_q4(x, gate_q, up_q, group_size=64, bits=4)
     # Distinct weights, distinct outputs.
     assert not mx.allclose(g, u, atol=1e-3).item()
@@ -76,7 +78,8 @@ def test_qmv_dual_same_weights_same_outputs():
     mx.random.seed(0)
     B, S, IN, OUT = 1, 1, 4096, 16384
     x = mx.random.normal((B, S, IN)).astype(mx.float16)
-    w_q = mx.quantize((mx.random.normal((OUT, IN)) * 0.02).astype(mx.float16),
-                      group_size=64, bits=4)
+    w_q = mx.quantize(
+        (mx.random.normal((OUT, IN)) * 0.02).astype(mx.float16), group_size=64, bits=4
+    )
     g, u = qmv_dual_q4(x, w_q, w_q, group_size=64, bits=4)
     assert mx.allclose(g, u).item()

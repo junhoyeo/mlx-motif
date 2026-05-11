@@ -65,7 +65,8 @@ def test_quantized_cache_roundtrip(bits):
     np.testing.assert_allclose(
         np.array(out[0].astype(mx.float32)),
         np.array(k1.astype(mx.float32)),
-        atol=tol, rtol=tol,
+        atol=tol,
+        rtol=tol,
     )
 
 

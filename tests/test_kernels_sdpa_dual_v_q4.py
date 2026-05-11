@@ -15,16 +15,16 @@ from mlx_motif.kernels import sdpa_dual_v_q4, sdpa_dual_v_q4_reference
 
 _SHAPES = [
     # (B, H_q, H_kv, KV, d)
-    (1,  4,  4,    16, 128),   # smallest
-    (1,  4,  4,   128, 128),
-    (1,  4,  4,   300, 128),   # not block-aligned (300 % BN=32 != 0)
-    (1,  4,  4,  1024, 128),
-    (2,  4,  4,    64, 128),   # batch
+    (1, 4, 4, 16, 128),  # smallest
+    (1, 4, 4, 128, 128),
+    (1, 4, 4, 300, 128),  # not block-aligned (300 % BN=32 != 0)
+    (1, 4, 4, 1024, 128),
+    (2, 4, 4, 64, 128),  # batch
     # GQA cases — Motif uses gqa=5 for the 12.7B (40 Q heads / 8 KV heads).
-    (1,  8,  4,    64, 128),   # gqa=2
-    (1, 16,  4,    64, 128),   # gqa=4
-    (1, 40,  8,   256, 128),   # Motif decode shape
-    (1, 40,  8,  1024, 128),
+    (1, 8, 4, 64, 128),  # gqa=2
+    (1, 16, 4, 64, 128),  # gqa=4
+    (1, 40, 8, 256, 128),  # Motif decode shape
+    (1, 40, 8, 1024, 128),
 ]
 
 
@@ -37,7 +37,7 @@ def test_sdpa_dual_v_q4_matches_reference(B, H_q, H_kv, KV, d, bits, group_size,
         pytest.skip(f"d={d} not divisible by group_size={group_size}")
 
     mx.random.seed(0)
-    scale = 1.0 / (d ** 0.5)
+    scale = 1.0 / (d**0.5)
     q = mx.random.normal((B, H_q, 1, d)).astype(dtype)
     k = mx.random.normal((B, H_kv, KV, d)).astype(dtype)
     v1 = mx.random.normal((B, H_kv, KV, d)).astype(dtype)
@@ -69,7 +69,7 @@ def test_sdpa_dual_v_q4_returns_concatenated_layout():
     """
     mx.random.seed(0)
     B, H, KV, D = 1, 4, 64, 128
-    scale = 1.0 / (D ** 0.5)
+    scale = 1.0 / (D**0.5)
     q = mx.random.normal((B, H, 1, D)).astype(mx.float16)
     k = mx.random.normal((B, H, KV, D)).astype(mx.float16)
     v = mx.random.normal((B, H, KV, D)).astype(mx.float16)

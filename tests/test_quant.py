@@ -66,16 +66,23 @@ def test_mlp_lowbit_preset_separates_mlp_from_attn():
     """`mlp_lowbit` drops gate/up/down to (mlp_bits, mlp_group_size); rest stays at (bits, group_size)."""
     model = Model(_grouped_args())
     meta = apply_quant(
-        model, preset="mlp_lowbit",
-        bits=4, group_size=64,
-        mlp_bits=4, mlp_group_size=32,   # tiny test config can't fit q3 (intermediate_size=128)
+        model,
+        preset="mlp_lowbit",
+        bits=4,
+        group_size=64,
+        mlp_bits=4,
+        mlp_group_size=32,  # tiny test config can't fit q3 (intermediate_size=128)
     )
     bits_for = {"mlp": set(), "non_mlp": set()}
     gs_for = {"mlp": set(), "non_mlp": set()}
     for path, m in model.named_modules():
         if not _is_quantized(m):
             continue
-        bucket = "mlp" if any(path.endswith(n) for n in (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj")) else "non_mlp"
+        bucket = (
+            "mlp"
+            if any(path.endswith(n) for n in (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"))
+            else "non_mlp"
+        )
         bits_for[bucket].add(m.bits)
         gs_for[bucket].add(m.group_size)
     assert bits_for["mlp"] == {4}, bits_for["mlp"]
@@ -95,9 +102,12 @@ def test_mlp_lowbit_overrides_emit_per_module_config():
     mlx-lm loader can rebuild matching shapes."""
     model = Model(_grouped_args())
     meta = apply_quant(
-        model, preset="mlp_lowbit",
-        bits=4, group_size=64,
-        mlp_bits=4, mlp_group_size=32,
+        model,
+        preset="mlp_lowbit",
+        bits=4,
+        group_size=64,
+        mlp_bits=4,
+        mlp_group_size=32,
     )
     # Per-module overrides emit dotted-path keys.
     mlp_overrides = {k: v for k, v in meta.items() if isinstance(v, dict) and "bits" in v}

@@ -96,3 +96,47 @@ def test_start_in_think_with_chunk_split_close_tag():
     out1 = f.feed("reasoning</thi")
     out2 = f.feed("nk>answer")
     assert out1 + out2 == "answer"
+
+
+# --------------------------------------------------------------------------- #
+# Prompt-tail detection (_prompt_opens_think_block)
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_opens_think_block_motif_template():
+    """Motif's reasoning template ends with `<|assistant|><think>\\n`."""
+    from mlx_motif.server import _prompt_opens_think_block
+    p = "<|system|>...<|user|>hi<|endofturn|><|assistant|><think>\n"
+    assert _prompt_opens_think_block(p) is True
+
+
+def test_prompt_opens_think_block_no_think_tag():
+    from mlx_motif.server import _prompt_opens_think_block
+    p = "<|system|>...<|user|>hi<|endofturn|><|assistant|>"
+    assert _prompt_opens_think_block(p) is False
+
+
+def test_prompt_opens_think_block_completed_prior_turn():
+    """A complete prior <think>...</think> followed by a fresh assistant
+    turn must not trigger — the next turn is not in think mode."""
+    from mlx_motif.server import _prompt_opens_think_block
+    p = "<|assistant|><think>prev reasoning</think>prev answer<|endofturn|><|assistant|>"
+    assert _prompt_opens_think_block(p) is False
+
+
+def test_prompt_opens_think_block_user_literal_think_text():
+    """REGRESSION GUARD: a user message containing the literal text
+    `<think>` (e.g., asking about the tag) must NOT trigger detection —
+    the assistant turn after it does NOT start in think mode.
+    Caught by codex review of PR #4."""
+    from mlx_motif.server import _prompt_opens_think_block
+    p = "<|user|>what does <think> mean?<|endofturn|><|assistant|>"
+    assert _prompt_opens_think_block(p) is False
+
+
+def test_prompt_opens_think_block_trailing_whitespace():
+    """Trailing whitespace after the open tag must still count as open."""
+    from mlx_motif.server import _prompt_opens_think_block
+    assert _prompt_opens_think_block("<|assistant|><think>") is True
+    assert _prompt_opens_think_block("<|assistant|><think>\n") is True
+    assert _prompt_opens_think_block("<|assistant|><think>\n\n\t  ") is True

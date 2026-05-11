@@ -44,6 +44,22 @@ _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
 
+def _prompt_opens_think_block(prompt: str) -> bool:
+    """Return True iff the rendered chat-template prompt TERMINATES with an
+    open ``<think>`` tag (allowing trailing whitespace), meaning the model
+    will begin its response already inside a think block.
+
+    Required for Motif's reasoning template (`<|assistant|><think>\\n`) and
+    other reasoning models that pre-open the think tag from the prompt side.
+
+    Importantly this is a TAIL check, not a "contains" check — a user message
+    containing literal ``<think>`` text (e.g., asking "what does <think> do?")
+    must NOT trigger this, since the assistant turn that follows it does not
+    start inside a think block.
+    """
+    return prompt.rstrip().endswith(_THINK_OPEN)
+
+
 class ThinkFilter:
     """Stream-time filter for `<think>...</think>` reasoning traces.
 
@@ -187,12 +203,10 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
                 return self._send_json(400, {"error": {"message": "messages required"}})
 
             prompt = _make_messages_text(messages, tokenizer)
-            # If the chat template put the model in <think> mode (e.g., Motif's
-            # default reasoning template ends with `<|assistant|><think>\n`),
-            # the response stream starts INSIDE the block with no opening tag —
-            # only a closing </think>. Pre-set the filter accordingly.
-            start_in_think = _THINK_OPEN in prompt.rsplit(_THINK_CLOSE, 1)[-1]
-            filt = ThinkFilter(mode=think_mode, start_in_think=start_in_think)
+            filt = ThinkFilter(
+                mode=think_mode,
+                start_in_think=_prompt_opens_think_block(prompt),
+            )
             req_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
 

@@ -54,11 +54,17 @@ class ThinkFilter:
         non-streaming response (or in a final SSE chunk for streaming).
     """
 
-    def __init__(self, mode: str = "visible"):
+    def __init__(self, mode: str = "visible", start_in_think: bool = False):
+        """``start_in_think=True`` treats the stream as already inside a
+        ``<think>`` block from the first token. Required for chat templates
+        that end with ``<|assistant|><think>`` (e.g., Motif's default reasoning
+        template) — the model's output begins inside the think block with no
+        opening tag in the stream, only a closing ``</think>``.
+        """
         if mode not in ("visible", "hidden", "captured"):
             raise ValueError(f"unknown think_mode: {mode}")
         self.mode = mode
-        self.in_think = False
+        self.in_think = start_in_think
         self.buffer = ""  # carries cross-chunk partial-tag text
         self.captured = ""
 
@@ -181,7 +187,12 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
                 return self._send_json(400, {"error": {"message": "messages required"}})
 
             prompt = _make_messages_text(messages, tokenizer)
-            filt = ThinkFilter(mode=think_mode)
+            # If the chat template put the model in <think> mode (e.g., Motif's
+            # default reasoning template ends with `<|assistant|><think>\n`),
+            # the response stream starts INSIDE the block with no opening tag —
+            # only a closing </think>. Pre-set the filter accordingly.
+            start_in_think = _THINK_OPEN in prompt.rsplit(_THINK_CLOSE, 1)[-1]
+            filt = ThinkFilter(mode=think_mode, start_in_think=start_in_think)
             req_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
 

@@ -65,3 +65,34 @@ def test_multiple_think_blocks():
     out = f.feed("a<think>x</think>b<think>y</think>c")
     assert out == "abc"
     assert f.captured == "xy"
+
+
+def test_start_in_think_hidden_drops_pre_close_text():
+    """When the chat template puts the model already in <think> mode
+    (Motif's reasoning template does this), the stream starts INSIDE
+    the block — only a closing </think> exists in the response, no
+    opening tag. `start_in_think=True` handles this."""
+    f = ThinkFilter("hidden", start_in_think=True)
+    out = f.feed("reasoning here</think>answer here")
+    assert out == "answer here"
+
+
+def test_start_in_think_captured_collects_pre_close():
+    f = ThinkFilter("captured", start_in_think=True)
+    out = f.feed("reasoning here</think>answer here")
+    assert out == "answer here"
+    assert f.captured == "reasoning here"
+
+
+def test_start_in_think_visible_still_passthrough():
+    f = ThinkFilter("visible", start_in_think=True)
+    out = f.feed("reasoning</think>answer")
+    assert out == "reasoning</think>answer"
+
+
+def test_start_in_think_with_chunk_split_close_tag():
+    """Close tag split across stream chunks while starting in-think."""
+    f = ThinkFilter("hidden", start_in_think=True)
+    out1 = f.feed("reasoning</thi")
+    out2 = f.feed("nk>answer")
+    assert out1 + out2 == "answer"

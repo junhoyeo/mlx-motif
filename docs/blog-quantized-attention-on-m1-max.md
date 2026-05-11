@@ -2,7 +2,14 @@
 
 I just shipped `sdpa_dual_v_q4` for `mlx-motif`: a custom Metal kernel that does shared-QK dual-V attention while reading the KV cache as packed 4-bit (or 8-bit) integers. No per-step `mx.dequantize`. Same softmax math as our existing `sdpa_dual_v`, just reading from a different memory layout.
 
-The headline number is 27-43% faster than the prior production path at KV ≥ 1024. That's real. It's also a goalpost shift, and the more interesting story is what the kernel taught me about where decode-time wins live on Apple Silicon — and where they don't.
+Two headline numbers worth keeping straight:
+
+- **Per-call microbench**, isolated kernel time at decode shapes: **27-43% faster** than the prior production path (dequant→fp16) at KV ∈ [1024, 16384]. That's the kernel's intrinsic speedup.
+- **End-to-end on a real Motif checkpoint**, decode tokens/sec at a 3k-token prompt: **+18%** vs the same q4 cache's dequant-bridge path, **+10.8%** vs the vanilla fp16 KVCache baseline. That's the user-facing speedup.
+
+These are different numbers because attention is only ~10-30% of per-layer decode time and the rest of the chain (MLP, projections, residuals) doesn't change. Conflating them is a real risk in this kind of writeup; I'll be explicit when I cite each below.
+
+The more interesting story is what the kernel taught me about where decode-time wins live on Apple Silicon — and where they don't.
 
 ## What this kernel replaces
 

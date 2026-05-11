@@ -23,7 +23,8 @@ def _get_motif_classes(config: dict):
 
 
 def _register_extra_eos_from_generation_config(
-    tokenizer: TokenizerWrapper, path: Path,
+    tokenizer: TokenizerWrapper,
+    path: Path,
 ) -> None:
     """HF ``generation_config.json`` may list multiple EOS token ids
     (Motif: ``[<|endoftext|>, <|endofturn|>]``), but ``tokenizer.eos_token_id``

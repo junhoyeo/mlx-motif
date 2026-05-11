@@ -44,6 +44,22 @@ _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
 
+def _prompt_opens_think_block(prompt: str) -> bool:
+    """Return True iff the rendered chat-template prompt TERMINATES with an
+    open ``<think>`` tag (allowing trailing whitespace), meaning the model
+    will begin its response already inside a think block.
+
+    Required for Motif's reasoning template (`<|assistant|><think>\\n`) and
+    other reasoning models that pre-open the think tag from the prompt side.
+
+    Importantly this is a TAIL check, not a "contains" check — a user message
+    containing literal ``<think>`` text (e.g., asking "what does <think> do?")
+    must NOT trigger this, since the assistant turn that follows it does not
+    start inside a think block.
+    """
+    return prompt.rstrip().endswith(_THINK_OPEN)
+
+
 class ThinkFilter:
     """Stream-time filter for `<think>...</think>` reasoning traces.
 
@@ -54,11 +70,17 @@ class ThinkFilter:
         non-streaming response (or in a final SSE chunk for streaming).
     """
 
-    def __init__(self, mode: str = "visible"):
+    def __init__(self, mode: str = "visible", start_in_think: bool = False):
+        """``start_in_think=True`` treats the stream as already inside a
+        ``<think>`` block from the first token. Required for chat templates
+        that end with ``<|assistant|><think>`` (e.g., Motif's default reasoning
+        template) — the model's output begins inside the think block with no
+        opening tag in the stream, only a closing ``</think>``.
+        """
         if mode not in ("visible", "hidden", "captured"):
             raise ValueError(f"unknown think_mode: {mode}")
         self.mode = mode
-        self.in_think = False
+        self.in_think = start_in_think
         self.buffer = ""  # carries cross-chunk partial-tag text
         self.captured = ""
 
@@ -181,7 +203,10 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
                 return self._send_json(400, {"error": {"message": "messages required"}})
 
             prompt = _make_messages_text(messages, tokenizer)
-            filt = ThinkFilter(mode=think_mode)
+            filt = ThinkFilter(
+                mode=think_mode,
+                start_in_think=_prompt_opens_think_block(prompt),
+            )
             req_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
             created = int(time.time())
 

@@ -106,6 +106,8 @@ def convert(
     q_group_size: int = 64,
     quant_preset: str = "uniform",
     q_proj_bits: int = 6,
+    mlp_bits: int = 3,
+    mlp_group_size: int = 32,
 ) -> Path:
     src = _resolve_hf_path(hf_path)
     out = Path(out_path)
@@ -126,6 +128,8 @@ def convert(
             bits=q_bits,
             group_size=q_group_size,
             q_bits=q_proj_bits,
+            mlp_bits=mlp_bits,
+            mlp_group_size=mlp_group_size,
         )
 
     save_model(out, model)

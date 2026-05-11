@@ -1,6 +1,20 @@
 # Design: `sdpa_dual_v_q4` — quantized-input shared-QK dual-V SDPA
 
-Status: **not implemented**. This is a design doc + skeleton for the next iteration. The cache plumbing it would consume (`MotifGroupedQuantizedKVCache`) is shipped and tested.
+Status: **shipped**. Kernel + tests + bench + model wire-in landed.
+- Kernel: `src/mlx_motif/kernels.py::sdpa_dual_v_q4` (+ `_dequant_probe` standalone)
+- Cache hook: `MotifGroupedQuantizedKVCache.update_and_fetch_4_quantized` returns triples
+- Wire-in: `MotifAttention._forward_grouped` auto-selects when cache is quantized (env-gated by `MLX_MOTIF_QUANT_SDPA`, default on)
+- Tests: `tests/test_kernels_sdpa_dual_v_q4.py` (37 cases), `tests/test_dequant_probe.py` (48), end-to-end via `tests/test_model.py::test_quant_cache_path_runs_and_close_to_fp16`
+- Bench (M1 Max, KV=8192): **0.65× the dequant→sdpa_dual_v path** (i.e. 35% faster than the prior production path on quantized caches)
+- Realised perf is better than the +10-20% projection below because the right baseline turned out to be `dequantize×3 + sdpa_dual_v`, not raw `sdpa_dual_v`. Vs raw fp16 `sdpa_dual_v` we're at parity at KV ≥ 16k and 5-15% slower at shorter context (compute-bound from the bit-extract).
+
+Two implementation deltas from the original sketch below:
+1. **MLX qdot trick** for the QK side (mask-without-shift; `q_pre[j] = scale*q[j] / 2^(shift_base+j*BITS)`, then in-place mask of K). Borrowed from `mlx/backend/metal/kernels/quantized.h::qdot`. Cuts about 15-20% off the inner loop in our measurements.
+2. Register pressure on bf16 needed trimming — scope-limited intermediates and held scales/biases in `T` not `U` (otherwise the kernel hits M1 Max's 896-thread cap and Metal refuses to launch at 1024).
+
+Below is the original design doc, kept for context.
+
+---
 
 ## Goal
 

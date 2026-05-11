@@ -60,3 +60,59 @@ def test_lambda_and_subln_are_not_quantized():
     # Forward still works (would raise if SubLN got incorrectly quantized).
     out = model(mx.array([[1, 2, 3, 4]]))
     assert out.shape == (1, 4, 128)
+
+
+def test_mlp_lowbit_preset_separates_mlp_from_attn():
+    """`mlp_lowbit` drops gate/up/down to (mlp_bits, mlp_group_size); rest stays at (bits, group_size)."""
+    model = Model(_grouped_args())
+    meta = apply_quant(
+        model,
+        preset="mlp_lowbit",
+        bits=4,
+        group_size=64,
+        mlp_bits=4,
+        mlp_group_size=32,  # tiny test config can't fit q3 (intermediate_size=128)
+    )
+    bits_for = {"mlp": set(), "non_mlp": set()}
+    gs_for = {"mlp": set(), "non_mlp": set()}
+    for path, m in model.named_modules():
+        if not _is_quantized(m):
+            continue
+        bucket = (
+            "mlp"
+            if any(path.endswith(n) for n in (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"))
+            else "non_mlp"
+        )
+        bits_for[bucket].add(m.bits)
+        gs_for[bucket].add(m.group_size)
+    assert bits_for["mlp"] == {4}, bits_for["mlp"]
+    assert gs_for["mlp"] == {32}, gs_for["mlp"]
+    assert bits_for["non_mlp"] == {4}, bits_for["non_mlp"]
+    assert gs_for["non_mlp"] == {64}, gs_for["non_mlp"]
+    assert meta["preset"] == "mlp_lowbit"
+    assert meta["mlp_bits"] == 4
+    assert meta["mlp_group_size"] == 32
+    # Forward still works.
+    out = model(mx.array([[1, 2, 3, 4]]))
+    assert out.shape == (1, 4, 128)
+
+
+def test_mlp_lowbit_overrides_emit_per_module_config():
+    """The returned config dict must include per-module overrides so the
+    mlx-lm loader can rebuild matching shapes."""
+    model = Model(_grouped_args())
+    meta = apply_quant(
+        model,
+        preset="mlp_lowbit",
+        bits=4,
+        group_size=64,
+        mlp_bits=4,
+        mlp_group_size=32,
+    )
+    # Per-module overrides emit dotted-path keys.
+    mlp_overrides = {k: v for k, v in meta.items() if isinstance(v, dict) and "bits" in v}
+    assert any(".mlp.gate_proj" in k for k in mlp_overrides)
+    assert any(".mlp.up_proj" in k for k in mlp_overrides)
+    assert any(".mlp.down_proj" in k for k in mlp_overrides)
+    for _path, settings in mlp_overrides.items():
+        assert settings == {"group_size": 32, "bits": 4}

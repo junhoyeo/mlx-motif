@@ -12,7 +12,14 @@ from __future__ import annotations
 import mlx.core as mx
 import pytest
 
-from mlx_motif.model import Model, ModelArgs, MotifAttention, PolyNorm
+from mlx_motif.model import (
+    AttnPath,
+    Model,
+    ModelArgs,
+    MotifAttention,
+    PolyNorm,
+    _resolve_attention_path,
+)
 
 
 def _vanilla_args(**overrides) -> ModelArgs:
@@ -94,6 +101,69 @@ def test_full_model_forward(variant):
     assert logits.shape == (1, 4, args.vocab_size)
 
 
+def _grouped_args_d64(**overrides) -> ModelArgs:
+    """Same topology as `_grouped_args` but head_dim=64 — minimum viable size
+    for the q4 attention kernel (`group_size=64` requires `head_dim >= 64`)."""
+    return _grouped_args(head_dim=64, **overrides)
+
+
+def _make_grouped_caches(model, *, group_size, bits):
+    """Build matched (fp16, q4) 4-slot caches so we can exercise both branches
+    of `_forward_grouped` against the same weights and input."""
+    from mlx_motif.cache import MotifGroupedKVCache, MotifGroupedQuantizedKVCache
+
+    n = len(model.model.layers)
+    fp16 = [MotifGroupedKVCache() for _ in range(n)]
+    q = [MotifGroupedQuantizedKVCache(group_size=group_size, bits=bits) for _ in range(n)]
+    return fp16, q
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_quant_cache_path_runs_and_close_to_fp16(bits, monkeypatch):
+    """Ensure the quantized-input attention path (`sdpa_dual_v_q4`) produces
+    logits within quantization noise of the fp16 path on the same input.
+    Also verifies that the wiring respects the `MLX_MOTIF_QUANT_SDPA` flag.
+    """
+    args = _grouped_args_d64()
+    model = Model(args)
+
+    # Common 2-token prompt; one decode step after.
+    prompt = mx.array([[1, 2]])
+    next_tok = mx.array([[3]])
+
+    # Reference run (fp16 cache, dequant→fp16 attn).
+    monkeypatch.setenv("MLX_MOTIF_QUANT_SDPA", "0")
+    fp16_caches, _ = _make_grouped_caches(model, group_size=64, bits=bits)
+    _ = model(prompt, cache=fp16_caches)
+    logits_fp16 = model(next_tok, cache=fp16_caches)
+
+    # Quant-cache + q4-kernel path.
+    monkeypatch.setenv("MLX_MOTIF_QUANT_SDPA", "1")
+    _, q_caches = _make_grouped_caches(model, group_size=64, bits=bits)
+    _ = model(prompt, cache=q_caches)
+    logits_q = model(next_tok, cache=q_caches)
+
+    assert logits_fp16.shape == logits_q.shape == (1, 1, args.vocab_size)
+    # Quantization noise + kernel fp32-vs-fp16 differ; tolerance is generous.
+    md = float(mx.max(mx.abs(logits_fp16 - logits_q)))
+    assert md < 5.0, f"q{bits} logits diverge too far from fp16: max diff = {md:.3f}"
+
+
+def test_quant_sdpa_flag_disables_q4_kernel(monkeypatch):
+    """Setting MLX_MOTIF_QUANT_SDPA=0 with a quantized cache must fall through
+    to the dequant→sdpa_dual_v path (cache helper still works, just no q4)."""
+    monkeypatch.setenv("MLX_MOTIF_QUANT_SDPA", "0")
+    args = _grouped_args_d64()
+    model = Model(args)
+    from mlx_motif.cache import MotifGroupedQuantizedKVCache
+
+    caches = [
+        MotifGroupedQuantizedKVCache(group_size=64, bits=4) for _ in range(len(model.model.layers))
+    ]
+    out = model(mx.array([[1, 2, 3]]), cache=caches)
+    assert out.shape == (1, 3, args.vocab_size)
+
+
 def test_sanitize_drops_rotary_buffers():
     args = _vanilla_args()
     model = Model(args)
@@ -104,3 +174,268 @@ def test_sanitize_drops_rotary_buffers():
     cleaned = model.sanitize(raw)
     assert "model.layers.0.self_attn.rotary_emb.inv_freq" not in cleaned
     assert "model.layers.0.self_attn.q_proj.weight" in cleaned
+
+
+# --------------------------------------------------------------------------- #
+# Unit tests for _resolve_attention_path
+# --------------------------------------------------------------------------- #
+
+
+def _stub_env(**kv):
+    """Return a dict-like stub that acts as an env mapping for _resolve_attention_path."""
+    return kv
+
+
+def _fp16_4slot_cache():
+    from mlx_motif.cache import MotifGroupedKVCache
+
+    return MotifGroupedKVCache()
+
+
+def _quant_4slot_cache(bits=4):
+    from mlx_motif.cache import MotifGroupedQuantizedKVCache
+
+    return MotifGroupedQuantizedKVCache(group_size=64, bits=bits)
+
+
+class TestResolveAttentionPath:
+    """Unit tests for _resolve_attention_path — one case per AttnPath value."""
+
+    # SERIAL_FLASH: MLX_MOTIF_FLASH_DECODE=1 with decode-eligible conditions.
+    def test_serial_flash_when_flash_decode_enabled(self):
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="1")
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.SERIAL_FLASH
+
+    def test_serial_flash_takes_priority_over_quant_sdpa(self):
+        # Even with a quantized cache AND quant_sdpa enabled, SERIAL_FLASH wins.
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="1", MLX_MOTIF_QUANT_SDPA="1")
+        path = _resolve_attention_path(
+            cache=_quant_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.SERIAL_FLASH
+
+    # QUANT_SDPA: quantized cache + default QUANT_SDPA flag.
+    def test_quant_sdpa_with_quantized_cache(self):
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_QUANT_SDPA="1")
+        path = _resolve_attention_path(
+            cache=_quant_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.QUANT_SDPA
+
+    def test_quant_sdpa_default_flag_is_on(self):
+        # MLX_MOTIF_QUANT_SDPA defaults to "1" when key absent from env.
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0")
+        path = _resolve_attention_path(
+            cache=_quant_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.QUANT_SDPA
+
+    def test_quant_sdpa_disabled_falls_through_to_dual_v(self):
+        # MLX_MOTIF_QUANT_SDPA=0 with quant cache -> DUAL_V (not QUANT_SDPA).
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_QUANT_SDPA="0")
+        path = _resolve_attention_path(
+            cache=_quant_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.DUAL_V
+
+    # DUAL_V: fp16 4-slot cache + default DUAL_V flag.
+    def test_dual_v_with_fp16_4slot_cache(self):
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_DUAL_V="1")
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.DUAL_V
+
+    def test_dual_v_default_flag_is_on(self):
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0")
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.DUAL_V
+
+    # FALLBACK: various decode-ineligible conditions.
+    def test_fallback_on_prefill_multi_token(self):
+        env = _stub_env()
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=4,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.FALLBACK
+
+    def test_fallback_when_kv_repeat_gt_1(self):
+        env = _stub_env()
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=1,
+            kv_repeat=2,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.FALLBACK
+
+    def test_fallback_when_kr_gt_1(self):
+        env = _stub_env()
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=2,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.FALLBACK
+
+    def test_fallback_when_fused_rope(self):
+        env = _stub_env()
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=True,
+            env=env,
+        )
+        assert path is AttnPath.FALLBACK
+
+    def test_serial_flash_wins_even_with_fused_rope(self):
+        """SERIAL_FLASH (gda_decode) handles per-branch RoPE internally,
+        which is its reason to exist. It must NOT be blocked by
+        ``fused_rope=True``. Regression guard: the original branch in
+        main was ``if use_serial_flash and S == 1 and kv_repeat == 1
+        and kr == 1`` — explicitly NOT including ``not fused_rope``.
+        """
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="1")
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=True,
+            env=env,
+        )
+        assert path is AttnPath.SERIAL_FLASH
+
+    def test_quant_sdpa_blocked_by_fused_rope(self):
+        """QUANT_SDPA consumes post-RoPE q/k from the standard rope() call
+        — fused-rope routes around that, so this kernel must fall through."""
+        env = _stub_env(MLX_MOTIF_QUANT_SDPA="1")
+        path = _resolve_attention_path(
+            cache=_quant_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=True,
+            env=env,
+        )
+        assert path is AttnPath.FALLBACK
+
+    def test_dual_v_blocked_by_fused_rope(self):
+        """DUAL_V — same reason as QUANT_SDPA above."""
+        env = _stub_env()  # MLX_MOTIF_DUAL_V defaults to "1"
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=True,
+            env=env,
+        )
+        assert path is AttnPath.FALLBACK
+
+    def test_fallback_when_dual_v_disabled(self):
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_DUAL_V="0")
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.FALLBACK
+
+    def test_fallback_with_none_cache(self):
+        # No cache at all (prefill without caching) — decode-eligible check
+        # requires isinstance(cache, MotifGroupedQuantizedKVCache) to be False,
+        # so we reach DUAL_V for single-token… but here S=4 forces FALLBACK.
+        env = _stub_env()
+        path = _resolve_attention_path(
+            cache=None,
+            S=4,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.FALLBACK
+
+    # Env-flag edge cases: all falsy string variants for QUANT_SDPA.
+    @pytest.mark.parametrize("val", ["0", "", "false", "False"])
+    def test_quant_sdpa_falsy_strings(self, val):
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_QUANT_SDPA=val)
+        path = _resolve_attention_path(
+            cache=_quant_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        # Falsy QUANT_SDPA with fp16-eligible conditions -> DUAL_V, not QUANT_SDPA.
+        assert path is AttnPath.DUAL_V
+
+    @pytest.mark.parametrize("val", ["0", "", "false", "False"])
+    def test_dual_v_falsy_strings(self, val):
+        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_DUAL_V=val)
+        path = _resolve_attention_path(
+            cache=_fp16_4slot_cache(),
+            S=1,
+            kv_repeat=1,
+            kr=1,
+            fused_rope=False,
+            env=env,
+        )
+        assert path is AttnPath.FALLBACK

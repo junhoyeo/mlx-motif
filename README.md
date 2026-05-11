@@ -29,7 +29,8 @@ Output is **byte-identical** between the kernel and reference paths — verified
 | 4a — Fused PolyNorm + GDA-post Metal kernels | done |
 | 4b — Custom shared-QK dual-V SDPA + variants | done (the headline win) |
 | 4c — 4-slot KV cache (memory savings at xlong) | done (opt-in via env) |
-| 5 — OpenAI-compatible server with `<think>` streaming | not started |
+| 4d — Quantized-input attention kernel (`sdpa_dual_v_q4`) | done (auto-engages with quant cache, beats dequant→fp16 by 27-43% at KV ≥ 1024) |
+| 5 — OpenAI-compatible server with `<think>` streaming | done (`mlx-motif serve --think-mode visible|hidden|captured`) |
 | 6 — HF Hub release + blog | not started |
 
 ## Install
@@ -120,6 +121,30 @@ Shared-QK, dual-V SDPA decode. Computes `cat([SDPA(q,k,v1), SDPA(q,k,v2)], axis=
 - Use `-1e30f` as the initial-max sentinel, NOT `-INFINITY`. `metal::fast::exp(-INF − finite)` returns NaN on Apple GPUs.
 - Channel coverage is `BN × v_per_thread × num_slabs = output_channels`. For our 2D=256 output: 32 × 4 × 2 = 256 ✓. Halving BN breaks coverage.
 
+### `sdpa_dual_v_q4` — quantized-input variant
+
+Same algorithm and threadgroup layout as `sdpa_dual_v`, but `K`, `V1`, `V2` are read straight out of HBM as MLX quantized triples `(data: uint32, scales: T, biases: T)` and dequantized in registers. Auto-selected at decode time when the cache is `MotifGroupedQuantizedKVCache` (gate via `MLX_MOTIF_QUANT_SDPA`).
+
+**Why it exists.** The naive path is `mx.dequantize(K)` + `mx.dequantize(V1)` + `mx.dequantize(V2)` + `sdpa_dual_v`. The dequants run every decode step, materialize three full-cache-size fp16 tensors, and never get cached. By inlining the dequant into the attention kernel we skip 3 ops per layer per token AND keep the K/V reads in their packed 4-bit/8-bit form (≈3.6× lower HBM traffic).
+
+**Bench (M1 Max, 12.7B decode shape, B=1, H_q=40, H_kv=8, D=128, group_size=64; min of 10 trials × 64 batched calls):**
+
+| KV    | dequant→sdpa_dual_v | `sdpa_dual_v_q4` (4b) | (8b)   | q4 vs deq | q8 vs deq |
+|-------|---------------------|------------------------|--------|-----------|-----------|
+| 1024  | 0.118 ms            | 0.086 ms               | 0.080 ms | **0.73×** | **0.68×** |
+| 4096  | 0.320 ms            | 0.227 ms               | 0.220 ms | **0.71×** | **0.62×** |
+| 8192  | 0.637 ms            | 0.415 ms               | 0.413 ms | **0.65×** | **0.58×** |
+| 16384 | 1.223 ms            | 0.794 ms               | 0.769 ms | **0.65×** | **0.57×** |
+
+(At KV ≤ 800 the dispatch overhead from 9 input buffers makes it borderline-or-slower than the dequant path; only the long-context regime wins.)
+
+**Key implementation tricks** (see `docs/sdpa_dual_v_q4_design.md` and the `_SDPA_DUAL_V_Q4_SRC` source):
+- **MLX qdot trick** for the QK side: precompute `q_pre[j] = scale * q[j] / 2^(shift_base + j*BITS)` once per lane, then in the kv loop the K nibble at position `j` — appearing in the packed word as `nibble * 2^(shift_base + j*BITS)` after a mask-without-shift — multiplied by `q_pre[j]` gives the correctly-weighted partial dot. Saves one shift per channel per kv step (the K side is shift-free in the inner loop). Borrowed from MLX's `qdot` helper in `mlx/backend/metal/kernels/quantized.h`.
+- **Per-lane K mask LUT** computed once outside the loop: 4 `uint32` masks → in-place mask + cast-to-float + multiply-and-add, no shifts.
+- **Per-lane group_idx is correct only if** `qk_per_thread ≤ group_size` and `qk_per_thread ≤ EL_PER_INT`. For `D=128, group_size ∈ {32, 64, 128}, bits ∈ {4, 8}` both hold, so a single scale/bias load per lane per kv step covers all 4 channels.
+- **Same -1e30f sentinel** as `sdpa_dual_v` — `metal::fast::exp(-INF − finite) = NaN` on Apple GPUs.
+- **Bit-extract probe** (`tests/test_dequant_probe.py`) locks down the 4/8-bit unpack against `mx.dequantize` standalone, so a future correctness regression in the full kernel can be triaged in isolation.
+
 ### `gda_post_split` — fused post-attention reduction
 
 Reads `attn_origin` and `attn_noise` as **separate** buffers, broadcasts noise via index inside the threadgroup (`h_n = h_o / gr`), computes `(attn_o − λ·attn_n)`, applies SubLN, scales by `(1 − λ_init)`. Replaces the previous chain that required `mx.concatenate([attn_o, attn_n], axis=1)` (~316 µs/layer on its own) followed by 5+ separate ops.
@@ -135,7 +160,7 @@ These are real, validated kernels that didn't win on M1 Max for our specific sha
 - `gda_decode` (commit `6922acb`) — single-pass flash-style fused GDA with serial-per-thread KV. Correct but ~2.7× slower than MLX's vectorized SDPA. Opt-in via `MLX_MOTIF_FLASH_DECODE=1`.
 - `sdpa_dual_v_2pass` (commit `ab50df7`) — MLX-style two-pass design (per-block partials → cross-block reduction). Loses to single-pass at every tested KV (64..16k) because with `H_q=40` query heads, single-pass already saturates M1's 32 cores. Right design for MLA-style 1-Q-head models or prefill (S>1) where the Q-axis becomes parallel.
 - `polynorm_mul` (commit `c4f2c03`) — fuses `polynorm(gate) * up` into one kernel. ~7% slower end-to-end than the bare two-step path: MLX's lazy graph already fuses the elementwise multiply into `down_proj`'s input handling more effectively than a single big custom kernel.
-- `MotifGroupedQuantizedKVCache` (commit `295ecf0`) — 4-bit per-slot quantized cache. Saves 15% peak memory at 3.2k context but costs 12% decode speed (per-step dequant > bandwidth saved). Real speed win requires the in-kernel quantized read, tracked as future work.
+- `MotifGroupedQuantizedKVCache` (commit `295ecf0`) — 4-bit per-slot quantized cache. Saves 15% peak memory at 3.2k context. Originally cost 12% decode speed via the dequant-bridge fetch; the **`sdpa_dual_v_q4` kernel below now reads it directly** and beats the dequant→fp16 path by 27-43% at KV ≥ 1024.
 
 ## Model surgeries
 
@@ -192,7 +217,8 @@ src/mlx_motif/
                      # MotifModel, Model + fuse_qkv() + make_cache()
   kernels.py         # All custom Metal kernels + pure-MLX references:
                      #   polynorm, polynorm_mul, gda_post, gda_post_split,
-                     #   sdpa_dual_v, sdpa_dual_v_2pass, gda_decode (legacy)
+                     #   sdpa_dual_v, sdpa_dual_v_q4, sdpa_dual_v_2pass,
+                     #   gda_decode (legacy)
   cache.py           # MotifGroupedKVCache + MotifGroupedQuantizedKVCache
                      #   (4-slot variants for the differential pattern)
   loader.py          # mlx_motif.load() — wraps mlx-lm load_model + fuse_qkv
@@ -209,6 +235,8 @@ tests/
   test_kernels_gda_decode.py       # legacy flash decode correctness
   test_kernels_sdpa_dual_v.py      # dual-V SDPA correctness (+ GQA)
   test_kernels_sdpa_dual_v_2pass.py # 2-pass dual-V correctness
+  test_kernels_sdpa_dual_v_q4.py   # quantized-input dual-V SDPA (+ GQA)
+  test_dequant_probe.py            # standalone 4/8-bit unpack probe
   test_grouped_cache.py            # 4-slot cache correctness
 
 examples/
@@ -222,7 +250,8 @@ examples/
 |---|---|---|
 | `MLX_MOTIF_DUAL_V` | `1` | `0` disables `sdpa_dual_v` and uses the V-stacked SDPA + `gda_post` fallback (the kernel A/B baseline) |
 | `MLX_MOTIF_FLASH_DECODE` | `0` | `1` enables the legacy serial flash decode kernel (correct, slow) |
-| `MLX_MOTIF_4SLOT_CACHE` | `0` | `1` = unquantized 4-slot cache; `q4` / `q8` = quantized 4-slot cache (memory savings at xlong, speed cost) |
+| `MLX_MOTIF_4SLOT_CACHE` | `0` | `1` = unquantized 4-slot cache; `q4` / `q8` = quantized 4-slot cache. Combined with `MLX_MOTIF_QUANT_SDPA=1` (default) the q4/q8 path now beats dequant→fp16 by 27-43% at KV ≥ 1024. |
+| `MLX_MOTIF_QUANT_SDPA` | `1` | `0` disables `sdpa_dual_v_q4` and falls back to dequant-bridge fetch + `sdpa_dual_v` even when the cache is quantized |
 | `MLX_MOTIF_DISABLE_KERNELS` | `0` | `1` falls back to pure-MLX references for all kernels (correctness-only mode) |
 | `MLX_MOTIF_PARITY` | unset | path to HF checkpoint to enable the parity test |
 | `MLX_MOTIF_PARITY_MLX` | unset | path to converted MLX checkpoint for the parity test |
@@ -240,7 +269,10 @@ Documented honestly because they're useful priors for the next person:
 | `mx.fast.SDPA` with quantized KV via dequant bridge | even-or-slower at all tested contexts | `ac95834`, `54c5c62` |
 | Single-call 40-head dual_v vs split origin/noise | split is +8% (smaller calls pipeline better) | `91c9a79` |
 | 2-pass dual-V (à la MLX `sdpa_vector_2pass_*`) | slower at every KV; right design for 1-Q-head models | `ab50df7` |
-| 4-slot quantized cache via dequant fetch | 15% memory saved, 12% slower (no in-kernel quant read) | `295ecf0` |
+| 4-slot quantized cache via dequant fetch | 15% memory saved, 12% slower (no in-kernel quant read) — **superseded** by `sdpa_dual_v_q4` (commit `e741102`) | `295ecf0` |
+| Composable q4 chain (3× `mx.quantized_matmul` + softmax + 2× attn@V) | Capped at +1% vs fp16 `sdpa_dual_v` at KV=8192. Confirmed compute-bound; motivated the hand-written kernel. | `f630dac` |
+| `qmv_dual_q4` — fused gate+up GEMV (shared `x` register reuse) | -9% at S=1, -77% at S=16. `x` already lives in L1 between MLX qmm calls so "shared load" buys nothing. Kept as reference for chips with smaller L1. | `54dabb5` |
+| `mlp_lowbit` preset — q3/gs=32 for MLP weights | -31% at p500 e2e + 10% PPL regression on Motif 12.7B, despite +31% per-call microbench. Extra scale/bias overhead absorbs the bandwidth saving. Kept opt-in for hardware/model A/B. | `b6a9c77` |
 
 ## Limitations / known issues
 
@@ -254,12 +286,12 @@ Documented honestly because they're useful priors for the next person:
 
 In order of expected payoff:
 
-1. **`sdpa_dual_v_q4`** — read the 4-slot quantized cache directly (no dequant). Real speed win at xlong; the 4-slot cache plumbing is already done, just needs the kernel.
-2. **OpenAI-compatible server** with `<think>` streaming toggle (visible / hidden / suppressed). `mlx_lm.server` works via our `load()`; needs a thin wrapper.
+1. ~~**`sdpa_dual_v_q4`** — read the 4-slot quantized cache directly (no dequant).~~ **Done** — see kernel section above. q4 beats dequant→fp16 by 27-43% at KV ≥ 1024.
+2. ~~**OpenAI-compatible server** with `<think>` streaming toggle.~~ **Done** — `mlx-motif serve --think-mode visible|hidden|captured`.
 3. **HF Hub upload** of the converted MLX checkpoints (`mlx-community/Motif-2-12.7B-Reasoning-MLX-q4` etc).
 4. **Multi-chip validation** — re-tune and re-bench on M2/M3/M4.
-5. **Perplexity eval** to validate q4 (and the mixed-precision preset specifically) preserves model quality.
-6. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings.
+5. ~~**Perplexity eval** to validate q4.~~ **Done** — `scripts/perplexity.py`; mixed-quant ≈ uniform q4 (PPL diff < 1%).
+6. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings (q4 kernel landed; need an end-to-end measurement).
 7. **Prefill-optimized kernels** — currently prefill uses the same path as MLX. The 2-pass `sdpa_dual_v_2pass` is the right design here.
 
 ## Reference architecture
@@ -273,6 +305,16 @@ For ground truth on the math, see:
 ## Commit trail of optimizations
 
 ```
+b6a9c77  feat(quant): mlp_lowbit preset (NEGATIVE — kept opt-in)
+54dabb5  feat(kernels): qmv_dual_q4 fused gate+up GEMV (NEGATIVE — kept ref)
+1d2c950  docs(blog): quantized attention on M1 Max — where the win actually lives
+3372a01  docs(readme): refresh status table, negative-results, commit trail
+b362de6  feat(model): wire sdpa_dual_v_q4 into _forward_grouped + docs
+e741102  feat(kernels): sdpa_dual_v_q4 — quantized-input shared-QK dual-V SDPA
+9e062ae  docs(kernels): design + skeleton for sdpa_dual_v_q4
+0e3f9fc  feat(server): OpenAI-compatible HTTP server with <think> stream filter
+b25f8af  feat(eval): perplexity script + finding: mixed-quant ≈ uniform q4
+f630dac  docs(kernels): bench notes — composable q4 chain doesn't beat sdpa_dual_v
 295ecf0  feat(cache): MotifGroupedKVCache + MotifGroupedQuantizedKVCache (4-slot)
 ab50df7  feat(kernels): 2-pass dual_v variant — correct, slower than single-pass
 3c92927  perf(model): drop the KV-size heuristic — native GQA wins everywhere

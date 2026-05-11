@@ -23,14 +23,118 @@ from mlx_lm.models.base import create_attention_mask
 from mlx_lm.models.cache import _BaseCache
 
 
-class MotifGroupedKVCache(_BaseCache):
+class MotifGroupedKVCacheBase(_BaseCache):
+    """Shared base for the 4-slot grouped KV caches.
+
+    Holds offset bookkeeping and all methods whose implementation is identical
+    between the fp16 and quantized variants:
+        - step constant (overridable per instance for tests)
+        - update_and_fetch (NotImplementedError shim)
+        - is_trimmable / trim / make_mask
+        - state.setter (unpacks 4-tuple into k1/k2/v1/v2)
+        - _grow skeleton (delegates storage differences to subclass hooks)
+
+    Subclass contract (must set in __init__ before any call):
+        self.k1 = self.k2 = self.v1 = self.v2 = None
+        self.offset = 0
+
+    Subclass hooks for _grow:
+        _slot_capacity(slot) -> int   index-2 length of an allocated slot
+        _init_storage(B, H, n, D, dtype) -> slot   fresh zeroed slot of length n
+        _trim_slot(slot, prev) -> slot              slice slot to [:prev] along axis-2
+        _expand_slot(slot, fresh) -> slot           concatenate slot + fresh along axis-2
+    """
+
+    step = 256
+
+    # ------------------------------------------------------------------
+    # mlx-lm _BaseCache contract: single-slot shim
+    # ------------------------------------------------------------------
+
+    def update_and_fetch(self, keys, values):
+        # Should not be reached for the grouped attention path; kept so that
+        # generic mlx-lm code paths (e.g., spec decoding cache trim) still work.
+        raise NotImplementedError(
+            "MotifGroupedKVCacheBase subclasses require the model to call "
+            "update_and_fetch_4 directly — the 1-slot path is intentionally unsupported."
+        )
+
+    # ------------------------------------------------------------------
+    # mlx-lm _BaseCache contract: trimmability
+    # ------------------------------------------------------------------
+
+    def is_trimmable(self):
+        return True
+
+    def trim(self, n):
+        n = min(self.offset, n)
+        self.offset -= n
+        return n
+
+    def make_mask(self, *args, **kwargs):
+        return create_attention_mask(*args, offset=self.offset, **kwargs)
+
+    # ------------------------------------------------------------------
+    # state setter (getter differs between subclasses)
+    # ------------------------------------------------------------------
+
+    @property
+    def state(self):
+        raise NotImplementedError
+
+    @state.setter
+    def state(self, v):
+        self.k1, self.k2, self.v1, self.v2 = v
+
+    # ------------------------------------------------------------------
+    # _grow skeleton — storage differences delegated to subclass hooks
+    # ------------------------------------------------------------------
+
+    def _grow(self, B: int, H: int, S: int, D: int, dtype) -> None:
+        prev = self.offset
+        if self.k1 is None or (prev + S) > self._slot_capacity(self.k1):
+            n_steps = (self.step + S - 1) // self.step
+            new_len = n_steps * self.step
+            if self.k1 is not None:
+                if prev % self.step != 0:
+                    self.k1 = self._trim_slot(self.k1, prev)
+                    self.k2 = self._trim_slot(self.k2, prev)
+                    self.v1 = self._trim_slot(self.v1, prev)
+                    self.v2 = self._trim_slot(self.v2, prev)
+                fresh = self._init_storage(B, H, new_len, D, dtype)
+                self.k1 = self._expand_slot(self.k1, fresh)
+                self.k2 = self._expand_slot(self.k2, fresh)
+                self.v1 = self._expand_slot(self.v1, fresh)
+                self.v2 = self._expand_slot(self.v2, fresh)
+            else:
+                self.k1 = self._init_storage(B, H, new_len, D, dtype)
+                self.k2 = self._init_storage(B, H, new_len, D, dtype)
+                self.v1 = self._init_storage(B, H, new_len, D, dtype)
+                self.v2 = self._init_storage(B, H, new_len, D, dtype)
+
+    # ------------------------------------------------------------------
+    # Subclass hooks (abstract)
+    # ------------------------------------------------------------------
+
+    def _slot_capacity(self, slot) -> int:
+        raise NotImplementedError
+
+    def _init_storage(self, B: int, H: int, n: int, D: int, dtype):
+        raise NotImplementedError
+
+    def _trim_slot(self, slot, prev: int):
+        raise NotImplementedError
+
+    def _expand_slot(self, slot, fresh):
+        raise NotImplementedError
+
+
+class MotifGroupedKVCache(MotifGroupedKVCacheBase):
     """4-slot unquantized KV cache for grouped DiffAttn (k1, k2, v1, v2).
 
     Behaves like a fp16/bf16 KVCache but stores the four buffers separately,
     which lets the forward path skip the post-fetch head-axis split.
     """
-
-    step = 256
 
     def __init__(self):
         self.k1 = None
@@ -39,26 +143,25 @@ class MotifGroupedKVCache(_BaseCache):
         self.v2 = None
         self.offset = 0
 
-    def _grow(self, B: int, H: int, S: int, D: int, dtype) -> None:
-        prev = self.offset
-        if self.k1 is None or (prev + S) > self.k1.shape[2]:
-            n_steps = (self.step + S - 1) // self.step
-            new_len = n_steps * self.step
-            shape = (B, H, new_len, D)
-            new_k1, new_k2 = mx.zeros(shape, dtype), mx.zeros(shape, dtype)
-            new_v1, new_v2 = mx.zeros(shape, dtype), mx.zeros(shape, dtype)
-            if self.k1 is not None:
-                if prev % self.step != 0:
-                    self.k1 = self.k1[..., :prev, :]
-                    self.k2 = self.k2[..., :prev, :]
-                    self.v1 = self.v1[..., :prev, :]
-                    self.v2 = self.v2[..., :prev, :]
-                self.k1 = mx.concatenate([self.k1, new_k1], axis=2)
-                self.k2 = mx.concatenate([self.k2, new_k2], axis=2)
-                self.v1 = mx.concatenate([self.v1, new_v1], axis=2)
-                self.v2 = mx.concatenate([self.v2, new_v2], axis=2)
-            else:
-                self.k1, self.k2, self.v1, self.v2 = new_k1, new_k2, new_v1, new_v2
+    # ------------------------------------------------------------------
+    # Storage hooks (fp16/bf16 tensors)
+    # ------------------------------------------------------------------
+
+    def _slot_capacity(self, slot) -> int:
+        return slot.shape[2]
+
+    def _init_storage(self, B: int, H: int, n: int, D: int, dtype):
+        return mx.zeros((B, H, n, D), dtype)
+
+    def _trim_slot(self, slot, prev: int):
+        return slot[..., :prev, :]
+
+    def _expand_slot(self, slot, fresh):
+        return mx.concatenate([slot, fresh], axis=2)
+
+    # ------------------------------------------------------------------
+    # 4-slot update/fetch
+    # ------------------------------------------------------------------
 
     def update_and_fetch_4(self, k1, k2, v1, v2):
         B, H, S, D = k1.shape
@@ -72,15 +175,9 @@ class MotifGroupedKVCache(_BaseCache):
         o = self.offset
         return self.k1[..., :o, :], self.k2[..., :o, :], self.v1[..., :o, :], self.v2[..., :o, :]
 
-    # Compatibility shim: a single-slot interface that mlx-lm calls when it
-    # doesn't know about update_and_fetch_4 (returns combined K/V tensors).
-    def update_and_fetch(self, keys, values):
-        # Should not be reached for the grouped attention path; kept so that
-        # generic mlx-lm code paths (e.g., spec decoding cache trim) still work.
-        raise NotImplementedError(
-            "MotifGroupedKVCache requires the model to call update_and_fetch_4 "
-            "directly — the 1-slot path is intentionally unsupported."
-        )
+    # ------------------------------------------------------------------
+    # mlx-lm _BaseCache contract: state / meta_state
+    # ------------------------------------------------------------------
 
     @property
     def state(self):
@@ -106,16 +203,9 @@ class MotifGroupedKVCache(_BaseCache):
     def meta_state(self, v):
         self.offset = int(v[0])
 
-    def is_trimmable(self):
-        return True
-
-    def trim(self, n):
-        n = min(self.offset, n)
-        self.offset -= n
-        return n
-
-    def make_mask(self, *args, **kwargs):
-        return create_attention_mask(*args, offset=self.offset, **kwargs)
+    # ------------------------------------------------------------------
+    # Conversion
+    # ------------------------------------------------------------------
 
     def to_quantized(self, group_size: int = 64, bits: int = 8) -> MotifGroupedQuantizedKVCache:
         """Switch to the quantized variant — keeps the 4 slots, quantizes them."""
@@ -130,7 +220,7 @@ class MotifGroupedKVCache(_BaseCache):
         return new
 
 
-class MotifGroupedQuantizedKVCache(_BaseCache):
+class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
     """4-slot quantized KV cache. Each of (k1, k2, v1, v2) lives in HBM as
     a quantized triple `(data: uint32, scales: dtype, biases: dtype)`.
 
@@ -140,70 +230,42 @@ class MotifGroupedQuantizedKVCache(_BaseCache):
     quantization-native sdpa_dual_v_q4 would skip the dequant entirely.
     """
 
-    step = 256
-
     def __init__(self, group_size: int = 64, bits: int = 8):
         self.k1 = self.k2 = self.v1 = self.v2 = None
         self.offset = 0
         self.group_size = group_size
         self.bits = bits
 
-    def _init_quant(self, B: int, H: int, total_len: int, D: int, dtype) -> tuple:
+    # ------------------------------------------------------------------
+    # Storage hooks (quantized triples)
+    # ------------------------------------------------------------------
+
+    def _slot_capacity(self, slot) -> int:
+        return slot[0].shape[2]
+
+    def _init_storage(self, B: int, H: int, n: int, D: int, dtype):
         el_per_int = 8 * mx.uint32.size // self.bits
         return (
-            mx.zeros((B, H, total_len, D // el_per_int), dtype=mx.uint32),
-            mx.zeros((B, H, total_len, D // self.group_size), dtype=dtype),
-            mx.zeros((B, H, total_len, D // self.group_size), dtype=dtype),
+            mx.zeros((B, H, n, D // el_per_int), dtype=mx.uint32),
+            mx.zeros((B, H, n, D // self.group_size), dtype=dtype),
+            mx.zeros((B, H, n, D // self.group_size), dtype=dtype),
         )
 
-    def _grow(self, B: int, H: int, S: int, D: int, dtype) -> None:
-        prev = self.offset
-        if self.k1 is None or (prev + S) > self.k1[0].shape[2]:
-            n_steps = (self.step + S - 1) // self.step
-            new_len = n_steps * self.step
-            if self.k1 is not None:
-                # trim to the live region then concat fresh space
-                if prev % self.step != 0:
+    def _trim_slot(self, slot, prev: int):
+        return tuple(x[..., :prev, :] for x in slot)
 
-                    def _trim(t):
-                        return tuple(x[..., :prev, :] for x in t)
+    def _expand_slot(self, slot, fresh):
+        return tuple(mx.concatenate([slot[i], fresh[i]], axis=-2) for i in range(3))
 
-                    self.k1 = _trim(self.k1)
-                    self.k2 = _trim(self.k2)
-                    self.v1 = _trim(self.v1)
-                    self.v2 = _trim(self.v2)
-                fresh = self._init_quant(B, H, new_len, D, dtype)
-
-                def _expand(t, f):
-                    return tuple(mx.concatenate([t[i], f[i]], axis=-2) for i in range(3))
-
-                self.k1 = _expand(self.k1, fresh)
-                self.k2 = _expand(self.k2, fresh)
-                self.v1 = _expand(self.v1, fresh)
-                self.v2 = _expand(self.v2, fresh)
-            else:
-                self.k1 = self._init_quant(B, H, new_len, D, dtype)
-                self.k2 = self._init_quant(B, H, new_len, D, dtype)
-                self.v1 = self._init_quant(B, H, new_len, D, dtype)
-                self.v2 = self._init_quant(B, H, new_len, D, dtype)
+    # ------------------------------------------------------------------
+    # 4-slot update/fetch
+    # ------------------------------------------------------------------
 
     def update_and_fetch_4(self, k1, k2, v1, v2):
         """Quantize the 4 incoming slices and append; return dequantized
         slices of the live cache region (so the fp16/bf16 attention kernel
         consumes unchanged inputs)."""
-        B, H, S, D = k1.shape
-        prev = self.offset
-        self._grow(B, H, S, D, k1.dtype)
-
-        for fresh, slot in [(k1, self.k1), (k2, self.k2), (v1, self.v1), (v2, self.v2)]:
-            q_data, q_scales, q_biases = mx.quantize(
-                fresh, group_size=self.group_size, bits=self.bits
-            )
-            slot[0][..., prev : prev + S, :] = q_data
-            slot[1][..., prev : prev + S, :] = q_scales
-            slot[2][..., prev : prev + S, :] = q_biases
-
-        self.offset += S
+        self._update_4(k1, k2, v1, v2)
         o = self.offset
 
         # Dequantize the live region for downstream attention kernel.
@@ -218,8 +280,44 @@ class MotifGroupedQuantizedKVCache(_BaseCache):
 
         return _deq(self.k1), _deq(self.k2), _deq(self.v1), _deq(self.v2)
 
-    def update_and_fetch(self, keys, values):
-        raise NotImplementedError("MotifGroupedQuantizedKVCache requires update_and_fetch_4.")
+    def update_and_fetch_4_quantized(self, k1, k2, v1, v2):
+        """Quantize the 4 incoming slices and append; return live-region
+        slices of each slot as raw quantized triples `(data, scales, biases)`.
+
+        This is the bandwidth-saving path: the consumer (a quant-input
+        attention kernel like `sdpa_dual_v_q4`) reads packed 4/8-bit
+        memory directly without paying the per-step `mx.dequantize` cost.
+        """
+        self._update_4(k1, k2, v1, v2)
+        o = self.offset
+
+        def _live(slot):
+            return (
+                slot[0][..., :o, :],
+                slot[1][..., :o, :],
+                slot[2][..., :o, :],
+            )
+
+        return _live(self.k1), _live(self.k2), _live(self.v1), _live(self.v2)
+
+    def _update_4(self, k1, k2, v1, v2):
+        B, H, S, D = k1.shape
+        prev = self.offset
+        self._grow(B, H, S, D, k1.dtype)
+
+        for fresh, slot in [(k1, self.k1), (k2, self.k2), (v1, self.v1), (v2, self.v2)]:
+            q_data, q_scales, q_biases = mx.quantize(
+                fresh, group_size=self.group_size, bits=self.bits
+            )
+            slot[0][..., prev : prev + S, :] = q_data
+            slot[1][..., prev : prev + S, :] = q_scales
+            slot[2][..., prev : prev + S, :] = q_biases
+
+        self.offset += S
+
+    # ------------------------------------------------------------------
+    # mlx-lm _BaseCache contract: state / meta_state
+    # ------------------------------------------------------------------
 
     @property
     def state(self):
@@ -236,14 +334,3 @@ class MotifGroupedQuantizedKVCache(_BaseCache):
     @meta_state.setter
     def meta_state(self, v):
         self.offset, self.group_size, self.bits = map(int, v)
-
-    def is_trimmable(self):
-        return True
-
-    def trim(self, n):
-        n = min(self.offset, n)
-        self.offset -= n
-        return n
-
-    def make_mask(self, *args, **kwargs):
-        return create_attention_mask(*args, offset=self.offset, **kwargs)

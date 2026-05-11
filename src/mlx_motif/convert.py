@@ -24,7 +24,6 @@ import shutil
 from pathlib import Path
 
 import mlx.core as mx
-import mlx.nn as nn
 from huggingface_hub import snapshot_download
 from mlx_lm.utils import save_config, save_model
 from safetensors import safe_open

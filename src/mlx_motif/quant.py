@@ -34,7 +34,7 @@ Usage:
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import mlx.nn as nn
 
@@ -89,7 +89,7 @@ def apply_quant(
     q_bits: int = 6,
     mlp_bits: int = 3,
     mlp_group_size: int = 32,
-    predicate: Optional[Callable] = None,
+    predicate: Callable | None = None,
 ) -> dict:
     """Quantize `model` in-place using the chosen preset.
 

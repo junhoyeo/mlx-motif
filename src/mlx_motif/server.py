@@ -39,8 +39,6 @@ import sys
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Optional
-
 
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"

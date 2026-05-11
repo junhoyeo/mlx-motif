@@ -205,7 +205,7 @@ class MotifGroupedKVCache(MotifGroupedKVCacheBase):
     # Conversion
     # ------------------------------------------------------------------
 
-    def to_quantized(self, group_size: int = 64, bits: int = 8) -> "MotifGroupedQuantizedKVCache":
+    def to_quantized(self, group_size: int = 64, bits: int = 8) -> MotifGroupedQuantizedKVCache:
         """Switch to the quantized variant — keeps the 4 slots, quantizes them."""
         new = MotifGroupedQuantizedKVCache(group_size=group_size, bits=bits)
         if self.offset > 0:

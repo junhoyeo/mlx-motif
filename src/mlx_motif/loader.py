@@ -9,7 +9,6 @@ injects our class via the `get_model_classes` hook on `mlx_lm.utils.load_model`.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Tuple
 
 import mlx.nn as nn
 from mlx_lm.utils import TokenizerWrapper, load_tokenizer
@@ -25,7 +24,7 @@ def _get_motif_classes(config: dict):
 def load(
     path: str | Path,
     fuse_qkv: bool = True,
-) -> Tuple[nn.Module, TokenizerWrapper]:
+) -> tuple[nn.Module, TokenizerWrapper]:
     """Load a converted MLX Motif checkpoint and its tokenizer.
 
     Args:

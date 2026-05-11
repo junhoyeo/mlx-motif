@@ -17,9 +17,7 @@ from __future__ import annotations
 import enum
 import math
 import os
-from dataclasses import dataclass, field
-from functools import partial
-from typing import Optional
+from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -61,21 +59,21 @@ class ModelArgs(BaseModelArgs):
     rms_norm_eps: float = 1e-6
     rope_theta: float = 10000.0
     max_position_embeddings: int = 8192
-    head_dim: Optional[int] = None
-    num_noise_heads: Optional[int] = None
+    head_dim: int | None = None
+    num_noise_heads: int | None = None
     k_ratio: int = 1
     attn_rms_norm_eps: float = 1e-5
     tie_word_embeddings: bool = False
-    rope_scaling: Optional[dict] = None
+    rope_scaling: dict | None = None
     hidden_act: str = "poly_norm"
     use_bias: bool = False
     expanded: bool = False
-    sliding_window: Optional[int] = None
+    sliding_window: int | None = None
     use_sliding_window: bool = False
-    max_window_layers: Optional[int] = None
+    max_window_layers: int | None = None
     fused_rope: bool = False
-    bos_token_id: Optional[int] = None
-    eos_token_id: Optional[int] = None
+    bos_token_id: int | None = None
+    eos_token_id: int | None = None
 
     @property
     def is_grouped(self) -> bool:
@@ -322,7 +320,6 @@ class MotifAttention(nn.Module):
         self.num_heads = args.num_attention_heads // 2
         self.num_kv_heads = args.num_key_value_heads // 2
         self.n_rep = self.num_heads // self.num_kv_heads
-        d = self.head_dim
         self.q_proj = nn.Linear(h, h, bias=args.use_bias)
         self.k_proj = nn.Linear(h, h // self.n_rep, bias=args.use_bias)
         self.v_proj = nn.Linear(h, h // self.n_rep, bias=args.use_bias)
@@ -340,7 +337,7 @@ class MotifAttention(nn.Module):
     def __call__(
         self,
         x: mx.array,
-        mask: Optional[mx.array] = None,
+        mask: mx.array | None = None,
         cache=None,
     ) -> mx.array:
         if self.args.is_grouped:
@@ -521,8 +518,11 @@ class MotifAttention(nn.Module):
         #   gda_post_split    : split-input post-reduction (avoids concat)
         # See kernels.py docstrings for design notes.
         from mlx_motif.kernels import (
-            gda_decode, gda_post, gda_post_split,
-            sdpa_dual_v, sdpa_dual_v_q4,
+            gda_decode,
+            gda_post,
+            gda_post_split,
+            sdpa_dual_v,
+            sdpa_dual_v_q4,
         )
 
         lam = self._lambda_full(mx.float32).reshape(1)
@@ -610,7 +610,7 @@ class MotifModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
+        mask: mx.array | None = None,
         cache=None,
     ) -> mx.array:
         h = self.embed_tokens(inputs)
@@ -618,7 +618,7 @@ class MotifModel(nn.Module):
             mask = create_attention_mask(h, cache)
         if cache is None:
             cache = [None] * len(self.layers)
-        for layer, c in zip(self.layers, cache):
+        for layer, c in zip(self.layers, cache, strict=True):
             h = layer(h, mask=mask, cache=c)
         return self.norm(h)
 
@@ -640,7 +640,7 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: Optional[mx.array] = None,
+        mask: mx.array | None = None,
         cache=None,
     ) -> mx.array:
         h = self.model(inputs, mask=mask, cache=cache)
@@ -676,12 +676,13 @@ class Model(nn.Module):
         dequant for ~4× cache memory at long context.
         """
         from mlx_lm.models.cache import KVCache
+
         from mlx_motif.cache import MotifGroupedKVCache, MotifGroupedQuantizedKVCache
 
         env = os.environ.get("MLX_MOTIF_4SLOT_CACHE", "0").lower()
         use_4slot = env not in ("0", "", "false", "off")
         caches = []
-        for layer in self.layers:
+        for _layer in self.layers:
             if use_4slot and self.args.is_grouped:
                 if env in ("q4", "4"):
                     caches.append(MotifGroupedQuantizedKVCache(group_size=64, bits=4))

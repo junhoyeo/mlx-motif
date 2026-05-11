@@ -21,29 +21,29 @@ Public API:
     sdpa_dual_v_reference(q, k, v1, v2, scale) -> mx.array
 """
 
-from .mlp import (
-    polynorm,
-    polynorm_reference,
-    polynorm_mul,
-    polynorm_mul_reference,
-    _dequant_probe,
-    qmv_dual_q4,
-    qmv_dual_q4_reference,
+from .attention import (
+    sdpa_dual_v,
+    sdpa_dual_v_2pass,
+    sdpa_dual_v_q4,
+    sdpa_dual_v_q4_reference,
+    sdpa_dual_v_reference,
 )
 from .gda import (
+    gda_decode,
+    gda_decode_reference,
     gda_post,
     gda_post_reference,
     gda_post_split,
     gda_post_split_reference,
-    gda_decode,
-    gda_decode_reference,
 )
-from .attention import (
-    sdpa_dual_v,
-    sdpa_dual_v_reference,
-    sdpa_dual_v_2pass,
-    sdpa_dual_v_q4,
-    sdpa_dual_v_q4_reference,
+from .mlp import (
+    _dequant_probe,
+    polynorm,
+    polynorm_mul,
+    polynorm_mul_reference,
+    polynorm_reference,
+    qmv_dual_q4,
+    qmv_dual_q4_reference,
 )
 
 __all__ = [

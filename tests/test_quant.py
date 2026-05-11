@@ -104,5 +104,5 @@ def test_mlp_lowbit_overrides_emit_per_module_config():
     assert any(".mlp.gate_proj" in k for k in mlp_overrides)
     assert any(".mlp.up_proj" in k for k in mlp_overrides)
     assert any(".mlp.down_proj" in k for k in mlp_overrides)
-    for path, settings in mlp_overrides.items():
+    for _path, settings in mlp_overrides.items():
         assert settings == {"group_size": 32, "bits": 4}

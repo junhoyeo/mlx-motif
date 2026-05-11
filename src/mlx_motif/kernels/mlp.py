@@ -9,7 +9,6 @@ import mlx.core as mx
 from ._common import _DISABLE
 from ._metal_helpers import Q4_QDOT_HEADER
 
-
 # --------------------------------------------------------------------------- #
 # PolyNorm
 # --------------------------------------------------------------------------- #

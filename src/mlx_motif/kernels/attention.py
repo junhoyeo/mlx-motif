@@ -6,7 +6,6 @@ import mlx.core as mx
 
 from ._common import _DISABLE
 
-
 # --------------------------------------------------------------------------- #
 # Shared-QK, dual-V SDPA decode — 2-pass variant (`sdpa_dual_v_2pass`)
 # --------------------------------------------------------------------------- #
@@ -232,7 +231,8 @@ def sdpa_dual_v_2pass(
 ) -> mx.array:
     """2-pass variant of `sdpa_dual_v`. Same semantics, optimized for long KV."""
     if _DISABLE:
-        H_q = q.shape[1]; H_kv = k.shape[1]
+        H_q = q.shape[1]
+        H_kv = k.shape[1]
         gqa = H_q // H_kv
         if gqa > 1:
             k = mx.repeat(k, gqa, axis=1)
@@ -723,7 +723,8 @@ def sdpa_dual_v_q4_reference(
     k = mx.dequantize(*k_q, group_size=group_size, bits=bits)
     v1 = mx.dequantize(*v1_q, group_size=group_size, bits=bits)
     v2 = mx.dequantize(*v2_q, group_size=group_size, bits=bits)
-    H_q = q.shape[1]; H_kv = k.shape[1]
+    H_q = q.shape[1]
+    H_kv = k.shape[1]
     gqa = H_q // H_kv
     if gqa > 1:
         k = mx.repeat(k, gqa, axis=1)

@@ -7,8 +7,10 @@ import numpy as np
 import pytest
 
 from mlx_motif.kernels import (
-    polynorm, polynorm_reference,
-    polynorm_mul, polynorm_mul_reference,
+    polynorm,
+    polynorm_mul,
+    polynorm_mul_reference,
+    polynorm_reference,
 )
 
 

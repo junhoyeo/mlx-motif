@@ -13,7 +13,6 @@ import pytest
 
 from mlx_motif.kernels import sdpa_dual_v_q4, sdpa_dual_v_q4_reference
 
-
 _SHAPES = [
     # (B, H_q, H_kv, KV, d)
     (1,  4,  4,    16, 128),   # smallest

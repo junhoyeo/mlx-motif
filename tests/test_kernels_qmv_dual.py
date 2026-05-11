@@ -12,7 +12,6 @@ import pytest
 
 from mlx_motif.kernels import qmv_dual_q4, qmv_dual_q4_reference
 
-
 _SHAPES = [
     # (B, S, IN, OUT) — must satisfy IN % 512 == 0 and OUT % 8 == 0
     (1, 1, 4096, 16384),  # production MLP shape (Motif 12.7B gate/up)

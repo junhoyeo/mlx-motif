@@ -165,13 +165,11 @@ def _repeat(x: mx.array, n_rep: int, axis: int = 1) -> mx.array:
 class AttnPath(enum.Enum):
     """Which kernel + cache-fetch strategy to use in _forward_grouped.
 
-    SERIAL_FLASH — legacy gda_decode (single-token serial-per-thread flash).
     QUANT_SDPA   — sdpa_dual_v_q4: K/V stay quantized through the kernel.
     DUAL_V       — sdpa_dual_v: fp16 K/V, shared-QK dual-V kernel.
     FALLBACK     — stacked SDPA + scalar gda_post (prefill / GQA repeat path).
     """
 
-    SERIAL_FLASH = "gda_decode"
     QUANT_SDPA = "sdpa_dual_v_q4"
     DUAL_V = "sdpa_dual_v"
     FALLBACK = "stacked_sdpa"
@@ -193,29 +191,20 @@ def _resolve_attention_path(
 
     Decision order (first match wins):
 
-    1. SERIAL_FLASH — ``MLX_MOTIF_FLASH_DECODE != 0`` AND single-token decode
-       with no GQA repeat and ``k_ratio == 1``. Note: this path does NOT gate
-       on ``fused_rope`` — the gda_decode kernel handles per-branch RoPE
-       internally, which is its reason to exist.
-    2. QUANT_SDPA   — cache is ``MotifGroupedQuantizedKVCache`` AND
-       ``MLX_MOTIF_QUANT_SDPA != 0`` AND same decode conditions AND
-       ``not fused_rope`` (kernel consumes post-RoPE q/k from rope() call).
-    3. DUAL_V       — ``MLX_MOTIF_DUAL_V != 0`` AND same decode conditions
+    1. QUANT_SDPA — cache is ``MotifGroupedQuantizedKVCache`` AND
+       ``MLX_MOTIF_QUANT_SDPA != 0`` AND single-token decode with no GQA
+       repeat, ``k_ratio == 1``, and ``not fused_rope`` (kernel consumes
+       post-RoPE q/k from the standard rope() call).
+    2. DUAL_V    — ``MLX_MOTIF_DUAL_V != 0`` AND same decode conditions
        AND ``not fused_rope`` (same reason as QUANT_SDPA).
-    4. FALLBACK     — everything else (prefill, GQA repeat, k_ratio > 1, …).
+    3. FALLBACK  — everything else (prefill, GQA repeat, k_ratio > 1, …).
     """
     from mlx_motif.cache import MotifGroupedQuantizedKVCache
 
     _is_falsy = ("0", "", "false", "False")
 
-    # Single-token decode shape preconditions shared by all three custom
-    # paths. The `not fused_rope` guard is intentionally NOT in here — it
-    # only applies to QUANT_SDPA and DUAL_V (which consume post-RoPE q/k
-    # tensors), not to SERIAL_FLASH (which does its own RoPE internally).
+    # Single-token decode shape preconditions shared by both custom paths.
     decode_shape_ok = S == 1 and kv_repeat == 1 and kr == 1
-
-    if decode_shape_ok and env.get("MLX_MOTIF_FLASH_DECODE", "0") not in _is_falsy:
-        return AttnPath.SERIAL_FLASH
 
     if (
         decode_shape_ok
@@ -515,13 +504,12 @@ class MotifAttention(nn.Module):
         # Kernel selection — keyed off the same `path` computed above
         # ------------------------------------------------------------------ #
 
-        # Available flash kernels:
-        #   gda_decode        : original serial-per-thread (correct, slow)
+        # Available decode-path kernels:
         #   sdpa_dual_v       : shared-QK dual-V SDPA (default at decode)
+        #   sdpa_dual_v_q4    : same, reads quantized cache directly
         #   gda_post_split    : split-input post-reduction (avoids concat)
-        # See kernels.py docstrings for design notes.
+        # See kernels/ docstrings for design notes.
         from mlx_motif.kernels import (
-            gda_decode,
             gda_post,
             gda_post_split,
             sdpa_dual_v,
@@ -530,22 +518,7 @@ class MotifAttention(nn.Module):
 
         lam = self._lambda_full(mx.float32).reshape(1)
 
-        if path is AttnPath.SERIAL_FLASH:
-            out = gda_decode(
-                q1,
-                q2,
-                k1,
-                k2,
-                v1,
-                v2,
-                self.subln.weight,
-                lam,
-                self.lambda_init,
-                gr,
-                self.scale,
-                eps=self.args.attn_rms_norm_eps,
-            )
-        elif path is AttnPath.QUANT_SDPA:
+        if path is AttnPath.QUANT_SDPA:
             # Quantized-input fast path: K, V1, V2 stay packed all the way
             # into the attention kernel — no per-step `mx.dequantize`. The
             # kernel does mask-without-shift for QK (MLX qdot trick) plus

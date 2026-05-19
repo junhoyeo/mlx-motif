@@ -155,14 +155,11 @@ Reads `attn_origin` and `attn_noise` as **separate** buffers, broadcasts noise v
 
 Single-pass `polynorm(x) = w0·norm(x³) + w1·norm(x²) + w2·norm(x) + b`. Each threadgroup processes one row, computes the three power-means via simdgroup reductions, then writes the linear combination.
 
-### Variants tried and kept in tree, NOT used by default
+### Variants we tried and removed
 
-These are real, validated kernels that didn't win on M1 Max for our specific shape but are kept as references and as the right answer for other configurations:
+Several kernels and design alternatives were built, measured, and ultimately did not ship — single-pass dual-V beat 2-pass at every tested KV, `polynorm_mul` lost to the lazy-graph chain fusion, `qmv_dual_q4` lost because `x` was already in L1, and `gda_decode` flash hit the M1 Max register-pressure cap. They're all written up with snippets + benches + "when this might win" notes in [`docs/experiments/`](docs/experiments/) — useful priors before re-trying any of them on different hardware.
 
-- `gda_decode` (commit `6922acb`) — single-pass flash-style fused GDA with serial-per-thread KV. Correct but ~2.7× slower than MLX's vectorized SDPA. Opt-in via `MLX_MOTIF_FLASH_DECODE=1`.
-- `sdpa_dual_v_2pass` (commit `ab50df7`) — MLX-style two-pass design (per-block partials → cross-block reduction). Loses to single-pass at every tested KV (64..16k) because with `H_q=40` query heads, single-pass already saturates M1's 32 cores. Right design for MLA-style 1-Q-head models or prefill (S>1) where the Q-axis becomes parallel.
-- `polynorm_mul` (commit `c4f2c03`) — fuses `polynorm(gate) * up` into one kernel. ~7% slower end-to-end than the bare two-step path: MLX's lazy graph already fuses the elementwise multiply into `down_proj`'s input handling more effectively than a single big custom kernel.
-- `MotifGroupedQuantizedKVCache` (commit `295ecf0`) — 4-bit per-slot quantized cache. Saves 15% peak memory at 3.2k context. Originally cost 12% decode speed via the dequant-bridge fetch; the **`sdpa_dual_v_q4` kernel below now reads it directly** and beats the dequant→fp16 path by 27-43% **per-call** at KV ∈ [1024, 16384] (e2e on real Motif: +18% at 3k prompt vs the dequant-bridge path).
+The one variant that's still wired up (with a documented trade-off) is the 4-bit quantized KV cache: `MotifGroupedQuantizedKVCache` saves ~15% peak memory at 3.2k context, originally cost 12% decode speed via dequant-bridge fetch, and is now net-positive on both axes thanks to the **`sdpa_dual_v_q4` kernel reading it directly** — beats the dequant→fp16 path by 27-43% per-call at KV ∈ [1024, 16384] (e2e on real Motif: +18% at 3k prompt vs the same cache's dequant path).
 
 ## Model surgeries
 
@@ -218,11 +215,10 @@ src/mlx_motif/
   model.py           # PolyNorm, MotifAttention (vanilla + GDA, AttnPath enum),
                      # MotifMLP, MotifModel, Model + fuse_qkv() + make_cache()
   kernels/           # Custom Metal kernels package + pure-MLX references:
-    __init__.py      #   re-exports + status summary of each kernel
-    attention.py     #   sdpa_dual_v, sdpa_dual_v_2pass, sdpa_dual_v_q4
-    gda.py           #   gda_post, gda_post_split, gda_decode (legacy)
-    mlp.py           #   polynorm, polynorm_mul, qmv_dual_q4, _dequant_probe
-    _metal_helpers.py#   shared Metal source fragments (Q4_QDOT_HEADER, ...)
+    __init__.py      #   re-exports + pointer to docs/experiments/ for removed kernels
+    attention.py     #   sdpa_dual_v, sdpa_dual_v_q4
+    gda.py           #   gda_post, gda_post_split
+    mlp.py           #   polynorm, _dequant_probe (test helper)
     _common.py       #   shared Python helpers
   cache.py           # MotifGroupedKVCacheBase + MotifGroupedKVCache +
                      # MotifGroupedQuantizedKVCache (4-slot variants for
@@ -235,18 +231,15 @@ src/mlx_motif/
                      # <think> stream handling (visible|hidden|captured)
 
 tests/
-  test_model.py                    # smoke: forward shapes, sanitize
+  test_model.py                    # smoke: forward shapes, sanitize, AttnPath resolution
   test_quant.py                    # quantization predicates
   test_parity.py                   # numerical parity vs HF reference
   test_think_filter.py             # server <think>-stream filter
-  test_kernels.py                  # polynorm + polynorm_mul correctness
+  test_kernels.py                  # polynorm correctness
   test_kernels_gda.py              # gda_post correctness
   test_kernels_gda_post_split.py   # gda_post_split correctness
-  test_kernels_gda_decode.py       # legacy flash decode correctness
   test_kernels_sdpa_dual_v.py      # dual-V SDPA correctness (+ GQA)
-  test_kernels_sdpa_dual_v_2pass.py # 2-pass dual-V correctness
   test_kernels_sdpa_dual_v_q4.py   # quantized-input dual-V SDPA (+ GQA)
-  test_kernels_qmv_dual.py         # fused gate+up GEMV (negative-result kernel)
   test_dequant_probe.py            # standalone 4/8-bit unpack probe
   test_grouped_cache.py            # 4-slot cache correctness
 
@@ -264,7 +257,6 @@ examples/
 | Variable | Default | Effect |
 |---|---|---|
 | `MLX_MOTIF_DUAL_V` | `1` | `0` disables `sdpa_dual_v` and uses the V-stacked SDPA + `gda_post` fallback (the kernel A/B baseline) |
-| `MLX_MOTIF_FLASH_DECODE` | `0` | `1` enables the legacy serial flash decode kernel (correct, slow) |
 | `MLX_MOTIF_4SLOT_CACHE` | `0` | `1` = unquantized 4-slot cache; `q4` / `q8` = quantized 4-slot cache. Combined with `MLX_MOTIF_QUANT_SDPA=1` (default) the q4/q8 path delivers per-call attention 27-43% faster than dequant→fp16 at KV ∈ [1024, 16384] (e2e on Motif 12.7B: +18% at 3k prompt vs same cache's dequant path). |
 | `MLX_MOTIF_QUANT_SDPA` | `1` | `0` disables `sdpa_dual_v_q4` and falls back to dequant-bridge fetch + `sdpa_dual_v` even when the cache is quantized |
 | `MLX_MOTIF_DISABLE_KERNELS` | `0` | `1` falls back to pure-MLX references for all kernels (correctness-only mode) |
@@ -273,21 +265,19 @@ examples/
 
 ## What we tried that didn't work (negative results)
 
-Documented honestly because they're useful priors for the next person:
+Every experiment — code snippet, bench numbers, root cause, and "when this might win on different hardware" — lives in [`docs/experiments/`](docs/experiments/). The short list:
 
-| Idea | Result | Commit |
-|---|---|---|
-| Custom `polynorm_mul` Metal kernel | -7% end-to-end | `c4f2c03` |
-| `mx.compile`-wrapped MLP chain | +12% microbench, -4% end-to-end (breaks lazy fusion) | reverted |
-| Fuse gate+up matmuls (4096→32768) | -34% (off MLX's quantized matmul sweet spot) | not landed |
-| Concat q+k for joint RoPE call | -9% (concat overhead exceeds dispatch saving) | not landed |
-| `mx.fast.SDPA` with quantized KV via dequant bridge | even-or-slower at all tested contexts | `ac95834`, `54c5c62` |
-| Single-call 40-head dual_v vs split origin/noise | split is +8% (smaller calls pipeline better) | `91c9a79` |
-| 2-pass dual-V (à la MLX `sdpa_vector_2pass_*`) | slower at every KV; right design for 1-Q-head models | `ab50df7` |
-| 4-slot quantized cache via dequant fetch | 15% memory saved, 12% slower (no in-kernel quant read) — **superseded** by `sdpa_dual_v_q4` (commit `e741102`) | `295ecf0` |
-| Composable q4 chain (3× `mx.quantized_matmul` + softmax + 2× attn@V) | Capped at +1% vs fp16 `sdpa_dual_v` at KV=8192. Confirmed compute-bound; motivated the hand-written kernel. | `f630dac` |
-| `qmv_dual_q4` — fused gate+up GEMV (shared `x` register reuse) | -9% at S=1, -77% at S=16. `x` already lives in L1 between MLX qmm calls so "shared load" buys nothing. Kept as reference for chips with smaller L1. | `54dabb5` |
-| `mlp_lowbit` preset — q3/gs=32 for MLP weights | -31% at p500 e2e + 10% PPL regression on Motif 12.7B, despite +31% per-call microbench. Extra scale/bias overhead absorbs the bandwidth saving. Kept opt-in for hardware/model A/B. | `b6a9c77` |
+| Idea | Status |
+|---|---|
+| `polynorm_mul` fused kernel | -7% e2e — [doc](docs/experiments/experiment-polynorm-mul.md) |
+| 2-pass dual-V SDPA | slower at every KV — [doc](docs/experiments/experiment-sdpa-dual-v-2pass.md) |
+| `qmv_dual_q4` fused gate+up GEMV | -9% to -77% — [doc](docs/experiments/experiment-qmv-dual-q4.md) |
+| `gda_decode` single-pass flash | ~2.7× slower (M1 Max register cap) — [doc](docs/experiments/experiment-gda-decode-flash.md) |
+| `mlp_lowbit` q3/gs=32 MLP preset | **kept** — memory ↓25%, speed -31%, PPL +10% — [doc](docs/experiments/experiment-mlp-lowbit.md) |
+| 4-slot quantized cache via dequant bridge | **superseded** by `sdpa_dual_v_q4` — [doc](docs/experiments/experiment-quant-kv-dequant-bridge.md) |
+| `mx.compile` MLP, fuse gate+up matmuls, concat q+k RoPE, single-call 40-head dual_v, composable q4 chain | [combined writeup](docs/experiments/experiment-not-landed.md) |
+
+Negative-result code itself is **not in the codebase** — only the writeups + commit pointers. Snippets in the docs are preserved verbatim from the removed code.
 
 ## Limitations / known issues
 

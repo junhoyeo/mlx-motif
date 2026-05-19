@@ -311,4 +311,3 @@ def gda_post(
         output_dtypes=[merged.dtype],
     )[0]
     return out
-

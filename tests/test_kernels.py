@@ -33,5 +33,3 @@ def test_polynorm_matches_reference(shape, dtype):
         f"polynorm mismatch shape={shape} dtype={dtype}: "
         f"max diff={np.max(np.abs(np.array(ref.astype(mx.float32)) - np.array(got.astype(mx.float32)))):.4e}"
     )
-
-

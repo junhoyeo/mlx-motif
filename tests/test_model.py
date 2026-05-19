@@ -201,35 +201,9 @@ def _quant_4slot_cache(bits=4):
 class TestResolveAttentionPath:
     """Unit tests for _resolve_attention_path — one case per AttnPath value."""
 
-    # SERIAL_FLASH: MLX_MOTIF_FLASH_DECODE=1 with decode-eligible conditions.
-    def test_serial_flash_when_flash_decode_enabled(self):
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="1")
-        path = _resolve_attention_path(
-            cache=_fp16_4slot_cache(),
-            S=1,
-            kv_repeat=1,
-            kr=1,
-            fused_rope=False,
-            env=env,
-        )
-        assert path is AttnPath.SERIAL_FLASH
-
-    def test_serial_flash_takes_priority_over_quant_sdpa(self):
-        # Even with a quantized cache AND quant_sdpa enabled, SERIAL_FLASH wins.
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="1", MLX_MOTIF_QUANT_SDPA="1")
-        path = _resolve_attention_path(
-            cache=_quant_4slot_cache(),
-            S=1,
-            kv_repeat=1,
-            kr=1,
-            fused_rope=False,
-            env=env,
-        )
-        assert path is AttnPath.SERIAL_FLASH
-
     # QUANT_SDPA: quantized cache + default QUANT_SDPA flag.
     def test_quant_sdpa_with_quantized_cache(self):
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_QUANT_SDPA="1")
+        env = _stub_env(MLX_MOTIF_QUANT_SDPA="1")
         path = _resolve_attention_path(
             cache=_quant_4slot_cache(),
             S=1,
@@ -242,7 +216,7 @@ class TestResolveAttentionPath:
 
     def test_quant_sdpa_default_flag_is_on(self):
         # MLX_MOTIF_QUANT_SDPA defaults to "1" when key absent from env.
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0")
+        env = _stub_env()
         path = _resolve_attention_path(
             cache=_quant_4slot_cache(),
             S=1,
@@ -255,7 +229,7 @@ class TestResolveAttentionPath:
 
     def test_quant_sdpa_disabled_falls_through_to_dual_v(self):
         # MLX_MOTIF_QUANT_SDPA=0 with quant cache -> DUAL_V (not QUANT_SDPA).
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_QUANT_SDPA="0")
+        env = _stub_env(MLX_MOTIF_QUANT_SDPA="0")
         path = _resolve_attention_path(
             cache=_quant_4slot_cache(),
             S=1,
@@ -268,7 +242,7 @@ class TestResolveAttentionPath:
 
     # DUAL_V: fp16 4-slot cache + default DUAL_V flag.
     def test_dual_v_with_fp16_4slot_cache(self):
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_DUAL_V="1")
+        env = _stub_env(MLX_MOTIF_DUAL_V="1")
         path = _resolve_attention_path(
             cache=_fp16_4slot_cache(),
             S=1,
@@ -280,7 +254,7 @@ class TestResolveAttentionPath:
         assert path is AttnPath.DUAL_V
 
     def test_dual_v_default_flag_is_on(self):
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0")
+        env = _stub_env()
         path = _resolve_attention_path(
             cache=_fp16_4slot_cache(),
             S=1,
@@ -340,24 +314,6 @@ class TestResolveAttentionPath:
         )
         assert path is AttnPath.FALLBACK
 
-    def test_serial_flash_wins_even_with_fused_rope(self):
-        """SERIAL_FLASH (gda_decode) handles per-branch RoPE internally,
-        which is its reason to exist. It must NOT be blocked by
-        ``fused_rope=True``. Regression guard: the original branch in
-        main was ``if use_serial_flash and S == 1 and kv_repeat == 1
-        and kr == 1`` — explicitly NOT including ``not fused_rope``.
-        """
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="1")
-        path = _resolve_attention_path(
-            cache=_fp16_4slot_cache(),
-            S=1,
-            kv_repeat=1,
-            kr=1,
-            fused_rope=True,
-            env=env,
-        )
-        assert path is AttnPath.SERIAL_FLASH
-
     def test_quant_sdpa_blocked_by_fused_rope(self):
         """QUANT_SDPA consumes post-RoPE q/k from the standard rope() call
         — fused-rope routes around that, so this kernel must fall through."""
@@ -386,7 +342,7 @@ class TestResolveAttentionPath:
         assert path is AttnPath.FALLBACK
 
     def test_fallback_when_dual_v_disabled(self):
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_DUAL_V="0")
+        env = _stub_env(MLX_MOTIF_DUAL_V="0")
         path = _resolve_attention_path(
             cache=_fp16_4slot_cache(),
             S=1,
@@ -415,7 +371,7 @@ class TestResolveAttentionPath:
     # Env-flag edge cases: all falsy string variants for QUANT_SDPA.
     @pytest.mark.parametrize("val", ["0", "", "false", "False"])
     def test_quant_sdpa_falsy_strings(self, val):
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_QUANT_SDPA=val)
+        env = _stub_env(MLX_MOTIF_QUANT_SDPA=val)
         path = _resolve_attention_path(
             cache=_quant_4slot_cache(),
             S=1,
@@ -429,7 +385,7 @@ class TestResolveAttentionPath:
 
     @pytest.mark.parametrize("val", ["0", "", "false", "False"])
     def test_dual_v_falsy_strings(self, val):
-        env = _stub_env(MLX_MOTIF_FLASH_DECODE="0", MLX_MOTIF_DUAL_V=val)
+        env = _stub_env(MLX_MOTIF_DUAL_V=val)
         path = _resolve_attention_path(
             cache=_fp16_4slot_cache(),
             S=1,

@@ -219,7 +219,7 @@ The hypothesis was wrong. `x` is 8 KB and M1 Max's L1 is 192 KB per core, so aft
 
 `mlp_lowbit` is **31% slower at p500** and within the noise band at p3000 (mlplow runs spanned 6.25 / 13.85 / 24.14 — ~4× spread suggesting thermal throttling). The +31% per-call microbench win does not survive integration. Two costs absorb it: ~+800 MB resident-memory overhead from doubled scale/bias entries at gs=32 (40 layers × 3 matmuls × 2 MB extra each), and apparent per-call dispatch overhead in MLX's q3 path that's higher than q4. Plus a real quality cost: +10% PPL relative.
 
-**Both kept in tree as documented negative results.** The `qmv_dual_q4` kernel is correct and may win on hardware with smaller L1 (M3/M4 maybe) or on shapes where x exceeds cache. The `mlp_lowbit` preset infrastructure is wired through the converter and ready to A/B against future bit-width combos. Neither is on by default.
+**Only the useful knob stayed in tree.** The `qmv_dual_q4` kernel was correct but is now documented under `docs/experiments/` instead of shipped as dead code. It may still be worth re-running on hardware with smaller L1 (M3/M4 maybe) or on shapes where x exceeds cache. The `mlp_lowbit` preset infrastructure is still wired through the converter and ready to A/B against future bit-width combos, but it is opt-in rather than default.
 
 ## Sanity-check: am I wrong, or is this consensus?
 

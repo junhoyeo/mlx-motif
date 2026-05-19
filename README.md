@@ -1,5 +1,7 @@
 # mlx-motif
 
+![Hero image for mlx-motif](./.github/assets/hero.png)
+
 The canonical [MLX](https://github.com/ml-explore/mlx) port of [Motif Technologies'](https://huggingface.co/Motif-Technologies) language models on Apple Silicon.
 
 Motif's flagship LLMs combine **Grouped Differential Attention** ([2510.06949](https://arxiv.org/abs/2510.06949) / [2410.05258](https://arxiv.org/abs/2410.05258)) with the **PolyNorm** activation ([2411.03884](https://arxiv.org/abs/2411.03884)). Neither primitive ships in mlx-lm. This repo implements both natively in MLX, with a stack of custom Metal kernels that beats `mx.fast.scaled_dot_product_attention` on the differential-attention path.
@@ -104,7 +106,7 @@ x  ─→  RMSNorm  ─→  qkv_proj  ─→  split (q | k | v)
 
 ## The custom Metal kernels
 
-All kernels live in [`src/mlx_motif/kernels.py`](src/mlx_motif/kernels.py). Each ships with a pure-MLX reference (`*_reference`) and a parametric correctness test under [`tests/`](tests/).
+All kernels live in the [`src/mlx_motif/kernels/`](src/mlx_motif/kernels/) package, split by domain (`attention.py`, `gda.py`, `mlp.py`, with shared Metal headers in `_metal_helpers.py` / `_common.py`). Each ships with a pure-MLX reference (`*_reference`) and a parametric correctness test under [`tests/`](tests/).
 
 ### `sdpa_dual_v` — the headline kernel
 
@@ -212,23 +214,31 @@ Note: isolated microbench ≠ in-chain time. MLX's lazy graph fuses many of thes
 ```
 src/mlx_motif/
   __init__.py        # exports load, Model, ModelArgs, __version__
-  __main__.py        # CLI: convert | generate
-  model.py           # PolyNorm, MotifAttention (vanilla + GDA), MotifMLP,
-                     # MotifModel, Model + fuse_qkv() + make_cache()
-  kernels.py         # All custom Metal kernels + pure-MLX references:
-                     #   polynorm, polynorm_mul, gda_post, gda_post_split,
-                     #   sdpa_dual_v, sdpa_dual_v_q4, sdpa_dual_v_2pass,
-                     #   gda_decode (legacy)
-  cache.py           # MotifGroupedKVCache + MotifGroupedQuantizedKVCache
-                     #   (4-slot variants for the differential pattern)
-  loader.py          # mlx_motif.load() — wraps mlx-lm load_model + fuse_qkv
+  __main__.py        # CLI: convert | generate | serve
+  model.py           # PolyNorm, MotifAttention (vanilla + GDA, AttnPath enum),
+                     # MotifMLP, MotifModel, Model + fuse_qkv() + make_cache()
+  kernels/           # Custom Metal kernels package + pure-MLX references:
+    __init__.py      #   re-exports + status summary of each kernel
+    attention.py     #   sdpa_dual_v, sdpa_dual_v_2pass, sdpa_dual_v_q4
+    gda.py           #   gda_post, gda_post_split, gda_decode (legacy)
+    mlp.py           #   polynorm, polynorm_mul, qmv_dual_q4, _dequant_probe
+    _metal_helpers.py#   shared Metal source fragments (Q4_QDOT_HEADER, ...)
+    _common.py       #   shared Python helpers
+  cache.py           # MotifGroupedKVCacheBase + MotifGroupedKVCache +
+                     # MotifGroupedQuantizedKVCache (4-slot variants for
+                     # the differential pattern)
+  loader.py          # mlx_motif.load() — wraps mlx-lm load_model + fuse_qkv;
+                     # registers all EOS ids from generation_config.json
   convert.py         # HF → MLX safetensors converter
   quant.py           # mixed-precision quantization presets
+  server.py          # OpenAI-compatible HTTP server + ThinkFilter for
+                     # <think> stream handling (visible|hidden|captured)
 
 tests/
   test_model.py                    # smoke: forward shapes, sanitize
   test_quant.py                    # quantization predicates
   test_parity.py                   # numerical parity vs HF reference
+  test_think_filter.py             # server <think>-stream filter
   test_kernels.py                  # polynorm + polynorm_mul correctness
   test_kernels_gda.py              # gda_post correctness
   test_kernels_gda_post_split.py   # gda_post_split correctness
@@ -236,8 +246,13 @@ tests/
   test_kernels_sdpa_dual_v.py      # dual-V SDPA correctness (+ GQA)
   test_kernels_sdpa_dual_v_2pass.py # 2-pass dual-V correctness
   test_kernels_sdpa_dual_v_q4.py   # quantized-input dual-V SDPA (+ GQA)
+  test_kernels_qmv_dual.py         # fused gate+up GEMV (negative-result kernel)
   test_dequant_probe.py            # standalone 4/8-bit unpack probe
   test_grouped_cache.py            # 4-slot cache correctness
+
+scripts/
+  bench_decode_e2e.py  # end-to-end decode benchmark (the headline-numbers harness)
+  perplexity.py        # PPL eval for quantization sanity-checks
 
 examples/
   convert.py    # end-to-end conversion script
@@ -305,6 +320,16 @@ For ground truth on the math, see:
 ## Commit trail of optimizations
 
 ```
+264fafa  fix(server): tighten prompt-in-think detection to a tail check
+ec52ad5  fix(loader): register all EOS token ids from generation_config.json
+e7b1785  fix(server): ThinkFilter must start in_think=True when template opens with <think>
+a79c1bd  docs: distinguish per-call microbench from e2e; tighten parity claim
+c05a223  chore: drop unused imports + refresh stale kernels package docstring
+6b3ded4  fix(model): SERIAL_FLASH path must not gate on `not fused_rope`
+b5b8fee  refactor(model): collapse attention path resolution into AttnPath enum
+026be9b  refactor(kernels): split kernels.py into a package + extract Q4_QDOT_HEADER
+420d5a6  refactor(cache): extract MotifGroupedKVCacheBase
+adcb77f  docs(blog): fold prior-art survey into the MLP findings
 b6a9c77  feat(quant): mlp_lowbit preset (NEGATIVE — kept opt-in)
 54dabb5  feat(kernels): qmv_dual_q4 fused gate+up GEMV (NEGATIVE — kept ref)
 1d2c950  docs(blog): quantized attention on M1 Max — where the win actually lives

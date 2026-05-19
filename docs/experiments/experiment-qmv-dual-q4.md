@@ -2,9 +2,17 @@
 
 **Status:** Removed from the codebase. Was committed in `54dabb5`.
 
+## Removed surface
+
+- Deleted symbols: `_QMV_DUAL_SRC`, `_make_qmv_dual_kernel`, `qmv_dual_q4_reference`, `qmv_dual_q4` from `src/mlx_motif/kernels/mlp.py`.
+- Deleted helper dependency: `Q4_QDOT_HEADER` and `src/mlx_motif/kernels/_metal_helpers.py`.
+- Deleted exports: `qmv_dual_q4`, `qmv_dual_q4_reference` from `src/mlx_motif/kernels/__init__.py`.
+- Deleted test file: `tests/test_kernels_qmv_dual.py`.
+- Full removed code: `git show origin/main:src/mlx_motif/kernels/mlp.py` and search for `QMV_DUAL`.
+
 ## Hypothesis
 
-At decode time MotifMLP is `down_proj(polynorm(gate_proj(x)) * up_proj(x))`. The `gate_proj` and `up_proj` matmuls are two separate q4 GEMVs, both reading the **same** activation `x` (4096-wide). 
+At decode time MotifMLP is `down_proj(polynorm(gate_proj(x)) * up_proj(x))`. The `gate_proj` and `up_proj` matmuls are two separate q4 GEMVs, both reading the **same** activation `x` (4096-wide).
 
 Hypothesis: applying the same "load Q once, accumulate into two slabs" trick that `sdpa_dual_v` uses for V should win here too — load `x` into registers once, run two parallel `qdot` chains for the two weight matrices, and emit both outputs from a single threadgroup.
 

@@ -8,7 +8,8 @@ post-fetch — defeating the bandwidth win.
 
 `MotifGroupedKVCache` and `MotifGroupedQuantizedKVCache` keep the four
 slots separate end-to-end so each branch can be fed straight to the
-attention kernel without intermediate concat or dequant.
+attention kernel without intermediate concat. Quantized slots can be consumed
+directly by `sdpa_dual_v_q4`; the dequant bridge remains as a fallback.
 
 Both classes implement the mlx-lm `_BaseCache` contract (`offset`,
 `update_and_fetch`, `state`, `meta_state`, `is_trimmable`, `trim`,
@@ -225,9 +226,9 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
     a quantized triple `(data: uint32, scales: dtype, biases: dtype)`.
 
     Bandwidth win at long context — packed 4-bit reads ¼ the bytes of fp16.
-    The fetch dequantizes back to fp16/bf16 (cost paid once per layer per
-    step) so existing fp16-input attention kernels stay unchanged. A future
-    quantization-native sdpa_dual_v_q4 would skip the dequant entirely.
+    `update_and_fetch_4_quantized` returns the packed triples for
+    `sdpa_dual_v_q4`; `update_and_fetch_4` keeps the slower dequantized bridge
+    for fp16-input attention fallbacks.
     """
 
     def __init__(self, group_size: int = 64, bits: int = 8):

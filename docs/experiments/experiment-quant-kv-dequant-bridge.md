@@ -2,6 +2,13 @@
 
 **Status:** Superseded by `sdpa_dual_v_q4` (in-kernel dequant). The bridge path stays as the fallback when `MLX_MOTIF_QUANT_SDPA=0`.
 
+## Live surface
+
+- Live cache symbols: `MotifGroupedQuantizedKVCache.update_and_fetch_4` (dequant bridge) and `update_and_fetch_4_quantized` (packed q4/q8 path) in `src/mlx_motif/cache.py`.
+- Live model dispatch: `AttnPath.QUANT_SDPA` and `MLX_MOTIF_QUANT_SDPA` routing in `src/mlx_motif/model.py`.
+- Test coverage: `tests/test_grouped_cache.py`, `tests/test_kernels_sdpa_dual_v_q4.py`, `tests/test_dequant_probe.py`, and quant-cache path tests in `tests/test_model.py`.
+- Full code: `src/mlx_motif/cache.py` and `src/mlx_motif/model.py`; search for `MotifGroupedQuantizedKVCache` and `QUANT_SDPA`.
+
 ## Hypothesis
 
 A 4-bit-per-slot KV cache cuts KV memory by ~4× — at 3.2k context that's the difference between fitting comfortably and not fitting at all. The naive way to make this work without writing a new attention kernel: per decode step, `mx.dequantize` the cache back to fp16 and feed that into the existing `sdpa_dual_v` kernel ("dequant bridge").

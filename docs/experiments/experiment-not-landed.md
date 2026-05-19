@@ -2,6 +2,12 @@
 
 These ideas got far enough to measure but never reached the codebase. Brief writeups so we don't redo them.
 
+## Provenance
+
+These entries have no deleted production symbols in this PR. They are bench
+notes for local or reverted prototypes; each section carries its own commit
+reference when one exists.
+
 ## `mx.compile`-wrapped MLP chain
 
 **Hypothesis.** Wrapping the MLP chain in `mx.compile` should let MLX's graph compiler do its full fusion pass on the chained ops.

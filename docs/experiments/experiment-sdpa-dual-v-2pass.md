@@ -2,6 +2,13 @@
 
 **Status:** Removed from the codebase. Was committed in `ab50df7`.
 
+## Removed surface
+
+- Deleted symbols: `_DUAL_V_PASS1_SRC`, `_DUAL_V_PASS2_SRC`, `_make_dual_v_pass1_kernel`, `_make_dual_v_pass2_kernel`, `sdpa_dual_v_2pass` from `src/mlx_motif/kernels/attention.py`.
+- Deleted exports: `sdpa_dual_v_2pass` from `src/mlx_motif/kernels/__init__.py`.
+- Deleted test file: `tests/test_kernels_sdpa_dual_v_2pass.py`.
+- Full removed code: `git show origin/main:src/mlx_motif/kernels/attention.py` and search for `DUAL_V_PASS`.
+
 ## Hypothesis
 
 The shipping `sdpa_dual_v` single-pass kernel uses `BN=32` simdgroups, each walking `KV/32` positions serially. At `KV=16384` that's 512 positions per simdgroup. As KV grows, each simdgroup's serial walk gets longer while the number of simdgroups stays fixed at 32 — the GPU's threadgroup scheduler runs out of work to interleave.

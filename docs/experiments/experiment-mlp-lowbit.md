@@ -2,6 +2,13 @@
 
 **Status:** **Kept in tree** as opt-in preset (`apply_quant(model, preset="mlp_lowbit")`). Speed-negative but memory-positive — kept for memory-constrained scenarios.
 
+## Live surface
+
+- Live symbols: `_mlp_lowbit_predicate` and `apply_quant(..., preset="mlp_lowbit")` in `src/mlx_motif/quant.py`.
+- CLI surface: `mlx-motif convert --quant-preset mlp_lowbit`.
+- Test coverage: quantization predicate/config behavior in `tests/test_quant.py`.
+- Full code: `src/mlx_motif/quant.py`; search for `mlp_lowbit`.
+
 ## Hypothesis
 
 MotifMLP at decode is bandwidth-bound on weight reads. The three MLP projections (`gate_proj`, `up_proj`, `down_proj`) at q4/gs=64 dominate per-layer cost. Dropping them to **q3 with group_size=32** cuts ~25% of MLP weight bytes — at a bandwidth-bound op, that should be a near-linear speedup.

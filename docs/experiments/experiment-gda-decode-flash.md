@@ -2,6 +2,14 @@
 
 **Status:** Removed from the codebase. Was committed in `6922acb`. The env flag `MLX_MOTIF_FLASH_DECODE` is gone with it.
 
+## Removed surface
+
+- Deleted symbols: `_GDA_DECODE_SRC`, `_make_gda_decode_kernel`, `gda_decode_reference`, `gda_decode` from `src/mlx_motif/kernels/gda.py`.
+- Deleted exports: `gda_decode`, `gda_decode_reference` from `src/mlx_motif/kernels/__init__.py`.
+- Deleted model dispatch: `AttnPath.SERIAL_FLASH` and `MLX_MOTIF_FLASH_DECODE` routing from `src/mlx_motif/model.py`.
+- Deleted test file: `tests/test_kernels_gda_decode.py`; deleted `SERIAL_FLASH` resolver cases from `tests/test_model.py`.
+- Full removed code: `git show origin/main:src/mlx_motif/kernels/gda.py` and search for `GDA_DECODE`.
+
 ## Hypothesis
 
 The full GDA decode pipeline is several ops: `q1·k1` SDPA → `q2·k2` SDPA → V-channel split → λ-subtract → SubLN → scale. The shipping fast path uses a V-stacked `mx.fast.scaled_dot_product_attention` plus a `gda_post` post-reduction kernel.

@@ -34,6 +34,14 @@ Each entry is structured the same way:
 |---|---|
 | [experiment-not-landed.md](experiment-not-landed.md) | `mx.compile` MLP, fuse gate+up matmuls (4096→32768), concat-qk for joint RoPE, single-call 40-head dual_v, composable q4 chain, mx.fast.SDPA with quantized KV via dequant bridge |
 
+## Provenance standard
+
+For removed experiments, each page names the deleted production symbols and
+test files, then keeps the load-bearing code snippet inline. The full removed
+implementation is intentionally recovered from git history instead of pasted
+wholesale into the active docs; this keeps the docs readable while preserving
+an exact audit trail.
+
 ## Why this folder exists
 
 Negative-result kernels are real engineering work — somebody wrote, tested, and benchmarked them. Deleting the code without recording why it lost throws away the most valuable byproduct: a calibrated prior for the next person evaluating the same idea on different hardware or a different shape. The snippets are preserved verbatim so someone re-trying these on M3/M4 doesn't start from scratch.

@@ -106,7 +106,7 @@ x  ─→  RMSNorm  ─→  qkv_proj  ─→  split (q | k | v)
 
 ## The custom Metal kernels
 
-All kernels live in the [`src/mlx_motif/kernels/`](src/mlx_motif/kernels/) package, split by domain (`attention.py`, `gda.py`, `mlp.py`, with shared Metal headers in `_metal_helpers.py` / `_common.py`). Each ships with a pure-MLX reference (`*_reference`) and a parametric correctness test under [`tests/`](tests/).
+All production kernels live in the [`src/mlx_motif/kernels/`](src/mlx_motif/kernels/) package, split by domain (`attention.py`, `gda.py`, `mlp.py`, with shared helpers in `_common.py`). Each production kernel ships with a pure-MLX reference (`*_reference`) and a parametric correctness test under [`tests/`](tests/).
 
 ### `sdpa_dual_v` — the headline kernel
 
@@ -277,7 +277,7 @@ Every experiment — code snippet, bench numbers, root cause, and "when this mig
 | 4-slot quantized cache via dequant bridge | **superseded** by `sdpa_dual_v_q4` — [doc](docs/experiments/experiment-quant-kv-dequant-bridge.md) |
 | `mx.compile` MLP, fuse gate+up matmuls, concat q+k RoPE, single-call 40-head dual_v, composable q4 chain | [combined writeup](docs/experiments/experiment-not-landed.md) |
 
-Negative-result code itself is **not in the codebase** — only the writeups + commit pointers. Snippets in the docs are preserved verbatim from the removed code.
+Negative-result code itself is **not in the codebase** — only the writeups, exact deleted-symbol provenance, and commit pointers. The docs keep the load-bearing snippets inline; full removed implementations are recoverable from git history with the file/symbol references in each experiment page.
 
 ## Limitations / known issues
 
@@ -297,7 +297,7 @@ In order of expected payoff:
 4. **Multi-chip validation** — re-tune and re-bench on M2/M3/M4.
 5. ~~**Perplexity eval** to validate q4.~~ **Done** — `scripts/perplexity.py`; mixed-quant ≈ uniform q4 (PPL diff < 1%).
 6. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings (q4 kernel landed; need an end-to-end measurement).
-7. **Prefill-optimized kernels** — currently prefill uses the same path as MLX. The 2-pass `sdpa_dual_v_2pass` is the right design here.
+7. **Prefill-optimized kernels** — currently prefill uses the same path as MLX. A future 2-pass design may be the right shape here, but the removed `sdpa_dual_v_2pass` decode experiment lost at Motif's tested decode shapes.
 
 ## Reference architecture
 

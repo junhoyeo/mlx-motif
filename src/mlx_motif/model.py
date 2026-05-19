@@ -31,10 +31,8 @@ def _maybe_dequant_kv(k, v, cache):
     The differential pattern slices K and V along the head axis AFTER cache
     fetch (`k[:, :, 0]`, `k[:, :, 1]`, etc.). When the cache is quantized,
     `update_and_fetch` returns triples (data, scales, biases) which can't be
-    sliced. We trade attention-time quantized-SDPA (already incompatible with
-    our split anyway) for cache-time *memory* savings: K/V live in HBM at
-    `kv_bits`, but get dequantized into registers per step before the split.
-    Net win: 2–4× cache memory at long context, no decode-speed regression.
+    sliced. This fallback materializes dequantized K/V for fp16/bf16 attention
+    kernels; the quantized-input `sdpa_dual_v_q4` path bypasses it when possible.
     """
     if hasattr(cache, "bits"):
         k = mx.dequantize(*k, group_size=cache.group_size, bits=cache.bits)
@@ -682,8 +680,9 @@ class Model(nn.Module):
         independent k1/k2/v1/v2 tensors instead of being re-sliced post-fetch.
 
         With `MLX_MOTIF_4SLOT_CACHE=q4` the slots are quantized to 4-bit
-        (group_size=64); `=q8` for 8-bit. Quantized variant trades a per-step
-        dequant for ~4× cache memory at long context.
+        (group_size=64); `=q8` for 8-bit. Quantized variants feed
+        `sdpa_dual_v_q4` by default; set `MLX_MOTIF_QUANT_SDPA=0` to use the
+        slower dequant-bridge fallback for A/B or debugging.
         """
         from mlx_lm.models.cache import KVCache
 

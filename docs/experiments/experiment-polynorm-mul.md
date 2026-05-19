@@ -2,6 +2,13 @@
 
 **Status:** Removed from the codebase. Was committed in `c4f2c03`.
 
+## Removed surface
+
+- Deleted symbols: `_POLYNORM_MUL_SRC`, `_make_polynorm_mul_kernel`, `polynorm_mul_reference`, `polynorm_mul` from `src/mlx_motif/kernels/mlp.py`.
+- Deleted exports: `polynorm_mul`, `polynorm_mul_reference` from `src/mlx_motif/kernels/__init__.py`.
+- Deleted test coverage: `test_polynorm_mul_matches_reference` from `tests/test_kernels.py`.
+- Full removed code: `git show origin/main:src/mlx_motif/kernels/mlp.py` and search for `POLYNORM_MUL`.
+
 ## Hypothesis
 
 MotifMLP at decode is `down_proj(polynorm(gate_proj(x)) * up_proj(x))`. The two-step `polynorm(gate) * up` writes a full intermediate-sized tensor (`(B·S, 16384)` at the 12.7B layout, ~32 KB/token at bf16, ~1.3 MB/token across 40 layers) to HBM and reads it back into the elementwise `* up` op.

@@ -25,7 +25,7 @@ Output is **byte-identical** between the in-tree kernel and reference paths (`ML
 
 **Shipped:** package + HF→MLX converter, mixed-precision quantization (`--quant-preset uniform|mixed|mlp_lowbit`), fused PolyNorm + GDA-post Metal kernels, shared-QK dual-V SDPA, 4-slot KV cache (fp16 / q4 / q8) with in-kernel quant-input SDPA (`sdpa_dual_v_q4`), OpenAI-compatible server with `<think>` streaming toggle, speculative-decoding wiring.
 
-**Open:** HF Hub release of converted checkpoints, multi-chip validation (M2/M3/M4), prefill-path kernels.
+**Open:** HF Hub release of converted checkpoints, multi-chip validation (M2/M3/M4), long-context end-to-end bench (16k+), prefill-path kernels.
 
 ## Install
 
@@ -239,7 +239,7 @@ Negative-result code itself is **not in the codebase** — only the writeups, ex
 
 ## What's next
 
-In order of expected payoff — tracked as GitHub issues, contributions welcome:
+In order of expected payoff — contributions welcome:
 
 1. **HF Hub upload** of the converted MLX checkpoints (`mlx-community/Motif-2-12.7B-Reasoning-MLX-q4` etc).
 2. **Multi-chip validation** — re-tune and re-bench the Metal kernels on M2/M3/M4.

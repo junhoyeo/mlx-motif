@@ -23,17 +23,9 @@ Output is **byte-identical** between the in-tree kernel and reference paths (`ML
 
 ## Status
 
-| Phase | Status |
-| --- | --- |
-| 1 — Package + structural port + tests | done |
-| 2 — Speculative decoding wiring | done (works, doesn't beat baseline at this draft/target ratio) |
-| 3 — Mixed-precision quantization | done (`--quant-preset mixed --q-proj-bits 6`) |
-| 4a — Fused PolyNorm + GDA-post Metal kernels | done |
-| 4b — Custom shared-QK dual-V SDPA + variants | done (the headline win) |
-| 4c — 4-slot KV cache (memory savings at xlong) | done (opt-in via env) |
-| 4d — Quantized-input attention kernel (`sdpa_dual_v_q4`) | done (auto-engages with quant cache; **per-call** 27-43% faster than dequant→fp16 at KV ∈ [1024, 16384]; **end-to-end** +18% on Motif 12.7B at 3k prompt vs the same q4 cache's dequant path, +10.8% vs vanilla fp16 KVCache) |
-| 5 — OpenAI-compatible server with `<think>` streaming | done (`mlx-motif serve --think-mode visible|hidden|captured`) |
-| 6 — HF Hub release + blog | not started |
+**Shipped:** package + HF→MLX converter, mixed-precision quantization (`--quant-preset uniform|mixed|mlp_lowbit`), fused PolyNorm + GDA-post Metal kernels, shared-QK dual-V SDPA, 4-slot KV cache (fp16 / q4 / q8) with in-kernel quant-input SDPA (`sdpa_dual_v_q4`), OpenAI-compatible server with `<think>` streaming toggle, speculative-decoding wiring.
+
+**Open:** HF Hub release of converted checkpoints, multi-chip validation (M2/M3/M4), long-context end-to-end bench (16k+), prefill-path kernels.
 
 ## Install
 
@@ -206,51 +198,9 @@ xlong prompt (3204)    14 tok/s (estimate)    24.02 ± 0.17 tok/s         +71%
 
 Note: isolated microbench ≠ in-chain time. MLX's lazy graph fuses many of these; chained per-layer time is roughly half the sum.
 
-## Codepath / file map
+## Codebase layout
 
-```
-src/mlx_motif/
-  __init__.py        # exports load, Model, ModelArgs, __version__
-  __main__.py        # CLI: convert | generate | serve
-  model.py           # PolyNorm, MotifAttention (vanilla + GDA, AttnPath enum),
-                     # MotifMLP, MotifModel, Model + fuse_qkv() + make_cache()
-  kernels/           # Custom Metal kernels package + pure-MLX references:
-    __init__.py      #   re-exports + pointer to docs/experiments/ for removed kernels
-    attention.py     #   sdpa_dual_v, sdpa_dual_v_q4
-    gda.py           #   gda_post, gda_post_split
-    mlp.py           #   polynorm, _dequant_probe (test helper)
-    _common.py       #   shared Python helpers
-  cache.py           # MotifGroupedKVCacheBase + MotifGroupedKVCache +
-                     # MotifGroupedQuantizedKVCache (4-slot variants for
-                     # the differential pattern)
-  loader.py          # mlx_motif.load() — wraps mlx-lm load_model + fuse_qkv;
-                     # registers all EOS ids from generation_config.json
-  convert.py         # HF → MLX safetensors converter
-  quant.py           # mixed-precision quantization presets
-  server.py          # OpenAI-compatible HTTP server + ThinkFilter for
-                     # <think> stream handling (visible|hidden|captured)
-
-tests/
-  test_model.py                    # smoke: forward shapes, sanitize, AttnPath resolution
-  test_quant.py                    # quantization predicates
-  test_parity.py                   # numerical parity vs HF reference
-  test_think_filter.py             # server <think>-stream filter
-  test_kernels.py                  # polynorm correctness
-  test_kernels_gda.py              # gda_post correctness
-  test_kernels_gda_post_split.py   # gda_post_split correctness
-  test_kernels_sdpa_dual_v.py      # dual-V SDPA correctness (+ GQA)
-  test_kernels_sdpa_dual_v_q4.py   # quantized-input dual-V SDPA (+ GQA)
-  test_dequant_probe.py            # standalone 4/8-bit unpack probe
-  test_grouped_cache.py            # 4-slot cache correctness
-
-scripts/
-  bench_decode_e2e.py  # end-to-end decode benchmark (the headline-numbers harness)
-  perplexity.py        # PPL eval for quantization sanity-checks
-
-examples/
-  convert.py    # end-to-end conversion script
-  generate.py   # end-to-end generation script
-```
+For where each module/test/script lives and what it does, see [`docs/codebase-tour.md`](docs/codebase-tour.md).
 
 ## Environment variables
 
@@ -287,17 +237,14 @@ Negative-result code itself is **not in the codebase** — only the writeups, ex
 - **Parity verified at bf16, not q4.** Quantization adds noise that hasn't been numerically diffed against HF.
 - **Speculative decoding wires up but doesn't beat baseline.** The 2.6B → 12.7B draft/target ratio isn't aggressive enough on M1 Max — accept rate ~70% but draft cost wipes the gain. Needs a sub-1B Motif draft model to actually win.
 
-## Roadmap
+## What's next
 
-In order of expected payoff:
+In order of expected payoff — contributions welcome:
 
-1. ~~**`sdpa_dual_v_q4`** — read the 4-slot quantized cache directly (no dequant).~~ **Done** — see kernel section above. Per-call: 27-43% faster than dequant→fp16 at KV ∈ [1024, 16384]. End-to-end on Motif 12.7B at 3k prompt: +18% vs same cache's dequant path, +10.8% vs vanilla fp16 KVCache.
-2. ~~**OpenAI-compatible server** with `<think>` streaming toggle.~~ **Done** — `mlx-motif serve --think-mode visible|hidden|captured`.
-3. **HF Hub upload** of the converted MLX checkpoints (`mlx-community/Motif-2-12.7B-Reasoning-MLX-q4` etc).
-4. **Multi-chip validation** — re-tune and re-bench on M2/M3/M4.
-5. ~~**Perplexity eval** to validate q4.~~ **Done** — `scripts/perplexity.py`; mixed-quant ≈ uniform q4 (PPL diff < 1%).
-6. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings (q4 kernel landed; need an end-to-end measurement).
-7. **Prefill-optimized kernels** — currently prefill uses the same path as MLX. A future 2-pass design may be the right shape here, but the removed `sdpa_dual_v_2pass` decode experiment lost at Motif's tested decode shapes.
+1. **HF Hub upload** of the converted MLX checkpoints (`mlx-community/Motif-2-12.7B-Reasoning-MLX-q4` etc).
+2. **Multi-chip validation** — re-tune and re-bench the Metal kernels on M2/M3/M4.
+3. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings (q4 kernel landed; need an end-to-end measurement).
+4. **Prefill-optimized kernels** — currently prefill uses MLX's stock path. A 2-pass design may fit prefill, even though the decode-time `sdpa_dual_v_2pass` lost at Motif's tested shapes (see [docs/experiments/](docs/experiments/)).
 
 ## Reference architecture
 
@@ -306,49 +253,6 @@ For ground truth on the math, see:
 - `/tmp/refs/sdpa_vector.h` (run `curl -sL https://raw.githubusercontent.com/ml-explore/mlx/main/mlx/backend/metal/kernels/sdpa_vector.h -o sdpa_vector.h`) — MLX's vectorized SDPA decode, the template our kernels follow.
 - HF `Motif-Technologies/Motif-2-12.7B-Reasoning/modeling_motif.py` — the PyTorch reference for Grouped Differential Attention; our kernels are validated against this layer-by-layer.
 - arXiv [2510.06949](https://arxiv.org/abs/2510.06949) (GDA), [2410.05258](https://arxiv.org/abs/2410.05258) (DiffTransformer), [2411.03884](https://arxiv.org/abs/2411.03884) (PolyNorm).
-
-## Commit trail of optimizations
-
-```
-264fafa  fix(server): tighten prompt-in-think detection to a tail check
-ec52ad5  fix(loader): register all EOS token ids from generation_config.json
-e7b1785  fix(server): ThinkFilter must start in_think=True when template opens with <think>
-a79c1bd  docs: distinguish per-call microbench from e2e; tighten parity claim
-c05a223  chore: drop unused imports + refresh stale kernels package docstring
-6b3ded4  fix(model): SERIAL_FLASH path must not gate on `not fused_rope`
-b5b8fee  refactor(model): collapse attention path resolution into AttnPath enum
-026be9b  refactor(kernels): split kernels.py into a package + extract Q4_QDOT_HEADER
-420d5a6  refactor(cache): extract MotifGroupedKVCacheBase
-adcb77f  docs(blog): fold prior-art survey into the MLP findings
-b6a9c77  feat(quant): mlp_lowbit preset (NEGATIVE — kept opt-in)
-54dabb5  feat(kernels): qmv_dual_q4 fused gate+up GEMV (NEGATIVE — kept ref)
-1d2c950  docs(blog): quantized attention on M1 Max — where the win actually lives
-3372a01  docs(readme): refresh status table, negative-results, commit trail
-b362de6  feat(model): wire sdpa_dual_v_q4 into _forward_grouped + docs
-e741102  feat(kernels): sdpa_dual_v_q4 — quantized-input shared-QK dual-V SDPA
-9e062ae  docs(kernels): design + skeleton for sdpa_dual_v_q4
-0e3f9fc  feat(server): OpenAI-compatible HTTP server with <think> stream filter
-b25f8af  feat(eval): perplexity script + finding: mixed-quant ≈ uniform q4
-f630dac  docs(kernels): bench notes — composable q4 chain doesn't beat sdpa_dual_v
-295ecf0  feat(cache): MotifGroupedKVCache + MotifGroupedQuantizedKVCache (4-slot)
-ab50df7  feat(kernels): 2-pass dual_v variant — correct, slower than single-pass
-3c92927  perf(model): drop the KV-size heuristic — native GQA wins everywhere
-9d8f867  perf(model): permute Q rows to origin-first → zero-copy q1/q2 split
-e80d25c  perf(kernels): gda_post_split eliminates the (origin, noise) concat (+4%)
-1db9c42  perf(kernels): native GQA broadcast in sdpa_dual_v eliminates mx.repeat
-91c9a79  perf(model): split sdpa_dual_v into origin+noise calls (+8%)
-ac63071  feat(model): fuse Q/K/V projections into one quantized matmul (+10%)
-2b9e20b  feat(kernels): sdpa_dual_v — first custom kernel beating MLX SDPA on M1 Max
-54c5c62  docs(model): correct the QuantizedKVCache claim from previous commit
-ac95834  feat(model): dequant-after-fetch bridge enables QuantizedKVCache
-c4f2c03  feat(kernels): polynorm_mul fusion + negative-result note
-acc2de7  docs(kernels): why the obvious flash-GDA design hits a wall on M1 Max
-6922acb  feat(kernels): flash-style fused GDA decode kernel — correct, slower
-b0bc447  docs(model): note that QuantizedKVCache requires a custom cache class
-9ed4f0e  fix(quant): per-layer overrides into config so loader rebuilds shapes
-4cf0cbb  feat(kernels): fused PolyNorm + post-GDA Metal kernels + mixed quant
-fee28a8  feat: initial MLX port of Motif (Phase 1 scaffold)
-```
 
 ## License
 

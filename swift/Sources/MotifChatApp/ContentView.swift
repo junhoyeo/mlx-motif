@@ -154,8 +154,8 @@ private struct RuntimeView: View {
 
             Section("App status") {
                 Label("Active chat path: OpenAI-compatible streaming endpoint", systemImage: "network")
-                Label("Native in-process MLX generation: not available yet", systemImage: "exclamationmark.triangle")
-                Text("Run `mlx-motif serve` and point this app at `/v1` for local chat. MotifKitMLX is a buildable scaffold until MotifMLXBackend can stream tokens without nativeBackendUnavailable.")
+                Label("Native in-process MLX generation: optional package overlay", systemImage: "cpu")
+                Text("Run `mlx-motif serve` and point this app at `/v1` for the default local chat path. The optional MotifKitMLX overlay now has a native reference generation CLI for converted checkpoints, while this lightweight app target remains server-backed by default.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -171,8 +171,8 @@ private struct RuntimeView: View {
 
             Section("Native MLX status") {
                 Label("MotifKitMLX overlay is gated behind MOTIFKIT_ENABLE_MLX=1", systemImage: "shippingbox")
-                Label("Current evidence is build/fixture parity, not runtime-generated output", systemImage: "checklist")
-                Label("Remaining native path: decoder wiring, model load, cache, and Metal kernel parity", systemImage: "wrench.and.screwdriver")
+                Label("Current native evidence: reference load/generation wiring plus fixture parity", systemImage: "checklist")
+                Label("Remaining native path: q4 cache, custom Metal kernel parity, speculative decoding, and same-machine benchmarks", systemImage: "wrench.and.screwdriver")
             }
         }
         .formStyle(.grouped)

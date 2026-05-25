@@ -12,13 +12,17 @@ public actor MotifMLXBackend: MotifChatBackend {
     public nonisolated let loadPlan: MotifMLXLoadPlan?
     public nonisolated let layerPlan: MotifMLXLayerPlan?
     public nonisolated let decoderGraphPlan: MotifMLXDecoderGraphPlan?
+    public nonisolated let modelDirectory: URL?
+
+    private var nativeRuntime: MotifMLXNativeRuntime?
 
     public init(
         configuration: MotifModelConfiguration? = nil,
-        featureFlags: MotifRuntimeFeatureFlags = .init()
+        featureFlags: MotifRuntimeFeatureFlags = .fromEnvironment()
     ) {
         self.configuration = configuration
         self.featureFlags = featureFlags
+        self.modelDirectory = nil
         let plan = configuration.map {
             MotifMLXLoadPlan(configuration: $0, featureFlags: featureFlags)
         }
@@ -29,11 +33,12 @@ public actor MotifMLXBackend: MotifChatBackend {
 
     public init(
         modelDirectory: URL,
-        featureFlags: MotifRuntimeFeatureFlags = .init()
+        featureFlags: MotifRuntimeFeatureFlags = .fromEnvironment()
     ) throws {
         let bundle = try MotifModelBundle(directoryURL: modelDirectory)
         self.configuration = bundle.configuration
         self.featureFlags = featureFlags
+        self.modelDirectory = modelDirectory
         let plan = MotifMLXModelRegistry.loadPlan(for: bundle, featureFlags: featureFlags)
         self.loadPlan = plan
         self.layerPlan = plan.layerPlan
@@ -41,23 +46,58 @@ public actor MotifMLXBackend: MotifChatBackend {
     }
 
     public nonisolated var capabilityLabels: [MotifMLXCapabilityLabel] {
-        decoderGraphPlan?.capabilityLabels ?? [.stillUnavailable]
+        if modelDirectory != nil, loadPlan?.validationErrorDescription == nil {
+            return [.buildableScaffold, .fixtureProvenSemanticParity, .runtimeGeneratedOutput]
+        }
+        return decoderGraphPlan?.capabilityLabels ?? [.stillUnavailable]
     }
 
     public nonisolated func streamResponse(
         messages: [MotifChatMessage],
         parameters: MotifGenerationParameters
     ) -> AsyncThrowingStream<MotifGenerationEvent, any Error> {
+        guard let modelDirectory else {
+            return unavailableStream(
+                "MotifMLXBackend was created from configuration only. Provide a converted MLX model directory to load tokenizer, safetensors, and generation config before streaming native tokens."
+            )
+        }
+        if let validationErrorDescription = loadPlan?.validationErrorDescription {
+            return unavailableStream("Directory validation: \(validationErrorDescription)")
+        }
+
+        return AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    let runtime = try await self.runtime(modelDirectory: modelDirectory)
+                    let stream = runtime.streamResponse(messages: messages, parameters: parameters)
+                    for try await event in stream {
+                        continuation.yield(event)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func runtime(modelDirectory: URL) async throws -> MotifMLXNativeRuntime {
+        if let nativeRuntime { return nativeRuntime }
+        let loaded = try await MotifMLXNativeRuntime.load(modelDirectory: modelDirectory, featureFlags: featureFlags)
+        nativeRuntime = loaded
+        return loaded
+    }
+
+    private nonisolated func unavailableStream(
+        _ detail: String
+    ) -> AsyncThrowingStream<MotifGenerationEvent, any Error> {
         AsyncThrowingStream { continuation in
             let planDetail = layerPlan.map {
                 "Layer plan ready for \($0.configuration.modelType) (\($0.attentionLayout.variant.rawValue)); "
             } ?? ""
             let capabilityDetail = "Capability labels: \(capabilityLabels.map(\.rawValue).joined(separator: ", ")); "
-            let validationDetail = loadPlan?.validationErrorDescription.map {
-                "Directory validation: \($0); "
-            } ?? ""
             continuation.finish(throwing: MotifBackendError.nativeBackendUnavailable(
-                "\(planDetail)\(validationDetail)\(capabilityDetail)MLX Swift overlay now has a buildable decoder graph scaffold (embeddings, decoder layers, final norm, lm head), but MotifMLXBackend does not claim runtime-generated output yet. Remaining port order: replace attention scaffold with full differential attention -> tokenizer/load integration -> sdpa_dual_v/gda_post_split Metal parity -> quantized cache kernels."
+                "\(planDetail)\(capabilityDetail)\(detail)"
             ))
         }
     }

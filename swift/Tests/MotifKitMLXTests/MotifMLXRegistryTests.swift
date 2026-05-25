@@ -55,13 +55,13 @@ final class MotifMLXRegistryTests: XCTestCase {
         XCTAssertNil(backend.loadPlan?.validationErrorDescription)
     }
 
-    func testLayerPlanIncludesDecoderGraphScaffoldWithoutRuntimeClaim() throws {
+    func testLayerPlanIncludesDecoderGraphReferenceRuntimeReadiness() throws {
         let configuration = makeGroupedConfiguration()
 
         let plan = MotifMLXLoadPlan(configuration: configuration)
         let graph = try XCTUnwrap(plan.layerPlan?.decoderGraphPlan)
 
-        XCTAssertEqual(graph.capabilityLabels, [.buildableScaffold, .stillUnavailable])
+        XCTAssertEqual(graph.capabilityLabels, [.buildableScaffold, .fixtureProvenSemanticParity])
         XCTAssertFalse(graph.capabilityLabels.contains(.runtimeGeneratedOutput))
         XCTAssertEqual(graph.embeddingShape, [128_000, 4_096])
         XCTAssertEqual(graph.decoderLayerCount, 40)
@@ -74,7 +74,7 @@ final class MotifMLXRegistryTests: XCTestCase {
         XCTAssertEqual(graph.finalNormShape, [4_096])
         XCTAssertEqual(graph.lmHeadShape, [128_000, 4_096])
         XCTAssertFalse(graph.tiedEmbeddingLMHead)
-        XCTAssertTrue(graph.backendReadiness.contains("buildable scaffold"))
+        XCTAssertTrue(graph.backendReadiness.contains("reference decoder graph"))
     }
 
     func testMotifMLXModelBuildsDecoderGraphModuleTree() throws {
@@ -100,7 +100,7 @@ final class MotifMLXRegistryTests: XCTestCase {
         XCTAssertEqual(model.vocabularySize, 32)
         XCTAssertEqual(model.kvHeads, [2, 2])
         XCTAssertEqual(model.model.layers.count, 2)
-        XCTAssertEqual(model.graphPlan.capabilityLabels, [.buildableScaffold, .stillUnavailable])
+        XCTAssertEqual(model.graphPlan.capabilityLabels, [.buildableScaffold, .fixtureProvenSemanticParity])
         XCTAssertEqual(model.graphPlan.firstDecoderLayer.attentionProjectionShapes["q_proj"], [8, 8])
         XCTAssertEqual(model.graphPlan.firstDecoderLayer.attentionProjectionShapes["v_proj"], [4, 8])
         XCTAssertNotNil(model.lmHead)
@@ -109,10 +109,10 @@ final class MotifMLXRegistryTests: XCTestCase {
         XCTAssertEqual(model.loraLayers.count, 2)
     }
 
-    func testBackendKeepsRuntimeGeneratedOutputUnavailable() async throws {
+    func testBackendRequiresModelDirectoryBeforeRuntimeGeneration() async throws {
         let backend = MotifMLXBackend(configuration: makeGroupedConfiguration())
 
-        XCTAssertEqual(backend.capabilityLabels, [.buildableScaffold, .stillUnavailable])
+        XCTAssertEqual(backend.capabilityLabels, [.buildableScaffold, .fixtureProvenSemanticParity])
         XCTAssertFalse(backend.capabilityLabels.contains(.runtimeGeneratedOutput))
 
         var iterator = backend.streamResponse(
@@ -124,8 +124,8 @@ final class MotifMLXRegistryTests: XCTestCase {
             _ = try await iterator.next()
             XCTFail("MotifMLXBackend should not claim runtime-generated output yet")
         } catch MotifBackendError.nativeBackendUnavailable(let detail) {
-            XCTAssertTrue(detail.contains("Capability labels: buildable scaffold, still unavailable"))
-            XCTAssertTrue(detail.contains("does not claim runtime-generated output yet"))
+            XCTAssertTrue(detail.contains("Capability labels: buildable scaffold, fixture-proven semantic parity"))
+            XCTAssertTrue(detail.contains("Provide a converted MLX model directory"))
         } catch {
             XCTFail("Expected nativeBackendUnavailable, got \(error)")
         }

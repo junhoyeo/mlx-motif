@@ -36,6 +36,7 @@ if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {
     dependencies.append(contentsOf: [
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.6")),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", exact: "2.30.6"),
+        .package(url: "https://github.com/huggingface/swift-transformers", .upToNextMinor(from: "1.1.6")),
     ])
     targets.append(contentsOf: [
         .target(
@@ -46,8 +47,24 @@ if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ],
             path: "Sources/MotifKitMLX"
+        ),
+        .executableTarget(
+            name: "MotifNativeGenerate",
+            dependencies: ["MotifKit", "MotifKitMLX"],
+            path: "Sources/MotifNativeGenerate"
+        ),
+        .executableTarget(
+            name: "MotifNativeEvaluate",
+            dependencies: ["MotifKit", "MotifKitMLX"],
+            path: "Sources/MotifNativeEvaluate"
+        ),
+        .executableTarget(
+            name: "MotifNativeServe",
+            dependencies: ["MotifKit", "MotifKitMLX"],
+            path: "Sources/MotifNativeServe"
         ),
     ])
     targets.append(
@@ -77,4 +94,7 @@ let package = Package(
 
 if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {
     package.products.append(.library(name: "MotifKitMLX", targets: ["MotifKitMLX"]))
+    package.products.append(.executable(name: "MotifNativeGenerate", targets: ["MotifNativeGenerate"]))
+    package.products.append(.executable(name: "MotifNativeEvaluate", targets: ["MotifNativeEvaluate"]))
+    package.products.append(.executable(name: "MotifNativeServe", targets: ["MotifNativeServe"]))
 }

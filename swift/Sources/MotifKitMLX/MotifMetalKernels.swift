@@ -191,8 +191,8 @@ public enum MotifMetalKernels {
             name: .gdaPost,
             pythonSymbol: "gda_post",
             pythonSource: "src/mlx_motif/kernels/gda.py",
-            swiftWrapper: "planned MotifGDAPost.apply",
-            status: .parityPending,
+            swiftWrapper: "MotifGDAPost.apply",
+            status: .referenceReady,
             defaultEnabled: false,
             parityFixture: "legacy grouped differential attention postprocess fixture",
             benchmarkShape: "B=1, q_origin=32, q_groups=8, S in {1, 32}, channels=256"
@@ -201,8 +201,8 @@ public enum MotifMetalKernels {
             name: .gdaPostSplit,
             pythonSymbol: "gda_post_split",
             pythonSource: "src/mlx_motif/kernels/gda.py",
-            swiftWrapper: "planned MotifGDAPostSplit.apply",
-            status: .parityPending,
+            swiftWrapper: "MotifGDAPostSplit.apply",
+            status: .referenceReady,
             defaultEnabled: false,
             parityFixture: "attn_o/attn_n/subln/lambda fixture from Python gda_post_split_reference",
             benchmarkShape: "B=1, q_origin=32, q_groups=8, S in {1, 32}, channels=256"
@@ -211,8 +211,8 @@ public enum MotifMetalKernels {
             name: .sdpaDualV,
             pythonSymbol: "sdpa_dual_v",
             pythonSource: "src/mlx_motif/kernels/attention.py",
-            swiftWrapper: "planned MotifSDPADualV.apply",
-            status: .parityPending,
+            swiftWrapper: "MotifSDPADualV.apply",
+            status: .referenceReady,
             defaultEnabled: false,
             parityFixture: "q/k/v1/v2 decode fixture from Python sdpa_dual_v_reference",
             benchmarkShape: "B=1, Hq=40, Hkv=8, KV in {256, 1024}, D=128"
@@ -221,8 +221,8 @@ public enum MotifMetalKernels {
             name: .sdpaDualVQ4,
             pythonSymbol: "sdpa_dual_v_q4",
             pythonSource: "src/mlx_motif/kernels/attention.py",
-            swiftWrapper: "planned MotifSDPADualVQ4.apply",
-            status: .parityPending,
+            swiftWrapper: "MotifSDPADualVQ4.apply",
+            status: .wrapperScaffolded,
             defaultEnabled: false,
             parityFixture: "packed uint32/scales/biases fixture shared with Python sdpa_dual_v_q4_reference",
             benchmarkShape: "B=1, Hq=40, Hkv=8, KV in {256, 1024}, D=128, bits in {4, 8}"
@@ -375,6 +375,189 @@ public enum MotifMetalKernelHarness {
             iterations: benchmarkCase.iterations,
             referenceNanoseconds: referenceEnd - referenceStart,
             candidateNanoseconds: candidateEnd - candidateStart
+        )
+    }
+}
+
+public enum MotifSDPADualV {
+    public static func reference(
+        queries: MLXArray,
+        keys: MLXArray,
+        value1: MLXArray,
+        value2: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
+    ) -> MLXArray {
+        var keys = keys
+        var value1 = value1
+        var value2 = value2
+        let queryHeads = queries.dim(1)
+        let keyHeads = keys.dim(1)
+        if keyHeads > 0, queryHeads % keyHeads == 0, queryHeads != keyHeads {
+            let repeatCount = queryHeads / keyHeads
+            keys = repeated(keys, count: repeatCount, axis: 1)
+            value1 = repeated(value1, count: repeatCount, axis: 1)
+            value2 = repeated(value2, count: repeatCount, axis: 1)
+        }
+        let out1 = MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: keys,
+            values: value1,
+            scale: scale,
+            mask: mask
+        )
+        let out2 = MLXFast.scaledDotProductAttention(
+            queries: queries,
+            keys: keys,
+            values: value2,
+            scale: scale,
+            mask: mask
+        )
+        return concatenated([out1, out2], axis: -1)
+    }
+
+    public static func apply(
+        queries: MLXArray,
+        keys: MLXArray,
+        value1: MLXArray,
+        value2: MLXArray,
+        scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+        executionMode _: MotifMetalKernelExecutionMode = .referenceOnly
+    ) -> MLXArray {
+        // The Python Metal kernel is decode-only and disabled in Swift until
+        // golden fixtures prove numerical parity. This callable wrapper gives
+        // the model/server/bench paths the same routing surface today.
+        reference(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale, mask: mask)
+    }
+}
+
+public enum MotifSDPADualVQ4 {
+    public static func reference(
+        queries: MLXArray,
+        quantizedKeys: MotifQuantizedTuple,
+        quantizedValue1: MotifQuantizedTuple,
+        quantizedValue2: MotifQuantizedTuple,
+        scale: Float,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode = .affine,
+        dtype: DType? = nil
+    ) -> MLXArray {
+        let keys = dequantized(
+            quantizedKeys.data,
+            scales: quantizedKeys.scales,
+            biases: quantizedKeys.biases,
+            groupSize: groupSize,
+            bits: bits,
+            mode: mode,
+            dtype: dtype
+        )
+        let value1 = dequantized(
+            quantizedValue1.data,
+            scales: quantizedValue1.scales,
+            biases: quantizedValue1.biases,
+            groupSize: groupSize,
+            bits: bits,
+            mode: mode,
+            dtype: dtype
+        )
+        let value2 = dequantized(
+            quantizedValue2.data,
+            scales: quantizedValue2.scales,
+            biases: quantizedValue2.biases,
+            groupSize: groupSize,
+            bits: bits,
+            mode: mode,
+            dtype: dtype
+        )
+        return MotifSDPADualV.reference(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale)
+    }
+}
+
+public enum MotifGDAPostSplit {
+    public static func reference(
+        attnOrigin: MLXArray,
+        attnNoise: MLXArray,
+        sublnWeight: MLXArray,
+        lambda: MLXArray,
+        lambdaInit: Double,
+        groupedRatio: Int,
+        eps: Float = 1e-5
+    ) -> MLXArray {
+        let noise = groupedRatio == 1 ? attnNoise : repeated(attnNoise, count: groupedRatio, axis: 1)
+        let differential = attnOrigin - lambda.asType(attnOrigin.dtype) * noise
+        let normalized = MLXFast.rmsNorm(
+            differential,
+            weight: sublnWeight.asType(differential.dtype),
+            eps: eps
+        )
+        return normalized * Float(1.0 - lambdaInit)
+    }
+
+    public static func apply(
+        attnOrigin: MLXArray,
+        attnNoise: MLXArray,
+        sublnWeight: MLXArray,
+        lambda: MLXArray,
+        lambdaInit: Double,
+        groupedRatio: Int,
+        eps: Float = 1e-5,
+        executionMode _: MotifMetalKernelExecutionMode = .referenceOnly
+    ) -> MLXArray {
+        reference(
+            attnOrigin: attnOrigin,
+            attnNoise: attnNoise,
+            sublnWeight: sublnWeight,
+            lambda: lambda,
+            lambdaInit: lambdaInit,
+            groupedRatio: groupedRatio,
+            eps: eps
+        )
+    }
+}
+
+public enum MotifGDAPost {
+    public static func reference(
+        merged: MLXArray,
+        sublnWeight: MLXArray,
+        lambda: MLXArray,
+        lambdaInit: Double,
+        queryGroups: Int,
+        groupedRatio: Int,
+        eps: Float = 1e-5
+    ) -> MLXArray {
+        let qOrigin = queryGroups * groupedRatio
+        let pieces = merged.split(indices: [qOrigin], axis: 1)
+        return MotifGDAPostSplit.reference(
+            attnOrigin: pieces[0],
+            attnNoise: pieces[1],
+            sublnWeight: sublnWeight,
+            lambda: lambda,
+            lambdaInit: lambdaInit,
+            groupedRatio: groupedRatio,
+            eps: eps
+        )
+    }
+
+    public static func apply(
+        merged: MLXArray,
+        sublnWeight: MLXArray,
+        lambda: MLXArray,
+        lambdaInit: Double,
+        queryGroups: Int,
+        groupedRatio: Int,
+        eps: Float = 1e-5,
+        executionMode _: MotifMetalKernelExecutionMode = .referenceOnly
+    ) -> MLXArray {
+        reference(
+            merged: merged,
+            sublnWeight: sublnWeight,
+            lambda: lambda,
+            lambdaInit: lambdaInit,
+            queryGroups: queryGroups,
+            groupedRatio: groupedRatio,
+            eps: eps
         )
     }
 }

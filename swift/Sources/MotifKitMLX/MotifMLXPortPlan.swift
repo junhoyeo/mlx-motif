@@ -12,6 +12,7 @@ public struct MotifMLXLayerPlan: Codable, Equatable, Sendable {
     public var groupedAttentionReferencePlan: MotifGroupedAttentionReferencePlan?
     public var mlpLayout: MotifMLPLayout
     public var kernelNames: [String]
+    public var decoderGraphPlan: MotifMLXDecoderGraphPlan
 
     public init(configuration: MotifModelConfiguration) throws {
         self.configuration = configuration
@@ -25,6 +26,11 @@ public struct MotifMLXLayerPlan: Codable, Equatable, Sendable {
         }
         self.mlpLayout = MotifMLPLayout(configuration: configuration)
         self.kernelNames = MotifMetalKernelRegistry.required.map(\.name)
+        self.decoderGraphPlan = MotifMLXDecoderGraphPlan(
+            configuration: configuration,
+            attentionLayout: attentionLayout,
+            cacheKind: attentionLayout.variant == .groupedDifferential ? .groupedFourSlot : .standard
+        )
     }
 }
 
@@ -36,6 +42,10 @@ public struct MotifMLXLoadPlan: Equatable, Sendable {
     public var requiredKernelNames: [String]
     public var extraEOSTokenIDs: Set<Int>
     public var modelDirectory: URL?
+    public var checkpointMetadata: MotifCheckpointMetadata?
+    public var tokenizerMetadata: MotifTokenizerMetadata?
+    public var directoryValidation: MotifModelDirectoryValidation?
+    public var chatTemplate: String?
     public var mlxModelConfiguration: ModelConfiguration?
     public var layerPlan: MotifMLXLayerPlan?
     public var validationErrorDescription: String?
@@ -44,7 +54,10 @@ public struct MotifMLXLoadPlan: Equatable, Sendable {
         configuration: MotifModelConfiguration,
         featureFlags: MotifRuntimeFeatureFlags = .init(),
         modelDirectory: URL? = nil,
-        extraEOSTokenIDs: [Int] = []
+        extraEOSTokenIDs: [Int] = [],
+        checkpointMetadata: MotifCheckpointMetadata? = nil,
+        tokenizerMetadata: MotifTokenizerMetadata? = nil,
+        directoryValidation: MotifModelDirectoryValidation? = nil
     ) {
         self.modelType = configuration.modelType
         self.registryKey = MotifMLXModelRegistry.registryKey(for: configuration)
@@ -53,7 +66,13 @@ public struct MotifMLXLoadPlan: Equatable, Sendable {
         self.requiredKernelNames = configuration.requiredCustomKernelNames
         self.extraEOSTokenIDs = Set(extraEOSTokenIDs)
         self.modelDirectory = modelDirectory
-        if let modelDirectory {
+        self.checkpointMetadata = checkpointMetadata
+        self.tokenizerMetadata = tokenizerMetadata
+        self.directoryValidation = directoryValidation
+        self.chatTemplate = tokenizerMetadata?.preferredChatTemplate
+        if let modelDirectory,
+           directoryValidation?.isLoadableScaffold != false
+        {
             self.mlxModelConfiguration = MotifMLXModelRegistry.modelConfiguration(
                 directory: modelDirectory,
                 bundleConfiguration: configuration,
@@ -70,6 +89,9 @@ public struct MotifMLXLoadPlan: Equatable, Sendable {
             self.layerPlan = nil
             self.validationErrorDescription = String(describing: error)
         }
+        if self.validationErrorDescription == nil {
+            self.validationErrorDescription = directoryValidation?.blockingSummary
+        }
     }
 
     public init(bundle: MotifModelBundle, featureFlags: MotifRuntimeFeatureFlags = .init()) {
@@ -77,7 +99,10 @@ public struct MotifMLXLoadPlan: Equatable, Sendable {
             configuration: bundle.configuration,
             featureFlags: featureFlags,
             modelDirectory: bundle.directoryURL,
-            extraEOSTokenIDs: bundle.extraEOSTokenIDs
+            extraEOSTokenIDs: bundle.extraEOSTokenIDs,
+            checkpointMetadata: bundle.checkpointMetadata,
+            tokenizerMetadata: bundle.tokenizerMetadata,
+            directoryValidation: bundle.directoryValidation
         )
     }
 }

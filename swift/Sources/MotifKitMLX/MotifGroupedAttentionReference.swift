@@ -92,6 +92,77 @@ public struct MotifGroupedKVCachedSlices {
     }
 }
 
+public enum MotifAttentionMaskPlanKind: String, Codable, Equatable, Sendable {
+    case none
+    case causal
+    case materializedCausal
+}
+
+/// Shape-only attention-mask plan for the grouped reference path. Keeping this
+/// separate from `MLXFast.ScaledDotProductAttentionMaskMode` makes RoPE/cache
+/// parity testable without evaluating MLX runtime kernels.
+public struct MotifAttentionMaskPlan: Codable, Equatable, Sendable {
+    public var kind: MotifAttentionMaskPlanKind
+    public var queryLength: Int
+    public var keyValueLength: Int
+    public var cacheOffset: Int
+    public var windowSize: Int?
+    public var materializedShape: [Int]?
+
+    public init(
+        kind: MotifAttentionMaskPlanKind,
+        queryLength: Int,
+        keyValueLength: Int,
+        cacheOffset: Int,
+        windowSize: Int? = nil,
+        materializedShape: [Int]? = nil
+    ) {
+        self.kind = kind
+        self.queryLength = queryLength
+        self.keyValueLength = keyValueLength
+        self.cacheOffset = cacheOffset
+        self.windowSize = windowSize
+        self.materializedShape = materializedShape
+    }
+
+    public var requiresMaterializedArray: Bool {
+        kind == .materializedCausal
+    }
+
+    public func makeMask() -> MLXFast.ScaledDotProductAttentionMaskMode {
+        switch kind {
+        case .none:
+            return .none
+        case .causal:
+            return .causal
+        case .materializedCausal:
+            return .array(createCausalMask(n: queryLength, offset: cacheOffset, windowSize: windowSize))
+        }
+    }
+}
+
+/// Deterministic shape contract for one grouped-differential attention step.
+/// This mirrors the Python decode/prefill routing decisions without owning
+/// MotifMLXBackend token generation.
+public struct MotifGroupedAttentionStepPlan: Codable, Equatable, Sendable {
+    public var batchSize: Int
+    public var queryLength: Int
+    public var cacheOffset: Int
+    public var keyValueLength: Int
+    public var ropePositionRange: [Int]
+    public var qOriginShape: [Int]
+    public var qNoiseShape: [Int]
+    public var kOriginUpdateShape: [Int]
+    public var kNoiseUpdateShape: [Int]
+    public var valueUpdateShape: [Int]
+    public var kOriginCachedShape: [Int]
+    public var kNoiseCachedShape: [Int]
+    public var valueCachedShape: [Int]
+    public var outputShape: [Int]
+    public var attentionPath: MotifAttentionPath
+    public var maskPlan: MotifAttentionMaskPlan
+}
+
 /// Four-slot grouped KV cache matching the Python `MotifGroupedKVCache` split:
 /// origin keys, noise keys, value slab 1, value slab 2. This is deliberately
 /// fp16/bf16 reference storage; quantized cache support stays represented by
@@ -108,6 +179,7 @@ public final class MotifGroupedKVCacheReference {
     public init() {}
 
     public var isEmpty: Bool { offset == 0 }
+    public var cachedLength: Int { offset }
 
     public func reset() {
         offset = 0
@@ -137,6 +209,30 @@ public final class MotifGroupedKVCacheReference {
         )
     }
 
+    public func fetch() -> MotifGroupedKVCachedSlices? {
+        guard let kOrigin, let kNoise, let value1, let value2 else {
+            return nil
+        }
+        return MotifGroupedKVCachedSlices(
+            kOrigin: kOrigin,
+            kNoise: kNoise,
+            value1: value1,
+            value2: value2
+        )
+    }
+
+    /// Reorder cached batch rows for beam-search style reuse. This mirrors the
+    /// batch-axis gather used by mlx-lm KV caches while leaving sequence offsets
+    /// untouched.
+    public func reorder(batchIndices: [Int]) {
+        guard !batchIndices.isEmpty else { return }
+        let indices = MLXArray(batchIndices.map(Int32.init), [batchIndices.count])
+        kOrigin = kOrigin.map { take($0, indices, axis: 0) }
+        kNoise = kNoise.map { take($0, indices, axis: 0) }
+        value1 = value1.map { take($0, indices, axis: 0) }
+        value2 = value2.map { take($0, indices, axis: 0) }
+    }
+
     private func appendCached(_ cached: MLXArray?, _ next: MLXArray) -> MLXArray {
         guard let cached else { return next }
         return concatenated([cached, next], axis: 2)
@@ -144,6 +240,106 @@ public final class MotifGroupedKVCacheReference {
 }
 
 public enum MotifGroupedDifferentialAttentionReference {
+    public static func planStep(
+        layout: MotifAttentionLayout,
+        batchSize: Int,
+        sequenceLength: Int,
+        cacheOffset: Int = 0,
+        cacheKind: MotifKVCacheKind = .groupedFourSlot,
+        fusedRope: Bool = false,
+        featureFlags: MotifRuntimeFeatureFlags = .init(),
+        forceMaterializedMask: Bool = false,
+        slidingWindow: Int? = nil
+    ) throws -> MotifGroupedAttentionStepPlan {
+        guard layout.variant == .groupedDifferential else {
+            throw MotifGroupedAttentionReferenceError.requiresGroupedDifferentialAttention
+        }
+        guard batchSize > 0 else {
+            throw MotifGroupedAttentionReferenceError.invalidShape("batchSize must be positive")
+        }
+        guard sequenceLength > 0 else {
+            throw MotifGroupedAttentionReferenceError.invalidShape("sequenceLength must be positive")
+        }
+        guard cacheOffset >= 0 else {
+            throw MotifGroupedAttentionReferenceError.invalidShape("cacheOffset must be non-negative")
+        }
+
+        let noiseHeads = layout.requiredNoiseHeads
+        let originHeads = noiseHeads * layout.groupedRatio
+        let keyNoiseHeads = layout.requiredKeyNoiseHeads
+        let keyValueLength = cacheOffset + sequenceLength
+        let maskPlan = makeMaskPlan(
+            sequenceLength: sequenceLength,
+            cacheOffset: cacheOffset,
+            forceMaterialized: forceMaterializedMask,
+            slidingWindow: slidingWindow
+        )
+        let attentionPath = MotifAttentionPathResolver.resolve(
+            cacheKind: cacheKind,
+            sequenceLength: sequenceLength,
+            keyValueRepeat: layout.keyValueRepeat,
+            keyRatio: layout.keyRatio,
+            fusedRope: fusedRope,
+            featureFlags: featureFlags
+        )
+
+        return MotifGroupedAttentionStepPlan(
+            batchSize: batchSize,
+            queryLength: sequenceLength,
+            cacheOffset: cacheOffset,
+            keyValueLength: keyValueLength,
+            ropePositionRange: [cacheOffset, keyValueLength],
+            qOriginShape: [batchSize, originHeads, sequenceLength, layout.headDim],
+            qNoiseShape: [batchSize, noiseHeads, sequenceLength, layout.headDim],
+            kOriginUpdateShape: [batchSize, keyNoiseHeads * layout.keyRatio, sequenceLength, layout.headDim],
+            kNoiseUpdateShape: [batchSize, keyNoiseHeads, sequenceLength, layout.headDim],
+            valueUpdateShape: [batchSize, keyNoiseHeads, sequenceLength, layout.headDim],
+            kOriginCachedShape: [batchSize, keyNoiseHeads * layout.keyRatio, keyValueLength, layout.headDim],
+            kNoiseCachedShape: [batchSize, keyNoiseHeads, keyValueLength, layout.headDim],
+            valueCachedShape: [batchSize, keyNoiseHeads, keyValueLength, layout.headDim],
+            outputShape: [batchSize, originHeads, sequenceLength, 2 * layout.headDim],
+            attentionPath: attentionPath,
+            maskPlan: maskPlan
+        )
+    }
+
+    public static func makeMaskPlan(
+        sequenceLength: Int,
+        cacheOffset: Int = 0,
+        forceMaterialized: Bool = false,
+        slidingWindow: Int? = nil
+    ) -> MotifAttentionMaskPlan {
+        let keyValueLength = cacheOffset + sequenceLength
+        if sequenceLength == 1 {
+            return MotifAttentionMaskPlan(
+                kind: .none,
+                queryLength: sequenceLength,
+                keyValueLength: keyValueLength,
+                cacheOffset: cacheOffset,
+                windowSize: slidingWindow
+            )
+        }
+
+        if forceMaterialized || (slidingWindow != nil && sequenceLength > slidingWindow!) {
+            return MotifAttentionMaskPlan(
+                kind: .materializedCausal,
+                queryLength: sequenceLength,
+                keyValueLength: keyValueLength,
+                cacheOffset: cacheOffset,
+                windowSize: slidingWindow,
+                materializedShape: [sequenceLength, keyValueLength]
+            )
+        }
+
+        return MotifAttentionMaskPlan(
+            kind: .causal,
+            queryLength: sequenceLength,
+            keyValueLength: keyValueLength,
+            cacheOffset: cacheOffset,
+            windowSize: slidingWindow
+        )
+    }
+
     /// Split projected grouped-attention tensors into the six logical streams
     /// consumed by the reference attention/cache path. Inputs mirror Python
     /// `_forward_grouped` immediately after q/k/v projection and before cache

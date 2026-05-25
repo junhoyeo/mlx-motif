@@ -11,6 +11,7 @@ public actor MotifMLXBackend: MotifChatBackend {
     public nonisolated let featureFlags: MotifRuntimeFeatureFlags
     public nonisolated let loadPlan: MotifMLXLoadPlan?
     public nonisolated let layerPlan: MotifMLXLayerPlan?
+    public nonisolated let decoderGraphPlan: MotifMLXDecoderGraphPlan?
 
     public init(
         configuration: MotifModelConfiguration? = nil,
@@ -23,6 +24,7 @@ public actor MotifMLXBackend: MotifChatBackend {
         }
         self.loadPlan = plan
         self.layerPlan = plan?.layerPlan
+        self.decoderGraphPlan = plan?.layerPlan?.decoderGraphPlan
     }
 
     public init(
@@ -35,6 +37,11 @@ public actor MotifMLXBackend: MotifChatBackend {
         let plan = MotifMLXModelRegistry.loadPlan(for: bundle, featureFlags: featureFlags)
         self.loadPlan = plan
         self.layerPlan = plan.layerPlan
+        self.decoderGraphPlan = plan.layerPlan?.decoderGraphPlan
+    }
+
+    public nonisolated var capabilityLabels: [MotifMLXCapabilityLabel] {
+        decoderGraphPlan?.capabilityLabels ?? [.stillUnavailable]
     }
 
     public nonisolated func streamResponse(
@@ -45,8 +52,12 @@ public actor MotifMLXBackend: MotifChatBackend {
             let planDetail = layerPlan.map {
                 "Layer plan ready for \($0.configuration.modelType) (\($0.attentionLayout.variant.rawValue)); "
             } ?? ""
+            let capabilityDetail = "Capability labels: \(capabilityLabels.map(\.rawValue).joined(separator: ", ")); "
+            let validationDetail = loadPlan?.validationErrorDescription.map {
+                "Directory validation: \($0); "
+            } ?? ""
             continuation.finish(throwing: MotifBackendError.nativeBackendUnavailable(
-                "\(planDetail)MLX Swift overlay has config, PolyNorm, and grouped attention/cache reference scaffolds, but full Motif generation is not implemented yet. Remaining port order: decoder layer wiring -> model registry/load -> sdpa_dual_v/gda_post_split Metal parity -> quantized cache kernels."
+                "\(planDetail)\(validationDetail)\(capabilityDetail)MLX Swift overlay now has a buildable decoder graph scaffold (embeddings, decoder layers, final norm, lm head), but MotifMLXBackend does not claim runtime-generated output yet. Remaining port order: replace attention scaffold with full differential attention -> tokenizer/load integration -> sdpa_dual_v/gda_post_split Metal parity -> quantized cache kernels."
             ))
         }
     }

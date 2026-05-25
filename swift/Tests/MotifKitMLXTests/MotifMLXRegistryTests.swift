@@ -34,6 +34,10 @@ final class MotifMLXRegistryTests: XCTestCase {
         XCTAssertEqual(plan.extraEOSTokenIDs, Set([100_257]))
         XCTAssertEqual(plan.mlxModelConfiguration?.id, .directory(directory))
         XCTAssertEqual(plan.mlxModelConfiguration?.eosTokenIds, Set([2, 100_257]))
+        XCTAssertEqual(plan.checkpointMetadata?.tensorKeyCount, 1)
+        XCTAssertEqual(plan.tokenizerMetadata?.preferredChatTemplate, "generation-template")
+        XCTAssertTrue(plan.directoryValidation?.isLoadableScaffold == true)
+        XCTAssertEqual(plan.chatTemplate, "generation-template")
         XCTAssertEqual(plan.layerPlan?.attentionLayout.outputProjectionInputSize, 8_192)
     }
 
@@ -46,7 +50,85 @@ final class MotifMLXRegistryTests: XCTestCase {
         XCTAssertEqual(backend.configuration?.modelType, "motif")
         XCTAssertEqual(backend.loadPlan?.registryKey, MotifMLXModelRegistry.modelType)
         XCTAssertEqual(backend.loadPlan?.extraEOSTokenIDs, Set([100_257]))
+        XCTAssertEqual(backend.loadPlan?.checkpointMetadata?.shardFileNames, ["model.safetensors"])
+        XCTAssertEqual(backend.loadPlan?.tokenizerMetadata?.chatTemplateSourceFileName, "generation_config.json")
         XCTAssertNil(backend.loadPlan?.validationErrorDescription)
+    }
+
+    func testLayerPlanIncludesDecoderGraphScaffoldWithoutRuntimeClaim() throws {
+        let configuration = makeGroupedConfiguration()
+
+        let plan = MotifMLXLoadPlan(configuration: configuration)
+        let graph = try XCTUnwrap(plan.layerPlan?.decoderGraphPlan)
+
+        XCTAssertEqual(graph.capabilityLabels, [.buildableScaffold, .stillUnavailable])
+        XCTAssertFalse(graph.capabilityLabels.contains(.runtimeGeneratedOutput))
+        XCTAssertEqual(graph.embeddingShape, [128_000, 4_096])
+        XCTAssertEqual(graph.decoderLayerCount, 40)
+        XCTAssertEqual(graph.firstDecoderLayer.layerIndex, 0)
+        XCTAssertEqual(graph.firstDecoderLayer.attentionProjectionShapes["q_proj"], [5_120, 4_096])
+        XCTAssertEqual(graph.firstDecoderLayer.attentionProjectionShapes["k_proj"], [2_048, 4_096])
+        XCTAssertEqual(graph.firstDecoderLayer.attentionProjectionShapes["v_proj"], [2_048, 4_096])
+        XCTAssertEqual(graph.firstDecoderLayer.attentionProjectionShapes["o_proj"], [4_096, 8_192])
+        XCTAssertEqual(graph.firstDecoderLayer.cacheKind, .groupedFourSlot)
+        XCTAssertEqual(graph.finalNormShape, [4_096])
+        XCTAssertEqual(graph.lmHeadShape, [128_000, 4_096])
+        XCTAssertFalse(graph.tiedEmbeddingLMHead)
+        XCTAssertTrue(graph.backendReadiness.contains("buildable scaffold"))
+    }
+
+    func testMotifMLXModelBuildsDecoderGraphModuleTree() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MOTIFKIT_RUN_MLX_RUNTIME_TESTS"] == "1",
+            "MotifMLXModel allocates MLX arrays; runtime ops require the default metallib."
+        )
+        let configuration = MotifModelConfiguration(
+            hiddenSize: 8,
+            numHiddenLayers: 2,
+            intermediateSize: 16,
+            numAttentionHeads: 4,
+            numKeyValueHeads: 2,
+            vocabSize: 32,
+            headDim: 2,
+            numNoiseHeads: 1,
+            kRatio: 1,
+            hiddenActivation: "poly_norm"
+        )
+
+        let model = try MotifMLXModel(configuration: configuration)
+
+        XCTAssertEqual(model.vocabularySize, 32)
+        XCTAssertEqual(model.kvHeads, [2, 2])
+        XCTAssertEqual(model.model.layers.count, 2)
+        XCTAssertEqual(model.graphPlan.capabilityLabels, [.buildableScaffold, .stillUnavailable])
+        XCTAssertEqual(model.graphPlan.firstDecoderLayer.attentionProjectionShapes["q_proj"], [8, 8])
+        XCTAssertEqual(model.graphPlan.firstDecoderLayer.attentionProjectionShapes["v_proj"], [4, 8])
+        XCTAssertNotNil(model.lmHead)
+        XCTAssertEqual(model.model.layers[0].attention.layout.variant, .groupedDifferential)
+        XCTAssertEqual(model.model.layers[0].attention.lambdaInit, Float(MotifAttentionLayout.lambdaInit(layerIndex: 0)))
+        XCTAssertEqual(model.loraLayers.count, 2)
+    }
+
+    func testBackendKeepsRuntimeGeneratedOutputUnavailable() async throws {
+        let backend = MotifMLXBackend(configuration: makeGroupedConfiguration())
+
+        XCTAssertEqual(backend.capabilityLabels, [.buildableScaffold, .stillUnavailable])
+        XCTAssertFalse(backend.capabilityLabels.contains(.runtimeGeneratedOutput))
+
+        var iterator = backend.streamResponse(
+            messages: [.user("Hello")],
+            parameters: MotifGenerationParameters(maxTokens: 1)
+        ).makeAsyncIterator()
+
+        do {
+            _ = try await iterator.next()
+            XCTFail("MotifMLXBackend should not claim runtime-generated output yet")
+        } catch MotifBackendError.nativeBackendUnavailable(let detail) {
+            XCTAssertTrue(detail.contains("Capability labels: buildable scaffold, still unavailable"))
+            XCTAssertTrue(detail.contains("does not claim runtime-generated output yet"))
+        } catch {
+            XCTFail("Expected nativeBackendUnavailable, got \(error)")
+        }
     }
 
     private func makeGroupedConfiguration() -> MotifModelConfiguration {
@@ -93,10 +175,29 @@ final class MotifMLXRegistryTests: XCTestCase {
         try """
         {
           "eos_token_id": [2, 100257],
-          "pad_token_id": 0
+          "pad_token_id": 0,
+          "chat_template": "generation-template"
         }
         """.write(
             to: directory.appendingPathComponent(MotifModelBundle.generationConfigFileName),
+            atomically: true,
+            encoding: .utf8
+        )
+        try """
+        {
+          "metadata": {"total_size": 64},
+          "weight_map": {
+            "model.embed_tokens.weight": "model.safetensors"
+          }
+        }
+        """.write(
+            to: directory.appendingPathComponent(MotifModelBundle.safetensorsIndexFileName),
+            atomically: true,
+            encoding: .utf8
+        )
+        try Data().write(to: directory.appendingPathComponent(MotifModelBundle.safetensorsFileName))
+        try "{}".write(
+            to: directory.appendingPathComponent(MotifModelBundle.tokenizerFileName),
             atomically: true,
             encoding: .utf8
         )

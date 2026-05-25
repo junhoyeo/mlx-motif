@@ -10,13 +10,14 @@ final class ChatStore: ObservableObject {
     @Published var temperature = 0.6
     @Published var prompt = ""
     @Published var messages: [MotifChatMessage] = [
-        .system("You are Motif running locally on Apple Silicon. Be concise and helpful.")
+        .system(ChatStore.defaultSystemPrompt)
     ]
     @Published var isGenerating = false
     @Published var lastError: String?
     @Published var capturedReasoning = ""
 
     private var generationTask: Task<Void, Never>?
+    private static let defaultSystemPrompt = "You are Motif accessed through the configured OpenAI-compatible endpoint. Be concise and helpful."
 
     func newChat() {
         cancel()
@@ -24,7 +25,7 @@ final class ChatStore: ObservableObject {
         capturedReasoning = ""
         lastError = nil
         messages = [
-            .system("You are Motif running locally on Apple Silicon. Be concise and helpful.")
+            .system(Self.defaultSystemPrompt)
         ]
     }
 

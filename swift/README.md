@@ -17,14 +17,20 @@ MotifChatApp (SwiftUI)
   - `<think>` stream filtering compatible with the Python server behavior
   - an OpenAI-compatible streaming backend for the existing `mlx-motif serve`
   - a placeholder native backend error type for the future in-process MLX path
-- `MotifChatApp` is a SwiftUI macOS app scaffold with chat and runtime panels.
-- `MotifKitMLX` is scaffolded but disabled by default so the package stays buildable on the repo's current Xcode 16.2 / Swift 6.0.3 toolchain.
+- `MotifChatApp` is a SwiftUI macOS app scaffold with chat and runtime panels. Its active chat path is the OpenAI-compatible endpoint; it does not claim in-process MLX token generation.
+- `MotifKitMLX` is scaffolded but disabled by default so the package stays buildable on the repo's current Xcode 16.2 / Swift 6.0.3 toolchain. `MotifMLXBackend` currently reports `nativeBackendUnavailable` instead of streaming tokens.
 
 ## Verify
 
 ```bash
 swift test --package-path swift
 swift build --package-path swift --target MotifChatApp
+```
+
+Optional MLX overlay checks are useful for porting work, but they are separate from the default app build:
+
+```bash
+MOTIFKIT_ENABLE_MLX=1 swift test --package-path swift --filter MotifKitMLXTests
 ```
 
 ## Run against today's Python backend
@@ -40,6 +46,8 @@ In another terminal / Xcode session, run `MotifChatApp` and keep the endpoint as
 ```text
 http://127.0.0.1:8080/v1
 ```
+
+This server-backed path is the only chat path expected to stream tokens today. The native Swift MLX path should still be described as buildable scaffold / fixture-proven semantic parity until `MotifMLXBackend.streamResponse` emits text events without `nativeBackendUnavailable`.
 
 ## Enable MLX overlay work
 

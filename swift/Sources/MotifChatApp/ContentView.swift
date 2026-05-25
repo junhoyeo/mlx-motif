@@ -152,6 +152,14 @@ private struct RuntimeView: View {
                 }
             }
 
+            Section("App status") {
+                Label("Active chat path: OpenAI-compatible streaming endpoint", systemImage: "network")
+                Label("Native in-process MLX generation: not available yet", systemImage: "exclamationmark.triangle")
+                Text("Run `mlx-motif serve` and point this app at `/v1` for local chat. MotifKitMLX is a buildable scaffold until MotifMLXBackend can stream tokens without nativeBackendUnavailable.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Generation") {
                 Stepper("Max tokens: \(store.maxTokens)", value: $store.maxTokens, in: 1...8192, step: 64)
                 Slider(value: $store.temperature, in: 0...2) {
@@ -162,8 +170,9 @@ private struct RuntimeView: View {
             }
 
             Section("Native MLX status") {
-                Label("MotifKitMLX overlay is scaffolded behind MOTIFKIT_ENABLE_MLX=1", systemImage: "checkmark.seal")
-                Label("Model architecture and custom kernels are next", systemImage: "wrench.and.screwdriver")
+                Label("MotifKitMLX overlay is gated behind MOTIFKIT_ENABLE_MLX=1", systemImage: "shippingbox")
+                Label("Current evidence is build/fixture parity, not runtime-generated output", systemImage: "checklist")
+                Label("Remaining native path: decoder wiring, model load, cache, and Metal kernel parity", systemImage: "wrench.and.screwdriver")
             }
         }
         .formStyle(.grouped)

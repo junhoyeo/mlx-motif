@@ -15,3 +15,7 @@ dist/
 *.safetensors
 .omc/
 .claude/
+
+# SwiftPM
+**/.build/
+swift/Package.resolved

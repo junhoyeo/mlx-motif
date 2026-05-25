@@ -16,7 +16,10 @@ var targets: [Target] = [
     .testTarget(
         name: "MotifKitTests",
         dependencies: ["MotifKit"],
-        path: "Tests/MotifKitTests"
+        path: "Tests/MotifKitTests",
+        resources: [
+            .process("Fixtures"),
+        ]
     ),
 ]
 
@@ -34,7 +37,7 @@ if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.6")),
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", exact: "2.30.6"),
     ])
-    targets.append(
+    targets.append(contentsOf: [
         .target(
             name: "MotifKitMLX",
             dependencies: [
@@ -45,6 +48,16 @@ if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
             ],
             path: "Sources/MotifKitMLX"
+        ),
+    ])
+    targets.append(
+        .testTarget(
+            name: "MotifKitMLXTests",
+            dependencies: [
+                "MotifKitMLX",
+                .product(name: "MLX", package: "mlx-swift"),
+            ],
+            path: "Tests/MotifKitMLXTests"
         )
     )
 }

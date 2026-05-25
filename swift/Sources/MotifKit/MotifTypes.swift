@@ -87,7 +87,200 @@ public enum MotifBackendError: Error, LocalizedError, Equatable, Sendable {
     }
 }
 
+public enum MotifAttentionVariant: String, Codable, Equatable, Sendable {
+    case vanillaDifferentialAttention = "vanilla_differential_attention"
+    case groupedDifferentialAttention = "grouped_differential_attention"
+}
+
+public indirect enum MotifJSONValue: Codable, Equatable, Sendable {
+    case string(String)
+    case int(Int)
+    case double(Double)
+    case bool(Bool)
+    case object([String: MotifJSONValue])
+    case array([MotifJSONValue])
+    case null
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let value = try? container.decode(Bool.self) {
+            self = .bool(value)
+        } else if let value = try? container.decode(Int.self) {
+            self = .int(value)
+        } else if let value = try? container.decode(Double.self) {
+            self = .double(value)
+        } else if let value = try? container.decode(String.self) {
+            self = .string(value)
+        } else if let value = try? container.decode([MotifJSONValue].self) {
+            self = .array(value)
+        } else if let value = try? container.decode([String: MotifJSONValue].self) {
+            self = .object(value)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Unsupported JSON value in Motif configuration"
+            )
+        }
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .string(let value):
+            try container.encode(value)
+        case .int(let value):
+            try container.encode(value)
+        case .double(let value):
+            try container.encode(value)
+        case .bool(let value):
+            try container.encode(value)
+        case .object(let value):
+            try container.encode(value)
+        case .array(let value):
+            try container.encode(value)
+        case .null:
+            try container.encodeNil()
+        }
+    }
+}
+
+public enum MotifModelConfigurationError: Error, LocalizedError, Equatable, Sendable {
+    case unsupportedModelType(String)
+    case nonPositiveField(String, Int)
+    case unsupportedHiddenActivation(String)
+    case invalidAttentionShape(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedModelType(let modelType):
+            "Unsupported Motif model_type: \(modelType)"
+        case .nonPositiveField(let field, let value):
+            "Motif config field \(field) must be positive; got \(value)"
+        case .unsupportedHiddenActivation(let activation):
+            "Unsupported Motif hidden_act: \(activation)"
+        case .invalidAttentionShape(let detail):
+            "Invalid Motif attention shape: \(detail)"
+        }
+    }
+}
+
+public struct MotifRopeScalingConfiguration: Codable, Equatable, Sendable {
+    public var type: String?
+    public var ropeType: String?
+    public var factor: Double?
+    public var originalMaxPositionEmbeddings: Int?
+    public var lowFreqFactor: Double?
+    public var highFreqFactor: Double?
+
+    public init(
+        type: String? = nil,
+        ropeType: String? = nil,
+        factor: Double? = nil,
+        originalMaxPositionEmbeddings: Int? = nil,
+        lowFreqFactor: Double? = nil,
+        highFreqFactor: Double? = nil
+    ) {
+        self.type = type
+        self.ropeType = ropeType
+        self.factor = factor
+        self.originalMaxPositionEmbeddings = originalMaxPositionEmbeddings
+        self.lowFreqFactor = lowFreqFactor
+        self.highFreqFactor = highFreqFactor
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case ropeType = "rope_type"
+        case factor
+        case originalMaxPositionEmbeddings = "original_max_position_embeddings"
+        case lowFreqFactor = "low_freq_factor"
+        case highFreqFactor = "high_freq_factor"
+    }
+}
+
+public struct MotifGenerationConfiguration: Codable, Equatable, Sendable {
+    public var bosTokenId: Int?
+    public var eosTokenIds: [Int]
+    public var padTokenId: Int?
+    public var maxNewTokens: Int?
+    public var temperature: Double?
+    public var doSample: Bool?
+    public var chatTemplate: String?
+
+    public var primaryEOSTokenId: Int? { eosTokenIds.first }
+    public var bosTokenID: Int? {
+        get { bosTokenId }
+        set { bosTokenId = newValue }
+    }
+    public var eosTokenIDs: [Int] {
+        get { eosTokenIds }
+        set { eosTokenIds = newValue }
+    }
+    public var padTokenID: Int? {
+        get { padTokenId }
+        set { padTokenId = newValue }
+    }
+
+    public init(
+        bosTokenId: Int? = nil,
+        eosTokenIds: [Int] = [],
+        padTokenId: Int? = nil,
+        maxNewTokens: Int? = nil,
+        temperature: Double? = nil,
+        doSample: Bool? = nil,
+        chatTemplate: String? = nil
+    ) {
+        self.bosTokenId = bosTokenId
+        self.eosTokenIds = eosTokenIds
+        self.padTokenId = padTokenId
+        self.maxNewTokens = maxNewTokens
+        self.temperature = temperature
+        self.doSample = doSample
+        self.chatTemplate = chatTemplate
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case bosTokenId = "bos_token_id"
+        case eosTokenId = "eos_token_id"
+        case padTokenId = "pad_token_id"
+        case maxNewTokens = "max_new_tokens"
+        case temperature
+        case doSample = "do_sample"
+        case chatTemplate = "chat_template"
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        bosTokenId = try container.decodeIfPresent(Int.self, forKey: .bosTokenId)
+        if let eosTokenId = try? container.decode(Int.self, forKey: .eosTokenId) {
+            eosTokenIds = [eosTokenId]
+        } else {
+            eosTokenIds = (try? container.decode([Int].self, forKey: .eosTokenId)) ?? []
+        }
+        padTokenId = try container.decodeIfPresent(Int.self, forKey: .padTokenId)
+        maxNewTokens = try container.decodeIfPresent(Int.self, forKey: .maxNewTokens)
+        temperature = try container.decodeIfPresent(Double.self, forKey: .temperature)
+        doSample = try container.decodeIfPresent(Bool.self, forKey: .doSample)
+        chatTemplate = try container.decodeIfPresent(String.self, forKey: .chatTemplate)
+    }
+
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(bosTokenId, forKey: .bosTokenId)
+        try container.encode(eosTokenIds, forKey: .eosTokenId)
+        try container.encodeIfPresent(padTokenId, forKey: .padTokenId)
+        try container.encodeIfPresent(maxNewTokens, forKey: .maxNewTokens)
+        try container.encodeIfPresent(temperature, forKey: .temperature)
+        try container.encodeIfPresent(doSample, forKey: .doSample)
+        try container.encodeIfPresent(chatTemplate, forKey: .chatTemplate)
+    }
+}
+
 public struct MotifModelConfiguration: Codable, Equatable, Sendable {
+    public static let canonicalModelType = "motif"
+
     public var modelType: String
     public var hiddenSize: Int
     public var numHiddenLayers: Int
@@ -102,14 +295,49 @@ public struct MotifModelConfiguration: Codable, Equatable, Sendable {
     public var numNoiseHeads: Int?
     public var kRatio: Int
     public var attnRMSNormEps: Double
+    public var tieWordEmbeddings: Bool
+    public var ropeScaling: MotifRopeScalingConfiguration?
     public var hiddenActivation: String
     public var useBias: Bool
+    public var expanded: Bool
+    public var slidingWindow: Int?
+    public var useSlidingWindow: Bool
+    public var maxWindowLayers: Int?
     public var fusedRope: Bool
+    public var bosTokenId: Int?
+    public var eosTokenId: Int?
+    public var quantization: [String: MotifJSONValue]?
 
     public var isGroupedDifferentialAttention: Bool { numNoiseHeads != nil }
+    public var effectiveHeadDim: Int { headDim ?? hiddenSize / numAttentionHeads }
+    public var attentionVariant: MotifAttentionVariant {
+        isGroupedDifferentialAttention ? .groupedDifferentialAttention : .vanillaDifferentialAttention
+    }
+    public var groupedRatio: Int? {
+        guard let numNoiseHeads else { return nil }
+        return (numAttentionHeads - numNoiseHeads) / numNoiseHeads
+    }
+    public var keyNoiseHeads: Int? {
+        guard isGroupedDifferentialAttention else { return nil }
+        return numKeyValueHeads / (kRatio + 1)
+    }
+    public var requiredCustomKernelNames: [String] {
+        if isGroupedDifferentialAttention {
+            return MotifMetalKernelRegistry.required.map(\.name)
+        }
+        return ["polynorm"]
+    }
+    public var bosTokenID: Int? {
+        get { bosTokenId }
+        set { bosTokenId = newValue }
+    }
+    public var eosTokenID: Int? {
+        get { eosTokenId }
+        set { eosTokenId = newValue }
+    }
 
     public init(
-        modelType: String = "motif",
+        modelType: String = Self.canonicalModelType,
         hiddenSize: Int,
         numHiddenLayers: Int,
         intermediateSize: Int,
@@ -123,9 +351,18 @@ public struct MotifModelConfiguration: Codable, Equatable, Sendable {
         numNoiseHeads: Int? = nil,
         kRatio: Int = 1,
         attnRMSNormEps: Double = 1e-5,
+        tieWordEmbeddings: Bool = false,
+        ropeScaling: MotifRopeScalingConfiguration? = nil,
         hiddenActivation: String = "poly_norm",
         useBias: Bool = false,
-        fusedRope: Bool = false
+        expanded: Bool = false,
+        slidingWindow: Int? = nil,
+        useSlidingWindow: Bool = false,
+        maxWindowLayers: Int? = nil,
+        fusedRope: Bool = false,
+        bosTokenId: Int? = nil,
+        eosTokenId: Int? = nil,
+        quantization: [String: MotifJSONValue]? = nil
     ) {
         self.modelType = modelType
         self.hiddenSize = hiddenSize
@@ -141,9 +378,100 @@ public struct MotifModelConfiguration: Codable, Equatable, Sendable {
         self.numNoiseHeads = numNoiseHeads
         self.kRatio = kRatio
         self.attnRMSNormEps = attnRMSNormEps
+        self.tieWordEmbeddings = tieWordEmbeddings
+        self.ropeScaling = ropeScaling
         self.hiddenActivation = hiddenActivation
         self.useBias = useBias
+        self.expanded = expanded
+        self.slidingWindow = slidingWindow
+        self.useSlidingWindow = useSlidingWindow
+        self.maxWindowLayers = maxWindowLayers
         self.fusedRope = fusedRope
+        self.bosTokenId = bosTokenId
+        self.eosTokenId = eosTokenId
+        self.quantization = quantization
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case modelType = "model_type"
+        case hiddenSize = "hidden_size"
+        case numHiddenLayers = "num_hidden_layers"
+        case intermediateSize = "intermediate_size"
+        case numAttentionHeads = "num_attention_heads"
+        case numKeyValueHeads = "num_key_value_heads"
+        case vocabSize = "vocab_size"
+        case rmsNormEps = "rms_norm_eps"
+        case ropeTheta = "rope_theta"
+        case maxPositionEmbeddings = "max_position_embeddings"
+        case headDim = "head_dim"
+        case numNoiseHeads = "num_noise_heads"
+        case kRatio = "k_ratio"
+        case attnRMSNormEps = "attn_rms_norm_eps"
+        case tieWordEmbeddings = "tie_word_embeddings"
+        case ropeScaling = "rope_scaling"
+        case hiddenActivation = "hidden_act"
+        case useBias = "use_bias"
+        case expanded
+        case slidingWindow = "sliding_window"
+        case useSlidingWindow = "use_sliding_window"
+        case maxWindowLayers = "max_window_layers"
+        case fusedRope = "fused_rope"
+        case bosTokenId = "bos_token_id"
+        case eosTokenId = "eos_token_id"
+        case quantization
+    }
+
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            modelType: try container.decodeIfPresent(String.self, forKey: .modelType) ?? "motif",
+            hiddenSize: try container.decode(Int.self, forKey: .hiddenSize),
+            numHiddenLayers: try container.decode(Int.self, forKey: .numHiddenLayers),
+            intermediateSize: try container.decode(Int.self, forKey: .intermediateSize),
+            numAttentionHeads: try container.decode(Int.self, forKey: .numAttentionHeads),
+            numKeyValueHeads: try container.decode(Int.self, forKey: .numKeyValueHeads),
+            vocabSize: try container.decode(Int.self, forKey: .vocabSize),
+            rmsNormEps: try container.decodeIfPresent(Double.self, forKey: .rmsNormEps) ?? 1e-6,
+            ropeTheta: try container.decodeIfPresent(Double.self, forKey: .ropeTheta) ?? 10_000,
+            maxPositionEmbeddings: try container.decodeIfPresent(
+                Int.self,
+                forKey: .maxPositionEmbeddings
+            ) ?? 8_192,
+            headDim: try container.decodeIfPresent(Int.self, forKey: .headDim),
+            numNoiseHeads: try container.decodeIfPresent(Int.self, forKey: .numNoiseHeads),
+            kRatio: try container.decodeIfPresent(Int.self, forKey: .kRatio) ?? 1,
+            attnRMSNormEps: try container.decodeIfPresent(
+                Double.self,
+                forKey: .attnRMSNormEps
+            ) ?? 1e-5,
+            tieWordEmbeddings: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .tieWordEmbeddings
+            ) ?? false,
+            ropeScaling: try container.decodeIfPresent(
+                MotifRopeScalingConfiguration.self,
+                forKey: .ropeScaling
+            ),
+            hiddenActivation: try container.decodeIfPresent(
+                String.self,
+                forKey: .hiddenActivation
+            ) ?? "poly_norm",
+            useBias: try container.decodeIfPresent(Bool.self, forKey: .useBias) ?? false,
+            expanded: try container.decodeIfPresent(Bool.self, forKey: .expanded) ?? false,
+            slidingWindow: try container.decodeIfPresent(Int.self, forKey: .slidingWindow),
+            useSlidingWindow: try container.decodeIfPresent(
+                Bool.self,
+                forKey: .useSlidingWindow
+            ) ?? false,
+            maxWindowLayers: try container.decodeIfPresent(Int.self, forKey: .maxWindowLayers),
+            fusedRope: try container.decodeIfPresent(Bool.self, forKey: .fusedRope) ?? false,
+            bosTokenId: try container.decodeIfPresent(Int.self, forKey: .bosTokenId),
+            eosTokenId: try container.decodeIfPresent(Int.self, forKey: .eosTokenId),
+            quantization: try container.decodeIfPresent(
+                [String: MotifJSONValue].self,
+                forKey: .quantization
+            )
+        )
     }
 }
 

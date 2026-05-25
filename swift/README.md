@@ -50,3 +50,13 @@ MOTIFKIT_ENABLE_MLX=1 swift build --package-path swift --target MotifKitMLX
 ```
 
 Once the repo moves to Xcode 16.3+ / Swift 6.1+, update the pins in `Package.swift` to `mlx-swift-lm` 3.31.3+ and `mlx-swift` 0.31.3+.
+
+## Custom Metal kernel porting
+
+`MotifKitMLX` now includes a Swift-side kernel manifest mirroring the Python custom kernels in `src/mlx_motif/kernels/` and a buildable PolyNorm wrapper scaffold. Custom Metal execution is intentionally disabled by default; native runtime code uses reference MLX Swift ops unless benchmark/parity work opts in with:
+
+```bash
+MOTIFKIT_ENABLE_MLX=1 MOTIFKIT_ENABLE_EXPERIMENTAL_METAL_KERNELS=1 swift test --package-path swift --filter MotifKitMLXTests
+```
+
+Set `MOTIFKIT_RUN_MLX_RUNTIME_TESTS=1` only on machines where the MLX Swift runtime can load its default metallib; otherwise the tests stay manifest/build-only. Before enabling any kernel in the app path, add golden fixtures from the Python reference and record TTFT/decode benchmark deltas for the matching Motif shapes.

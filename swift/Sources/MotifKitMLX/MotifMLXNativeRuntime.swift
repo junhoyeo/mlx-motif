@@ -283,6 +283,81 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
             tokensPerSecond: elapsed > 0 ? Double(totalTokens) / elapsed : 0
         )
     }
+
+    public func logitSnapshot(
+        text: String,
+        maxTokens: Int = 512,
+        topK: Int = 10
+    ) throws -> MotifMLXLogitSnapshot {
+        var tokenIDs = generationContext.tokenizer.encode(text: text)
+        if maxTokens > 0, tokenIDs.count > maxTokens {
+            tokenIDs = Array(tokenIDs.prefix(maxTokens))
+        }
+        guard !tokenIDs.isEmpty else {
+            throw MotifMLXNativeRuntimeError.notEnoughTokensForPerplexity(tokenIDs.count)
+        }
+        let started = Date()
+        let logits = generationContext.model(MLXArray(tokenIDs, [1, tokenIDs.count]), cache: nil)
+            .asType(.float32)
+        let last = logits[0, tokenIDs.count - 1, 0...]
+        eval(last)
+        let values = last.asArray(Float.self)
+        let top = values.enumerated()
+            .sorted { lhs, rhs in lhs.element > rhs.element }
+            .prefix(max(1, topK))
+            .map { MotifMLXLogitEntry(token: $0.offset, logit: Double($0.element)) }
+        let checksum = values.reduce(Double(0)) { partial, value in partial + Double(value) }
+        return MotifMLXLogitSnapshot(
+            promptTokens: tokenIDs.count,
+            vocabularySize: values.count,
+            checksum: checksum,
+            topK: Array(top),
+            elapsedSeconds: Date().timeIntervalSince(started)
+        )
+    }
+
+    public func benchmarkGeneration(
+        messages: [MotifChatMessage],
+        maxTokens: Int = 64,
+        temperature: Double = 0
+    ) async throws -> MotifMLXGenerationBenchmark {
+        let started = Date()
+        let input = MotifMLXChatInputProcessor.userInput(from: messages)
+        let lmInput = try await inputProcessor.prepare(input: input)
+        let stream = try generateTokens(
+            input: lmInput,
+            parameters: GenerateParameters(maxTokens: maxTokens, temperature: Float(temperature)),
+            context: generationContext,
+            includeStopToken: false
+        )
+        var tokens: [Int] = []
+        var info: MotifMLXGenerationInfo?
+        for await event in stream {
+            switch event {
+            case .token(let token):
+                tokens.append(token)
+            case .info(let completion):
+                info = MotifMLXGenerationInfo(
+                    promptTokenCount: completion.promptTokenCount,
+                    generationTokenCount: completion.generationTokenCount,
+                    promptTime: completion.promptTime,
+                    generateTime: completion.generateTime,
+                    promptTokensPerSecond: completion.promptTokensPerSecond,
+                    tokensPerSecond: completion.tokensPerSecond
+                )
+            }
+        }
+        let text = generationContext.tokenizer.decode(tokens: tokens)
+        return MotifMLXGenerationBenchmark(
+            promptCharacters: try inputProcessor.promptText(for: messages).count,
+            promptTokens: lmInput.text.tokens.size,
+            generatedTokens: tokens.count,
+            elapsedSeconds: Date().timeIntervalSince(started),
+            outputCharacters: text.count,
+            generationInfo: info,
+            output: text
+        )
+    }
 }
 
 public struct MotifMLXPerplexityResult: Codable, Equatable, Sendable {
@@ -292,5 +367,37 @@ public struct MotifMLXPerplexityResult: Codable, Equatable, Sendable {
     public var chunks: Int
     public var elapsedSeconds: Double
     public var tokensPerSecond: Double
+}
+
+public struct MotifMLXLogitEntry: Codable, Equatable, Sendable {
+    public var token: Int
+    public var logit: Double
+}
+
+public struct MotifMLXLogitSnapshot: Codable, Equatable, Sendable {
+    public var promptTokens: Int
+    public var vocabularySize: Int
+    public var checksum: Double
+    public var topK: [MotifMLXLogitEntry]
+    public var elapsedSeconds: Double
+}
+
+public struct MotifMLXGenerationInfo: Codable, Equatable, Sendable {
+    public var promptTokenCount: Int
+    public var generationTokenCount: Int
+    public var promptTime: Double
+    public var generateTime: Double
+    public var promptTokensPerSecond: Double
+    public var tokensPerSecond: Double
+}
+
+public struct MotifMLXGenerationBenchmark: Codable, Equatable, Sendable {
+    public var promptCharacters: Int
+    public var promptTokens: Int
+    public var generatedTokens: Int
+    public var elapsedSeconds: Double
+    public var outputCharacters: Int
+    public var generationInfo: MotifMLXGenerationInfo?
+    public var output: String
 }
 #endif

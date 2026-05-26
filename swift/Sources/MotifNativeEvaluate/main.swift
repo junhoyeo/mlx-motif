@@ -17,11 +17,11 @@ struct MotifNativeEvaluateCommand {
     private static func run() async throws {
         let arguments = Array(CommandLine.arguments.dropFirst())
         guard let modelIndex = arguments.firstIndex(of: "--model"), arguments.indices.contains(modelIndex + 1) else {
-            FileHandle.standardError.write(Data("usage: MotifNativeEvaluate --model <converted-mlx-dir> [--mode perplexity|bench] [--text text|--text-file path] [--chunk n] [--max-tokens n] [--prompt text]\n".utf8))
+            FileHandle.standardError.write(Data("usage: MotifNativeEvaluate --model <converted-mlx-dir> [--mode perplexity|bench|logits] [--text text|--text-file path] [--chunk n] [--max-tokens n] [--prompt text] [--top-k n]\n".utf8))
             Foundation.exit(2)
         }
         let mode = value(after: "--mode", in: arguments) ?? "perplexity"
-        guard mode == "perplexity" || mode == "bench" else {
+        guard mode == "perplexity" || mode == "bench" || mode == "logits" else {
             throw CommandError.invalidMode(mode)
         }
         let modelDirectory = URL(fileURLWithPath: arguments[modelIndex + 1])
@@ -40,22 +40,19 @@ struct MotifNativeEvaluateCommand {
             let prompt = value(after: "--prompt", in: arguments) ?? "Explain grouped differential attention in one sentence."
             let maxTokens = Int(value(after: "--max-tokens", in: arguments) ?? "64") ?? 64
             let temperature = Double(value(after: "--temperature", in: arguments) ?? "0") ?? 0
-            let started = Date()
-            var generated = ""
-            let stream = runtime.streamResponse(
+            let result = try await runtime.benchmarkGeneration(
                 messages: [.user(prompt)],
-                parameters: MotifGenerationParameters(maxTokens: maxTokens, temperature: temperature)
-            )
-            for try await event in stream {
-                if case .text(let text) = event { generated += text }
-            }
-            let result = NativeBenchResult(
-                promptCharacters: prompt.count,
                 maxTokens: maxTokens,
-                elapsedSeconds: Date().timeIntervalSince(started),
-                outputCharacters: generated.count,
-                output: generated
+                temperature: temperature
             )
+            let data = try JSONEncoder.pretty.encode(result)
+            FileHandle.standardOutput.write(data)
+            FileHandle.standardOutput.write(Data("\n".utf8))
+        case "logits":
+            let text = try inputText(arguments: arguments)
+            let maxTokens = Int(value(after: "--max-tokens", in: arguments) ?? "512") ?? 512
+            let topK = Int(value(after: "--top-k", in: arguments) ?? "10") ?? 10
+            let result = try runtime.logitSnapshot(text: text, maxTokens: maxTokens, topK: topK)
             let data = try JSONEncoder.pretty.encode(result)
             FileHandle.standardOutput.write(data)
             FileHandle.standardOutput.write(Data("\n".utf8))
@@ -82,21 +79,13 @@ struct MotifNativeEvaluateCommand {
     }
 }
 
-private struct NativeBenchResult: Codable {
-    var promptCharacters: Int
-    var maxTokens: Int
-    var elapsedSeconds: Double
-    var outputCharacters: Int
-    var output: String
-}
-
 private enum CommandError: Error, LocalizedError {
     case invalidMode(String)
 
     var errorDescription: String? {
         switch self {
         case .invalidMode(let mode):
-            "Unsupported mode: \(mode). Use perplexity or bench."
+            "Unsupported mode: \(mode). Use perplexity, bench, or logits."
         }
     }
 }

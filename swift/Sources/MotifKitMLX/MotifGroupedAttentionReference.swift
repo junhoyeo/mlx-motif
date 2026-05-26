@@ -40,9 +40,9 @@ public struct MotifGroupedAttentionReferencePlan: Codable, Equatable, Sendable {
         self.layout = layout
         self.cacheKind = cacheKind
         self.limitations = [
-            "reference-only MLX Swift ops; no custom Metal dispatch by default",
+            "direct custom Metal dispatch is default-on for decode shapes, with MLX_MOTIF_DISABLE_KERNELS=1 as fallback",
             "expects q/k/v tensors after projection and RoPE, not a full decoder layer",
-            "q4/q8 grouped cache uses a dequantizing Swift bridge until packed Metal fixtures prove sdpa_dual_v_q4 parity",
+            "q4/q8 grouped cache exposes packed tuples to the direct sdpa_dual_v_q4 path; the dequantizing bridge remains diagnostic-only",
         ]
         self.parityHooks = [
             "Python MotifAttention._forward_grouped fallback fixture",

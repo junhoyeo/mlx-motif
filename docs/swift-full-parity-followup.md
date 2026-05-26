@@ -13,16 +13,16 @@ surfaces** from **performance-proven custom-kernel parity**.
 | Real tokenizer/chat-template execution in Swift | Wired | `MotifMLXChatInputProcessor` uses swift-tokenizers `applyChatTemplate` with Motif EOS/chat-template metadata. |
 | Full Motif decoder forward pass parity | Implemented as MLX Swift reference graph | Decoder layers run embeddings, RMSNorm, PolyNorm MLP, vanilla DiffAttn, grouped DiffAttn, final norm, and lm head. Full-logit parity still needs golden real-checkpoint fixtures. |
 | Python-equivalent grouped differential attention execution | Implemented reference path | Grouped attention now routes through Swift 4-slot split/update logic and `MotifGDAPostSplit` / `MotifSDPADualV` reference wrappers. |
-| Working Swift custom Metal kernels equivalent to Python kernels | Reference wrappers plus gated manifest | `MotifMetalKernels` enumerates `polynorm`, `gda_post`, `gda_post_split`, `sdpa_dual_v`, `sdpa_dual_v_q4`; GDA/dual-V wrappers are callable reference paths. Direct Metal execution remains disabled until Python fixture parity + same-machine benchmarks pass. |
-| Quantized KV cache runtime parity | Implemented opt-in q4/q8 bridge | `MLX_MOTIF_4SLOT_CACHE=q4|q8` selects `MotifGroupedQuantizedKVCache`, stores packed tuples, and can fetch dequantized slices for the Swift model. Direct packed in-kernel speed parity remains gated. |
-| `sdpa_dual_v_q4` runtime path | Implemented reference bridge, not direct Metal | Quantized cache can expose packed tuples and `MotifSDPADualVQ4.reference` dequantizes them before shared-QK dual-V SDPA. Direct Python-equivalent packed Metal dispatch still needs fixtures/benchmarks. |
+| Working Swift custom Metal kernels equivalent to Python kernels | Implemented default-on direct Metal path | `MotifMetalKernels` now marks PolyNorm, GDA post/split, `sdpa_dual_v`, and `sdpa_dual_v_q4` as `metalReady`/default-enabled. `MLX_MOTIF_DISABLE_KERNELS=1` forces reference routing for differential checks. |
+| Quantized KV cache runtime parity | Implemented packed q4/q8 runtime path | `MLX_MOTIF_4SLOT_CACHE=q4|q8` selects `MotifGroupedQuantizedKVCache`; decode-time q4 attention passes packed tuples directly to `MotifSDPADualVQ4.apply` instead of materializing the full dequantized cache. |
+| `sdpa_dual_v_q4` runtime path | Implemented direct packed Metal dispatch | Swift ports the Python packed q4/q8 Metal source and runtime tests compare direct packed output against the dequant bridge on deterministic decode fixtures. |
 | HF→MLX conversion flow | Python flow remains canonical | Existing `mlx-motif convert` remains the conversion command; Swift runtime consumes its output. A Swift-native converter is intentionally not duplicated. |
 | Quantization presets | Load metadata honored | Swift load path passes `config.quantization` / per-layer quantization into `loadWeights`; Python remains the source for producing presets. |
 | Python server feature parity | Native Swift OpenAI-compatible server added | `MotifNativeServe` exposes `GET /v1/models` and `POST /v1/chat/completions` with streaming SSE and Motif `<think>` event handling. Production hardening/load tests remain a gate. |
-| Speculative decoding | Not implemented in Swift native path | Existing Python wiring remains the source of truth; Swift needs an MLXLMCommon-compatible draft-model API before enabling. |
-| Perplexity/e2e quality checks | Native CLI added | `MotifNativeEvaluate --mode perplexity|bench` and `scripts/bench_swift_native.py --mode ...` provide local quality/latency harnesses. Checked-in parity results require local weights/hardware. |
-| Long-context benchmarks | Harness path added | `scripts/bench_swift_native.py` accepts long prompts/model dirs and cache modes. No checked-in long-context result without model weights/hardware run. |
-| Performance parity against Python | Measurement harness added; not claimed | Custom Metal direct dispatch, packed q4 SDPA, and same-machine Python-vs-Swift benchmark evidence are still required before declaring speed parity. |
+| Speculative decoding | Implemented in Swift native path | `MotifMLXNativeRuntime.speculativeGenerate` and `MotifNativeGenerate --speculative --speculative-draft-model ...` run target/draft verification and emit acceptance metrics. |
+| Perplexity/e2e quality checks | Implemented with checked-in evidence harness | `MotifNativeEvaluate --mode perplexity|bench|logits`, `scripts/perplexity.py --json`, and `scripts/swift_python_hard_parity.py` emit raw same-machine JSON/markdown evidence. |
+| Long-context benchmarks | Implemented with evidence harness | `scripts/swift_python_hard_parity.py` runs Python decode and Swift q4 decode on generated long-context prompts and stores raw results under `docs/benchmarks/`. |
+| Performance parity against Python | Implemented/proven by same-machine harness for the local checkpoint | The hard-parity harness records Python decode, Swift q4 direct, Swift q4 bridge, logits, perplexity, speculative decoding, and long-context cells in one host report. Use the raw JSON for exact numbers. |
 
 ## Runtime feature flags shared with Python
 
@@ -30,8 +30,8 @@ The Swift MLX runtime reads the same knobs as the Python backend where possible:
 
 ```bash
 MLX_MOTIF_4SLOT_CACHE=1      # grouped four-slot fp cache
-MLX_MOTIF_4SLOT_CACHE=q4     # grouped four-slot q4 packed cache with dequant bridge
-MLX_MOTIF_4SLOT_CACHE=q8     # grouped four-slot q8 packed cache with dequant bridge
+MLX_MOTIF_4SLOT_CACHE=q4     # grouped four-slot q4 packed cache with direct packed sdpa_dual_v_q4 by default
+MLX_MOTIF_4SLOT_CACHE=q8     # grouped four-slot q8 packed cache with direct packed sdpa_dual_v_q4 by default
 MLX_MOTIF_DUAL_V=0           # disable dual-V wrapper routing
 MLX_MOTIF_QUANT_SDPA=0       # keep q4/q8 cache on the dequant bridge path
 MLX_MOTIF_DISABLE_KERNELS=1  # force reference routing
@@ -39,17 +39,19 @@ MLX_MOTIF_DISABLE_KERNELS=1  # force reference routing
 
 ## Why not mark performance parity complete?
 
-The repository does not vendor Motif weights, and a PR should not overclaim
-runtime/performance parity without golden numeric fixtures and same-machine
-benchmarks. This PR closes the Swift-side runtime surface gaps (server, eval,
-4-slot cache, q4/q8 cache bridge, dual-V/GDA wrapper routing) while keeping the
-remaining direct-Metal and measured-speed gates explicit.
+This hard-parity follow-up adds the direct Swift Metal implementations and a
+same-machine evidence harness. The raw reports under `docs/benchmarks/` are the
+source of truth for performance claims; if a future machine/checkpoint fails a
+cell, do not carry the parity claim forward without rerunning the harness.
+
+
+Latest checked-in local evidence: [`docs/benchmarks/swift-python-hard-parity-20260526T091532Z.md`](docs/benchmarks/swift-python-hard-parity-20260526T091532Z.md) (raw JSON alongside it).
 
 ## Verification commands
 
 ```bash
 scripts/verify_swift.sh
-scripts/verify_swift_mlx.sh
+scripts/verify_swift_mlx.sh  # also builds/installs mlx.metallib and runs runtime kernel tests
 uv run ruff check src tests scripts/bench_swift_native.py
 uv run ruff format --check src tests scripts/bench_swift_native.py
 uv run pytest -q
@@ -70,6 +72,12 @@ MOTIFKIT_ENABLE_MLX=1 swift run --package-path swift MotifNativeEvaluate \
   --mode perplexity \
   --text-file ./fixtures/eval.txt \
   --max-tokens 2048
+
+MOTIFKIT_ENABLE_MLX=1 swift run --package-path swift MotifNativeEvaluate \
+  --model ./out/motif-12.7b-q4 \
+  --mode logits \
+  --text "Explain grouped differential attention." \
+  --top-k 10
 
 MLX_MOTIF_4SLOT_CACHE=q4 MOTIFKIT_ENABLE_MLX=1 scripts/bench_swift_native.py \
   --model ./out/motif-12.7b-q4 \

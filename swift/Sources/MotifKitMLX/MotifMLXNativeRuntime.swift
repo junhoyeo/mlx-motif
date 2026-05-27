@@ -165,6 +165,7 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
             quantization: nil,
             perLayerQuantization: baseConfiguration.perLayerQuantization
         )
+        model.fuseQueryKeyValueProjectionsIfPossible()
 
         let eosTokenIDs = Set(
             ([bundle.configuration.eosTokenId].compactMap { $0 })

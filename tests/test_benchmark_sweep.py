@@ -36,6 +36,9 @@ def test_model_and_cache_cell_parsing() -> None:
     assert direct.disable_kernels is False
     assert direct.env["MLX_MOTIF_DISABLE_KERNELS"] == "0"
 
+    fused = bench_sweep.parse_cache_cell("q4_direct_fused:q4,quant_sdpa=1,fuse_qkv=1")
+    assert fused.env["MLX_MOTIF_FUSE_QKV"] == "1"
+
 
 def test_dry_run_cli_writes_schema_report(tmp_path: Path) -> None:
     output = tmp_path / "sweep.json"
@@ -79,6 +82,29 @@ def test_dry_run_cli_writes_schema_report(tmp_path: Path) -> None:
     assert all(cell["status"] == "pass" for cell in report["cells"])
     assert report["comparisons"], "dry-run matrix should include comparison rows"
     assert "Motif benchmark sweep" in markdown.read_text()
+
+
+def test_fused_cache_cells_compare_against_default() -> None:
+    bench_sweep = _load_bench_sweep()
+    cells = []
+    for name, tps in [("q4_direct", 10.0), ("q4_direct_fused", 12.0)]:
+        cells.append(
+            {
+                "model_id": "motif",
+                "backend": "swift",
+                "cache_cell": name,
+                "prompt_target_tokens": 128,
+                "status": "pass",
+                "cell_id": f"motif/swift/{name}/p128",
+                "summary": {"median_tokens_per_second": tps},
+            }
+        )
+
+    comparisons = bench_sweep.build_comparisons(cells)
+
+    fused = [row for row in comparisons if row["comparison"] == "fused_vs_default"]
+    assert len(fused) == 1
+    assert fused[0]["speedup"] == 1.2
 
 
 def test_failed_cell_is_preserved(tmp_path: Path) -> None:

@@ -141,6 +141,8 @@ final class MotifGoldenFixtureTests: XCTestCase {
         XCTAssertFalse(disabled.dualVAttention)
         XCTAssertFalse(disabled.quantizedSDPA)
         XCTAssertTrue(disabled.disableCustomKernels)
+        XCTAssertFalse(MotifRuntimeFeatureFlags.fromEnvironment([:]).fuseQueryKeyValue)
+        XCTAssertTrue(MotifRuntimeFeatureFlags.fromEnvironment(["MLX_MOTIF_FUSE_QKV": "1"]).fuseQueryKeyValue)
     }
 
     func testPolyNormReferenceMatchesGoldenFixture() throws {

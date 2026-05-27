@@ -1,0 +1,16 @@
+{
+  "elapsedSeconds" : 1.004963994026184,
+  "generatedTokens" : 4,
+  "generationInfo" : {
+    "generateTime" : 0.18018698692321777,
+    "generationTokenCount" : 4,
+    "promptTime" : 0.7504581212997437,
+    "promptTokenCount" : 462,
+    "promptTokensPerSecond" : 615.6239594020872,
+    "tokensPerSecond" : 22.19916137287151
+  },
+  "output" : "It seems like you've",
+  "outputCharacters" : 20,
+  "promptCharacters" : 3199,
+  "promptTokens" : 462
+}

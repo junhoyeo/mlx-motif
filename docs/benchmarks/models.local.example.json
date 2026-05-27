@@ -1,0 +1,16 @@
+{
+  "models": [
+    {
+      "id": "motif-2.6b-q4",
+      "path": ".models/motif-2.6b-mlx-q4",
+      "quantization": "q4",
+      "params_b": 2.6
+    },
+    {
+      "id": "motif-12.7b-q4",
+      "path": ".models/motif-12.7b-reasoning-q4",
+      "quantization": "q4",
+      "params_b": 12.7
+    }
+  ]
+}

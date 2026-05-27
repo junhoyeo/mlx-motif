@@ -16,8 +16,8 @@ MotifChatApp (SwiftUI)
   - shared chat message/generation types
   - `<think>` stream filtering compatible with the Python server behavior
   - an OpenAI-compatible streaming backend for the existing `mlx-motif serve`
-  - a placeholder native backend error type for the future in-process MLX path
-- `MotifChatApp` is a SwiftUI macOS app scaffold with chat and runtime panels. Its default app target still uses the OpenAI-compatible endpoint so non-MLX builds stay lightweight.
+  - a placeholder native backend error type for non-MLX builds
+- `MotifChatApp` is a SwiftUI macOS app scaffold with chat and runtime panels. Its default app target uses the OpenAI-compatible endpoint so non-MLX builds stay lightweight. When built with `MOTIFKIT_ENABLE_MLX=1`, it also links `MotifKitMLX` and can stream directly from a converted local checkpoint.
 - `MotifKitMLX` is disabled by default so the package stays buildable on the repo's current Xcode 16.2 / Swift 6.0.3 toolchain. With `MOTIFKIT_ENABLE_MLX=1`, `MotifMLXBackend(modelDirectory:)` now owns the native reference path: build the Motif decoder, load safetensors through MLXLMCommon, apply the tokenizer/chat template via swift-tokenizers, and stream generated events. Grouped four-slot q4/q8 caches are opt-in, and decode-time q4 uses direct packed custom Metal by default with `MLX_MOTIF_DISABLE_KERNELS=1` as the reference fallback.
 
 ## Verify
@@ -48,6 +48,14 @@ http://127.0.0.1:8080/v1
 ```
 
 This server-backed path remains available. The optional native Swift MLX path can be exercised from the package overlay with a converted checkpoint; rerun `scripts/swift_python_hard_parity.py` on the target machine before making fresh performance claims.
+
+To run the SwiftUI chat app directly against a converted checkpoint instead of a `/v1` endpoint:
+
+```bash
+MOTIFKIT_ENABLE_MLX=1 swift run --package-path swift MotifChatApp
+```
+
+Then choose **Native MLX checkpoint** in the Runtime panel and set the converted checkpoint directory, for example `.models/motif-2.6b-mlx-q4`.
 
 ## Enable MLX overlay work
 

@@ -141,10 +141,27 @@ private struct RuntimeView: View {
     var body: some View {
         Form {
             Section("Backend") {
-                TextField("OpenAI-compatible endpoint", text: $store.endpoint)
-                    .textFieldStyle(.roundedBorder)
-                TextField("Model ID", text: $store.model)
-                    .textFieldStyle(.roundedBorder)
+                Picker("Chat path", selection: $store.backendMode) {
+                    ForEach(MotifChatBackendMode.allCases) { mode in
+                        Label(mode.label, systemImage: mode.systemImage).tag(mode)
+                    }
+                }
+
+                switch store.backendMode {
+                case .openAICompatible:
+                    TextField("OpenAI-compatible endpoint", text: $store.endpoint)
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Model ID", text: $store.model)
+                        .textFieldStyle(.roundedBorder)
+
+                case .nativeMLX:
+                    TextField("Converted MLX model directory", text: $store.nativeModelDirectory)
+                        .textFieldStyle(.roundedBorder)
+                    Text("Build with `MOTIFKIT_ENABLE_MLX=1` and point this at an HF→MLX converted Motif checkpoint directory.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Picker("Thinking", selection: $store.thinkMode) {
                     ForEach(MotifThinkMode.allCases, id: \.self) { mode in
                         Text(mode.rawValue.capitalized).tag(mode)
@@ -153,9 +170,14 @@ private struct RuntimeView: View {
             }
 
             Section("App status") {
-                Label("Active chat path: OpenAI-compatible streaming endpoint", systemImage: "network")
-                Label("Native in-process MLX generation: optional package overlay", systemImage: "cpu")
-                Text("Run `mlx-motif serve` and point this app at `/v1` for the default local chat path. The optional MotifKitMLX overlay now has a native reference generation CLI for converted checkpoints, while this lightweight app target remains server-backed by default.")
+                Label("Active chat path: \(store.backendMode.label)", systemImage: store.backendMode.systemImage)
+                Label(
+                    store.nativeMLXCompiledIn
+                        ? "Native in-process MLX generation is compiled into this build"
+                        : "Native in-process MLX generation requires MOTIFKIT_ENABLE_MLX=1",
+                    systemImage: store.nativeMLXCompiledIn ? "checkmark.seal" : "shippingbox"
+                )
+                Text("Use the OpenAI-compatible endpoint for a Python or Swift local server, or rebuild the app with the MotifKitMLX overlay to stream directly from a converted checkpoint without a server hop.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -170,9 +192,9 @@ private struct RuntimeView: View {
             }
 
             Section("Native MLX status") {
-                Label("MotifKitMLX overlay is gated behind MOTIFKIT_ENABLE_MLX=1", systemImage: "shippingbox")
-                Label("Current native evidence: reference load/generation wiring plus fixture parity", systemImage: "checklist")
-                Label("Remaining native path: q4 cache, custom Metal kernel parity, speculative decoding, and same-machine benchmarks", systemImage: "wrench.and.screwdriver")
+                Label("MotifKitMLX overlay is gated behind MOTIFKIT_ENABLE_MLX=1 for lightweight default builds", systemImage: "shippingbox")
+                Label("Native path: tokenizer/chat template, checkpoint loading, q4 cache, custom Metal, and speculative decoding", systemImage: "checklist")
+                Label("Evidence: docs/benchmarks/swift-python-hard-parity-20260526T091532Z.md", systemImage: "speedometer")
             }
         }
         .formStyle(.grouped)

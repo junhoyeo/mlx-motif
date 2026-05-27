@@ -48,6 +48,7 @@ Create a local `.app` bundle and zip:
 
 ```bash
 scripts/package_swift_chat_app.sh
+scripts/verify_swift_chat_app_package.py dist/MotifChatApp.metadata.json
 ```
 
 Optional signing/notarization environment:
@@ -57,5 +58,7 @@ CODESIGN_IDENTITY="Developer ID Application: ..." scripts/package_swift_chat_app
 NOTARYTOOL_PROFILE=motif-notary scripts/package_swift_chat_app.sh
 ```
 
-The packaging script ad-hoc signs by default. Distribution builds should provide
-a Developer ID identity and a notarytool keychain profile.
+The packaging script ad-hoc signs by default and writes
+`MotifChatApp.metadata.json` with the git commit, Swift toolchain, bundle path,
+zip path, and SHA-256 checksums. Distribution builds should provide a Developer
+ID identity and a notarytool keychain profile.

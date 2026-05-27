@@ -77,15 +77,32 @@ def run_command(
     timeout: float | None = None,
 ) -> CommandResult:
     started = time.perf_counter()
-    proc = subprocess.run(
-        cmd,
-        cwd=cwd,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        elapsed = time.perf_counter() - started
+        stdout = error.stdout or ""
+        stderr = error.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        return CommandResult(
+            command=cmd,
+            returncode=124,
+            elapsed_seconds=elapsed,
+            stdout=stdout,
+            stderr=stderr + f"\nbenchmark cell timed out after {timeout}s",
+            json=parse_json_output(stdout),
+        )
     elapsed = time.perf_counter() - started
     return CommandResult(
         command=cmd,

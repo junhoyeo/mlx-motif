@@ -44,52 +44,77 @@ public struct MotifMLXChatInputProcessor: UserInputProcessor {
 
     public func prepare(input: UserInput) async throws -> LMInput {
         let messages = messageGenerator.generate(from: input)
-        let tokenIDs: [Int]
-        if let chatTemplate {
-            tokenIDs = try tokenizer.applyChatTemplate(
-                messages: messages,
-                chatTemplate: .literal(chatTemplate),
-                addGenerationPrompt: true,
-                truncation: false,
-                maxLength: nil,
-                tools: input.tools
-            )
-        } else {
-            tokenIDs = try tokenizer.applyChatTemplate(
-                messages: messages,
-                chatTemplate: nil,
-                addGenerationPrompt: true,
-                truncation: false,
-                maxLength: nil,
-                tools: input.tools
-            )
-        }
+        let tokenIDs = try tokenIDs(for: messages, tools: input.tools)
         return LMInput(tokens: MLXArray(tokenIDs))
     }
 
     public func promptText(for messages: [MotifChatMessage]) throws -> String {
         let generated = messageGenerator.generate(messages: messages.map(Self.chatMessage(from:)))
-        let tokenIDs: [Int]
-        if let chatTemplate {
-            tokenIDs = try tokenizer.applyChatTemplate(
-                messages: generated,
-                chatTemplate: .literal(chatTemplate),
-                addGenerationPrompt: true,
-                truncation: false,
-                maxLength: nil,
-                tools: nil
-            )
-        } else {
-            tokenIDs = try tokenizer.applyChatTemplate(
-                messages: generated,
+        let tokenIDs = try tokenIDs(for: generated, tools: nil)
+        return tokenizer.decode(tokens: tokenIDs)
+    }
+
+    private func tokenIDs(for messages: [Message], tools: [ToolSpec]?) throws -> [Int] {
+        do {
+            if let chatTemplate {
+                return try tokenizer.applyChatTemplate(
+                    messages: messages,
+                    chatTemplate: .literal(chatTemplate),
+                    addGenerationPrompt: true,
+                    truncation: false,
+                    maxLength: nil,
+                    tools: tools
+                )
+            }
+            return try tokenizer.applyChatTemplate(
+                messages: messages,
                 chatTemplate: nil,
                 addGenerationPrompt: true,
                 truncation: false,
                 maxLength: nil,
-                tools: nil
+                tools: tools
             )
+        } catch {
+            guard let chatTemplate else { throw error }
+            return tokenizer.encode(text: fallbackPrompt(messages: messages, chatTemplate: chatTemplate))
         }
-        return tokenizer.decode(tokens: tokenIDs)
+    }
+
+    private func fallbackPrompt(messages: [Message], chatTemplate: String) -> String {
+        if chatTemplate.contains("<|beginoftext|>") {
+            return fallbackReasoningPrompt(messages: messages)
+        }
+        var prompt = ""
+        for message in messages {
+            let role = stringValue(message["role"]) ?? "user"
+            let content = stringValue(message["content"]) ?? ""
+            prompt += "<|startofturn|><|\(role)|>\n\n\(content)<|endofturn|>"
+        }
+        prompt += "<|startofturn|><|assistant|>\n\n"
+        return prompt
+    }
+
+    private func fallbackReasoningPrompt(messages: [Message]) -> String {
+        var prompt = "<|beginoftext|><startofturn|>\n"
+        let systemMessages = messages.filter { stringValue($0["role"]) == "system" }
+        if !systemMessages.isEmpty {
+            prompt += "<|system|>\n"
+            for message in systemMessages {
+                prompt += (stringValue(message["content"]) ?? "") + "\n"
+            }
+            prompt += "<|endofturn|>"
+        }
+        for message in messages where stringValue(message["role"]) != "system" {
+            let role = stringValue(message["role"]) ?? "user"
+            let content = stringValue(message["content"]) ?? ""
+            prompt += "<|startofturn|>\n<|\(role)|>\n\(content)\n<|endofturn|>"
+        }
+        prompt += "<|assistant|><think>\n"
+        return prompt
+    }
+
+    private func stringValue(_ value: (any Sendable)?) -> String? {
+        value as? String
     }
 
     public static func userInput(from messages: [MotifChatMessage]) -> UserInput {

@@ -111,3 +111,15 @@ def test_failed_cell_is_preserved(tmp_path: Path) -> None:
     assert cell["returncode"] == 42
     assert "boom" in cell["error"]
     assert Path(cell["artifacts"]["stderr"]).read_text() == "boom"
+
+
+def test_command_timeout_is_preserved_as_failed_cell() -> None:
+    bench_sweep = _load_bench_sweep()
+    result = bench_sweep.run_command(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        cwd=Path.cwd(),
+        env={},
+        timeout=0.1,
+    )
+    assert result.returncode == 124
+    assert "timed out" in result.stderr

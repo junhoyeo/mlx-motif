@@ -48,6 +48,15 @@ M1 Max at p500/p3000/p16000 with `n_runs=1`, `max_tokens=8`, `q4_bridge`, and
 claim. The report shows Swift remains below Python for most q4-direct cells, so
 performance parity stays gated.
 
+## Checked-in QKV fusion probe
+
+[`benchmark-sweep-qkv-fusion-20260527T112300Z.md`](benchmark-sweep-qkv-fusion-20260527T112300Z.md)
+records the first opt-in Swift grouped-attention QKV fusion probe on the 12.7B
+q4 checkpoint. On this local Apple M1 Max, `MLX_MOTIF_FUSE_QKV=1` improves the
+Swift q4-direct cell by 1.05x at p500 and 1.20x at p3000, but it is still a
+single-run probe and does not close the Python-vs-Swift gap from the target
+sweep.
+
 ## CI and artifact expectations
 
 Normal PR CI runs a dry sweep only because Motif weights are not vendored. The manual `Benchmark sweep` workflow is for local/self-hosted Apple Silicon runners with checkpoint directories already present or restored from trusted infrastructure.

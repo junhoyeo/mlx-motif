@@ -1,0 +1,16 @@
+{
+  "elapsedSeconds" : 4.241024017333984,
+  "generatedTokens" : 8,
+  "generationInfo" : {
+    "generateTime" : 1.112515926361084,
+    "generationTokenCount" : 8,
+    "promptTime" : 3.0533021688461304,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 153.60418788070334,
+    "tokensPerSecond" : 7.19090829213305
+  },
+  "output" : "Okay, the user has shared a very",
+  "outputCharacters" : 32,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}

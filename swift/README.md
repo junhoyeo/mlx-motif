@@ -57,6 +57,8 @@ MOTIFKIT_ENABLE_MLX=1 swift run --package-path swift MotifChatApp
 
 Then choose **Native MLX checkpoint** in the Runtime panel and set the converted checkpoint directory, for example `.models/motif-2.6b-mlx-q4`.
 
+For smoke and packaging steps, see [`../docs/swift-app-smoke.md`](../docs/swift-app-smoke.md).
+
 ## Enable MLX overlay work
 
 The current machine has Swift 6.0.3, while latest `mlx-swift-lm` 3.31.3 requires Swift tools 6.1. For this toolchain the optional overlay pins `mlx-swift-lm` 2.30.6 and `mlx-swift` 0.30.6:

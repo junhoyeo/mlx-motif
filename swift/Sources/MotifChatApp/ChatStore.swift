@@ -31,22 +31,38 @@ enum MotifChatBackendMode: String, CaseIterable, Identifiable {
 
 @MainActor
 final class ChatStore: ObservableObject {
-    @Published var backendMode: MotifChatBackendMode = .openAICompatible
-    @Published var endpoint = "http://127.0.0.1:8080/v1"
-    @Published var model = "motif"
-    @Published var nativeModelDirectory = ProcessInfo.processInfo.environment["MOTIF_MODEL_DIR"] ?? ".models/motif-2.6b-mlx-q4"
-    @Published var thinkMode: MotifThinkMode = .hidden
-    @Published var maxTokens = 512
-    @Published var temperature = 0.6
+    @Published var backendMode: MotifChatBackendMode = ChatStore.storedBackendMode() {
+        didSet { ChatStore.defaults.set(backendMode.rawValue, forKey: DefaultsKey.backendMode.rawValue) }
+    }
+    @Published var endpoint = ChatStore.storedString(.endpoint, defaultValue: "http://127.0.0.1:8080/v1") {
+        didSet { ChatStore.defaults.set(endpoint, forKey: DefaultsKey.endpoint.rawValue) }
+    }
+    @Published var model = ChatStore.storedString(.model, defaultValue: "motif") {
+        didSet { ChatStore.defaults.set(model, forKey: DefaultsKey.model.rawValue) }
+    }
+    @Published var nativeModelDirectory = ChatStore.storedNativeModelDirectory() {
+        didSet { ChatStore.defaults.set(nativeModelDirectory, forKey: DefaultsKey.nativeModelDirectory.rawValue) }
+    }
+    @Published var thinkMode: MotifThinkMode = ChatStore.storedThinkMode() {
+        didSet { ChatStore.defaults.set(thinkMode.rawValue, forKey: DefaultsKey.thinkMode.rawValue) }
+    }
+    @Published var maxTokens = ChatStore.storedInt(.maxTokens, defaultValue: 512) {
+        didSet { ChatStore.defaults.set(maxTokens, forKey: DefaultsKey.maxTokens.rawValue) }
+    }
+    @Published var temperature = ChatStore.storedDouble(.temperature, defaultValue: 0.6) {
+        didSet { ChatStore.defaults.set(temperature, forKey: DefaultsKey.temperature.rawValue) }
+    }
     @Published var prompt = ""
     @Published var messages: [MotifChatMessage] = [
         .system(ChatStore.defaultSystemPrompt)
     ]
     @Published var isGenerating = false
     @Published var lastError: String?
+    @Published var runtimeStatus = "Idle"
     @Published var capturedReasoning = ""
 
     private var generationTask: Task<Void, Never>?
+    private static let defaults = UserDefaults.standard
     private static let defaultSystemPrompt = "You are Motif accessed through the configured local runtime. Be concise and helpful."
 
     var nativeMLXCompiledIn: Bool {
@@ -62,6 +78,7 @@ final class ChatStore: ObservableObject {
         prompt = ""
         capturedReasoning = ""
         lastError = nil
+        runtimeStatus = "Idle"
         messages = [
             .system(Self.defaultSystemPrompt)
         ]
@@ -71,6 +88,9 @@ final class ChatStore: ObservableObject {
         generationTask?.cancel()
         generationTask = nil
         isGenerating = false
+        if runtimeStatus != "Idle" {
+            runtimeStatus = "Cancelled"
+        }
     }
 
     func send() {
@@ -82,10 +102,12 @@ final class ChatStore: ObservableObject {
             backend = try makeBackend()
         } catch {
             lastError = error.localizedDescription
+            runtimeStatus = "Error"
             return
         }
 
         lastError = nil
+        runtimeStatus = backendMode == .nativeMLX ? "Loading native checkpoint…" : "Connecting to endpoint…"
         capturedReasoning = ""
         prompt = ""
         messages.append(.user(trimmed))
@@ -110,6 +132,9 @@ final class ChatStore: ObservableObject {
                 ) {
                     try Task.checkCancellation()
                     await MainActor.run {
+                        if self.runtimeStatus != "Generating…" {
+                            self.runtimeStatus = "Generating…"
+                        }
                         switch event {
                         case .text(let text):
                             self.append(text, toAssistantMessage: assistantID)
@@ -122,10 +147,12 @@ final class ChatStore: ObservableObject {
                 }
             } catch is CancellationError {
                 await MainActor.run {
+                    self.runtimeStatus = "Cancelled"
                     self.append("\n\n[Cancelled]", toAssistantMessage: assistantID)
                 }
             } catch {
                 await MainActor.run {
+                    self.runtimeStatus = "Error"
                     self.lastError = error.localizedDescription
                     self.append("\n\n[Error: \(error.localizedDescription)]", toAssistantMessage: assistantID)
                 }
@@ -134,8 +161,33 @@ final class ChatStore: ObservableObject {
             await MainActor.run {
                 self.isGenerating = false
                 self.generationTask = nil
+                if self.lastError == nil, self.runtimeStatus != "Cancelled" {
+                    self.runtimeStatus = "Idle"
+                }
             }
         }
+    }
+
+    func selectNativeModelDirectory(_ url: URL) {
+        nativeModelDirectory = url.path
+        backendMode = .nativeMLX
+        runtimeStatus = "Native checkpoint selected"
+        lastError = nil
+    }
+
+    func resetRuntimeSettings() {
+        for key in DefaultsKey.allCases {
+            ChatStore.defaults.removeObject(forKey: key.rawValue)
+        }
+        backendMode = .openAICompatible
+        endpoint = "http://127.0.0.1:8080/v1"
+        model = "motif"
+        nativeModelDirectory = ChatStore.defaultNativeModelDirectory
+        thinkMode = .hidden
+        maxTokens = 512
+        temperature = 0.6
+        runtimeStatus = "Settings reset"
+        lastError = nil
     }
 
     private func append(_ text: String, toAssistantMessage id: UUID) {
@@ -181,6 +233,52 @@ final class ChatStore: ObservableObject {
         return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
             .appendingPathComponent(expanded, isDirectory: true)
     }
+
+    private static var defaultNativeModelDirectory: String {
+        ProcessInfo.processInfo.environment["MOTIF_MODEL_DIR"] ?? ".models/motif-2.6b-mlx-q4"
+    }
+
+    private static func storedBackendMode() -> MotifChatBackendMode {
+        guard let rawValue = defaults.string(forKey: DefaultsKey.backendMode.rawValue) else {
+            return .openAICompatible
+        }
+        return MotifChatBackendMode(rawValue: rawValue) ?? .openAICompatible
+    }
+
+    private static func storedThinkMode() -> MotifThinkMode {
+        guard let rawValue = defaults.string(forKey: DefaultsKey.thinkMode.rawValue) else {
+            return .hidden
+        }
+        return MotifThinkMode(rawValue: rawValue) ?? .hidden
+    }
+
+    private static func storedNativeModelDirectory() -> String {
+        storedString(.nativeModelDirectory, defaultValue: defaultNativeModelDirectory)
+    }
+
+    private static func storedString(_ key: DefaultsKey, defaultValue: String) -> String {
+        defaults.string(forKey: key.rawValue) ?? defaultValue
+    }
+
+    private static func storedInt(_ key: DefaultsKey, defaultValue: Int) -> Int {
+        if defaults.object(forKey: key.rawValue) == nil { return defaultValue }
+        return defaults.integer(forKey: key.rawValue)
+    }
+
+    private static func storedDouble(_ key: DefaultsKey, defaultValue: Double) -> Double {
+        if defaults.object(forKey: key.rawValue) == nil { return defaultValue }
+        return defaults.double(forKey: key.rawValue)
+    }
+}
+
+private enum DefaultsKey: String, CaseIterable {
+    case backendMode = "motif.chat.backendMode"
+    case endpoint = "motif.chat.endpoint"
+    case model = "motif.chat.model"
+    case nativeModelDirectory = "motif.chat.nativeModelDirectory"
+    case thinkMode = "motif.chat.thinkMode"
+    case maxTokens = "motif.chat.maxTokens"
+    case temperature = "motif.chat.temperature"
 }
 
 private enum MotifChatStoreError: Error, LocalizedError {

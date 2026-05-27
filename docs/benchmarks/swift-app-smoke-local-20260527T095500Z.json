@@ -1,0 +1,53 @@
+{
+  "model": ".models/motif-2.6b-mlx-q4",
+  "required": true,
+  "checks": {
+    "native_generate": {
+      "command": [
+        "swift",
+        "run",
+        "--package-path",
+        "swift",
+        "MotifNativeGenerate",
+        "--model",
+        ".models/motif-2.6b-mlx-q4",
+        "--prompt",
+        "Reply with one short sentence.",
+        "--max-tokens",
+        "2",
+        "--json"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 9.726471334000962,
+      "stdout": "Sure,\n",
+      "stderr": "[0/1] Planning build\nBuilding for debugging...\n[0/3] Write swift-version--58304C5D6DBC2206.txt\nBuild of product 'MotifNativeGenerate' complete! (1.07s)\n"
+    },
+    "cancel_generation": {
+      "returncode": -15,
+      "stdout": "",
+      "stderr": "Building for debugging...\n[0/3] Write swift-version--58304C5D6DBC2206.txt\nBuild of product 'MotifNativeGenerate' complete! (0.26s)\n",
+      "terminated": true
+    },
+    "server_fallback": {
+      "status": "ok",
+      "response": {
+        "id": "chatcmpl-smoke",
+        "object": "chat.completion",
+        "model": "motif-smoke",
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": "hello from fallback"
+            },
+            "finish_reason": "stop"
+          }
+        ]
+      }
+    },
+    "server_process": {
+      "status": "stopped"
+    }
+  }
+}

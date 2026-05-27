@@ -32,7 +32,7 @@ struct MotifNativeServeCommand {
         let server = NativeOpenAIServer(runtime: runtime, host: host, port: port, modelID: modelID, defaultThinkMode: thinkMode)
         try server.start()
         FileHandle.standardError.write(Data("Serving \(modelID) on http://\(host):\(port)/v1\n".utf8))
-        dispatchMain()
+        try await server.waitUntilCancelled()
     }
 
     private static func value(after flag: String, in arguments: [String]) -> String? {
@@ -67,6 +67,13 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         }
         listener.start(queue: .global())
         self.listener = listener
+    }
+
+    func waitUntilCancelled() async throws {
+        while !Task.isCancelled {
+            try await Task.sleep(nanoseconds: 3_600_000_000_000)
+        }
+        listener?.cancel()
     }
 
     private func receive(connection: NWConnection, accumulated: Data) {

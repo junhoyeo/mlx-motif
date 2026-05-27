@@ -1,0 +1,75 @@
+{
+  "model": ".models/motif-2.6b-mlx-q4",
+  "required": true,
+  "checks": {
+    "native_generate": {
+      "command": [
+        "swift",
+        "run",
+        "--package-path",
+        "swift",
+        "MotifNativeGenerate",
+        "--model",
+        ".models/motif-2.6b-mlx-q4",
+        "--prompt",
+        "Reply with one short sentence.",
+        "--max-tokens",
+        "2",
+        "--json"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 4.8181162500004575,
+      "stdout": "Sure,\n",
+      "stderr": "[0/1] Planning build\nBuilding for debugging...\n[0/3] Write swift-version--58304C5D6DBC2206.txt\nBuild of product 'MotifNativeGenerate' complete! (1.06s)\n"
+    },
+    "cancel_generation": {
+      "returncode": -15,
+      "stdout": "",
+      "stderr": "Building for debugging...\n[0/3] Write swift-version--58304C5D6DBC2206.txt\nBuild of product 'MotifNativeGenerate' complete! (0.25s)\n",
+      "terminated": true
+    },
+    "server_ready": {
+      "status": "ready",
+      "models": {
+        "object": "list",
+        "data": [
+          {
+            "object": "model",
+            "id": "motif",
+            "created": 1779877637
+          }
+        ]
+      }
+    },
+    "server_fallback": {
+      "status": "ok",
+      "response": {
+        "id": "chatcmpl-82E647C4D56549CD9473EF86",
+        "choices": [
+          {
+            "finish_reason": "stop",
+            "message": {
+              "role": "assistant",
+              "content": "Hello,"
+            },
+            "index": 0
+          }
+        ],
+        "object": "chat.completion",
+        "usage": {
+          "total_tokens": 0,
+          "completion_tokens": 0,
+          "prompt_tokens": 0
+        },
+        "model": "motif",
+        "created": 1779877637
+      }
+    },
+    "server_process": {
+      "returncode": -15,
+      "stdout": "",
+      "stderr": "Building for debugging...\n[0/3] Write swift-version--58304C5D6DBC2206.txt\nBuild of product 'MotifNativeServe' complete! (0.24s)\nLoading native Swift Motif runtime from /Users/junhoyeo/mlx-motif/.models/motif-2.6b-mlx-q4 \u2026\nServing motif on http://127.0.0.1:52447/v1\n",
+      "terminated": true
+    }
+  }
+}

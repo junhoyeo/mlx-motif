@@ -47,6 +47,12 @@ cell, do not carry the parity claim forward without rerunning the harness.
 
 Latest checked-in local evidence: [`docs/benchmarks/swift-python-hard-parity-20260526T091532Z.md`](docs/benchmarks/swift-python-hard-parity-20260526T091532Z.md) (raw JSON alongside it).
 
+CI guardrails:
+
+- GitHub Actions runs the default Swift package verification via `scripts/verify_swift.sh`.
+- Python pytest validates the checked-in hard-parity report shape and key quality/runtime tolerances so the evidence cannot silently rot when the stack is rebased.
+- Runtime MLX/Metal tests remain local-only because hosted runners do not have the local Motif checkpoint used by `scripts/swift_python_hard_parity.py`.
+
 ## Verification commands
 
 ```bash

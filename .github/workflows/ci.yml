@@ -27,8 +27,8 @@ jobs:
         id: autofix
         if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
         run: |
-          uv run ruff check --fix src tests || true
-          uv run ruff format src tests || true
+          uv run ruff check --fix src tests scripts || true
+          uv run ruff format src tests scripts || true
           if ! git diff --quiet; then
             echo "has_changes=true" >> $GITHUB_OUTPUT
           fi
@@ -44,9 +44,9 @@ jobs:
           git push origin "HEAD:${{ github.head_ref }}"
 
       - name: Lint (strict)
-        run: uv run ruff check src tests
+        run: uv run ruff check src tests scripts
       - name: Format check (strict)
-        run: uv run ruff format --check src tests
+        run: uv run ruff format --check src tests scripts
 
   test:
     runs-on: macos-14
@@ -64,3 +64,34 @@ jobs:
         run: uv sync --extra dev
       - name: Test
         run: uv run pytest -q
+
+  swift:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Swift 6 toolchain
+        run: |
+          set -euo pipefail
+          for xcode in /Applications/Xcode_16*.app /Applications/Xcode.app; do
+            if [ ! -d "$xcode" ]; then
+              continue
+            fi
+
+            swift_bin="$xcode/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift"
+            if [ ! -x "$swift_bin" ]; then
+              continue
+            fi
+
+            version="$("$swift_bin" --version | head -n 1)"
+            echo "$xcode: $version"
+            if "$swift_bin" --version | grep -q 'version 6\.'; then
+              sudo xcode-select -s "$xcode/Contents/Developer"
+              swift --version
+              exit 0
+            fi
+          done
+
+          echo "Swift 6 toolchain not found on runner" >&2
+          exit 1
+      - name: Verify default Swift package
+        run: scripts/verify_swift.sh

@@ -103,6 +103,17 @@ jobs:
           exit 1
       - name: Verify default Swift package
         run: scripts/verify_swift.sh
+      - name: Package Swift chat app
+        run: |
+          CONFIGURATION=debug OUTPUT_DIR=dist-ci scripts/package_swift_chat_app.sh
+          scripts/verify_swift_chat_app_package.py dist-ci/MotifChatApp.metadata.json
+      - name: Upload Swift chat app package
+        uses: actions/upload-artifact@v4
+        with:
+          name: motif-chat-app-package
+          path: |
+            dist-ci/MotifChatApp.zip
+            dist-ci/MotifChatApp.metadata.json
       - name: Upload Swift build logs on failure
         if: failure()
         uses: actions/upload-artifact@v4

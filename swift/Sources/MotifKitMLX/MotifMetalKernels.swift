@@ -194,7 +194,7 @@ public enum MotifKernelFallbackTelemetry {
     public static let logEnvironmentVariable = "MLX_MOTIF_LOG_FALLBACKS"
 
     private static let lock = NSLock()
-    private static var counts: [MotifMetalKernelName: Int] = [:]
+    nonisolated(unsafe) private static var counts: [MotifMetalKernelName: Int] = [:]
 
     /// Records a single fallback for `kernel` and, when logging is enabled,
     /// writes a diagnostic line to standard error.

@@ -42,6 +42,36 @@ throughput scales with context length, so these speedups are not a clean
 head-to-head comparison.  They are recorded for completeness and monitored for
 schema continuity, but **must not be cited as parity evidence**.
 
+
+## Certified sweep update (20260531T184554Z)
+
+Source file: `docs/benchmarks/benchmark-sweep-certified-20260531T184554Z.json`<br>
+Host: Apple M1 Max · macOS-26.2-arm64-arm-64bit · `--max-tokens 64` · `--n-runs 5` · `--warmup-runs 1`<br>
+Certification validator: [`tests/test_benchmark_certification.py`](../../tests/test_benchmark_certification.py)
+
+### motif-2.6b-q4 — certified clean `swift_vs_python` speedup
+
+| cache_cell | prompt target | Swift tok/s | Python tok/s | speedup |
+|------------|--------------|------------|-------------|---------|
+| q4_bridge | 500 | 18.22 | 82.00 | **0.222x** |
+| q4_bridge | 3000 | 18.04 | 52.19 | **0.346x** |
+| q4_bridge | 16000 | 12.37 | 16.03 | **0.772x** |
+| q4_direct | 500 | 18.00 | 98.30 | **0.183x** |
+| q4_direct | 3000 | 17.89 | 57.45 | **0.311x** |
+| q4_direct | 16000 | 12.75 | 16.33 | **0.781x** |
+
+Certified evidence still shows Swift below Python for all clean 2.6B q4
+comparisons.  The long-context q4-direct cell is closest (0.781x), but short and
+mid contexts remain far from parity.  Keep the regression sentinel active and
+continue optimizing the Swift generation loop / q4 direct path before claiming
+performance parity.
+
+### motif-12.7b-q4 — certified rows remain token-mismatched
+
+All certified 12.7B `swift_vs_python` rows still have `prompt_tokens_match ==
+false` (Swift 469/2735/14527 vs Python 555/2821/14613 prompt tokens). They are
+useful trend evidence but still must not be cited as clean parity.
+
 ## Caveats
 
 1. **Token-mismatch caveat (12.7b).** Every motif-12.7b-q4 row has

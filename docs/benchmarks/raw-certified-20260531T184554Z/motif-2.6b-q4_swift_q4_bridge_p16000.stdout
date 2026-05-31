@@ -1,0 +1,101 @@
+{
+  "elapsedSeconds" : 37.25555503368378,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 4.949102997779846,
+    "generationTokenCount" : 64,
+    "promptTime" : 30.37435293197632,
+    "promptTokenCount" : 14519,
+    "promptTokensPerSecond" : 478.00195225608434,
+    "tokensPerSecond" : 12.931636304338427
+  },
+  "output" : "It seems like a repetitive pattern in the development of large language models have accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has",
+  "outputCharacters" : 437,
+  "promptCharacters" : 99704,
+  "promptTokens" : 14519
+}
+
+{
+  "elapsedSeconds" : 35.338598012924194,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 5.017079949378967,
+    "generationTokenCount" : 64,
+    "promptTime" : 28.42367398738861,
+    "promptTokenCount" : 14519,
+    "promptTokensPerSecond" : 510.80659053583224,
+    "tokensPerSecond" : 12.756424184135666
+  },
+  "output" : "It seems like a repetitive pattern in the development of large language models have accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has",
+  "outputCharacters" : 437,
+  "promptCharacters" : 99704,
+  "promptTokens" : 14519
+}
+
+{
+  "elapsedSeconds" : 35.86695396900177,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 5.652971029281616,
+    "generationTokenCount" : 64,
+    "promptTime" : 28.430052995681763,
+    "promptTokenCount" : 14519,
+    "promptTokensPerSecond" : 510.6919780348383,
+    "tokensPerSecond" : 11.321480274441308
+  },
+  "output" : "It seems like a repetitive pattern in the development of large language models have accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has",
+  "outputCharacters" : 437,
+  "promptCharacters" : 99704,
+  "promptTokens" : 14519
+}
+
+{
+  "elapsedSeconds" : 35.513136982917786,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 5.172338962554932,
+    "generationTokenCount" : 64,
+    "promptTime" : 28.331933975219727,
+    "promptTokenCount" : 14519,
+    "promptTokensPerSecond" : 512.4606040907378,
+    "tokensPerSecond" : 12.373512343898382
+  },
+  "output" : "It seems like a repetitive pattern in the development of large language models have accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has",
+  "outputCharacters" : 437,
+  "promptCharacters" : 99704,
+  "promptTokens" : 14519
+}
+
+{
+  "elapsedSeconds" : 36.653197050094604,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 5.123868942260742,
+    "generationTokenCount" : 64,
+    "promptTime" : 29.676436066627502,
+    "promptTokenCount" : 14519,
+    "promptTokensPerSecond" : 489.2433837878287,
+    "tokensPerSecond" : 12.490561472433379
+  },
+  "output" : "It seems like a repetitive pattern in the development of large language models have accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has",
+  "outputCharacters" : 437,
+  "promptCharacters" : 99704,
+  "promptTokens" : 14519
+}
+
+{
+  "elapsedSeconds" : 35.85261595249176,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 5.498448014259338,
+    "generationTokenCount" : 64,
+    "promptTime" : 28.48450005054474,
+    "promptTokenCount" : 14519,
+    "promptTokensPerSecond" : 509.71580944852633,
+    "tokensPerSecond" : 11.639648103251375
+  },
+  "output" : "It seems like a repetitive pattern in the development of large language models have accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has accelerated rapidly in recent years, with new architectures emerging that challenge conventional wisdom about attention mechanisms. The development of large language models has",
+  "outputCharacters" : 437,
+  "promptCharacters" : 99704,
+  "promptTokens" : 14519
+}

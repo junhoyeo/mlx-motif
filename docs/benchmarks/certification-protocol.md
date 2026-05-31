@@ -23,6 +23,23 @@ Swift/Python parity.
 
 ---
 
+
+## Status of the current checked-in certified sweep
+
+`docs/benchmarks/benchmark-sweep-certified-20260531T184554Z.json` is the current
+**certified evidence run**. It satisfies the minimums below:
+
+- `n_runs=5`
+- `warmup_runs=1`
+- `max_tokens=64`
+- prompt lengths `(500, 3000, 16000)`
+- backends `python` and `swift`
+- models `motif-2.6b-q4` and `motif-12.7b-q4`
+
+It should be used as the current benchmark evidence source, while
+`perf-parity-tracking.md` remains the source of truth for whether that evidence
+closes parity. It does **not** close Swift/Python performance parity.
+
 ## Certification minimums
 
 | Parameter | Minimum | Rationale |

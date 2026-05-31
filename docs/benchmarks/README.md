@@ -39,6 +39,24 @@ MOTIFKIT_ENABLE_MLX=1 uv run python scripts/bench_sweep.py \
   --markdown artifacts/benchmarks/full-sweep.md
 ```
 
+
+## Checked-in certified sweep
+
+The current certified sweep evidence is
+[`benchmark-sweep-certified-20260531T184554Z.md`](benchmark-sweep-certified-20260531T184554Z.md)
+(raw JSON and raw logs alongside it). It covers 2.6B q4 and 12.7B q4 on the
+local Apple M1 Max at p500/p3000/p16000 with `n_runs=5`, `warmup_runs=1`,
+`max_tokens=64`, `q4_bridge`, and `q4_direct`. All 24 cells passed the
+certification matrix.
+
+This certified run is evidence, not a parity claim: clean 2.6B q4-direct
+Swift-vs-Python speedups remain below 1.0x at every prompt length
+(p500: 0.183x;
+p3000: 0.311x;
+p16000: 0.781x). The
+12.7B rows still have prompt-token mismatches, so their ratios remain flagged
+as non-clean comparisons.
+
 ## Checked-in target sweep
 
 The current target sweep evidence is

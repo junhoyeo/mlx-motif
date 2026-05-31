@@ -249,6 +249,9 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 _TARGET_SWEEP_PATH = (
     _REPO_ROOT / "docs" / "benchmarks" / "benchmark-sweep-target-20260527T103000Z.json"
 )
+_CERTIFIED_SWEEP_PATH = (
+    _REPO_ROOT / "docs" / "benchmarks" / "benchmark-sweep-certified-20260531T184554Z.json"
+)
 
 
 @pytest.mark.skipif(
@@ -273,3 +276,18 @@ def test_existing_target_sweep_is_not_certified() -> None:
     assert "n_runs" in violation_text, f"Expected n_runs violation. Got: {violations}"
     assert "warmup_runs" in violation_text, f"Expected warmup_runs violation. Got: {violations}"
     assert "max_tokens" in violation_text, f"Expected max_tokens violation. Got: {violations}"
+
+
+@pytest.mark.skipif(
+    not _CERTIFIED_SWEEP_PATH.exists(),
+    reason="certified sweep JSON not present in working tree",
+)
+def test_checked_in_certified_sweep_passes_certification() -> None:
+    """The checked-in certified sweep must satisfy the certification minimums."""
+    sweep = json.loads(_CERTIFIED_SWEEP_PATH.read_text(encoding="utf-8"))
+    assert sweep["config"].get("dry_run") is False
+    assert validate_certification(sweep) == []
+    failed_cells = [
+        cell["cell_id"] for cell in sweep.get("cells", []) if cell.get("status") != "pass"
+    ]
+    assert failed_cells == []

@@ -1,0 +1,101 @@
+{
+  "elapsedSeconds" : 138.6473399400711,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 14.786067962646484,
+    "generationTokenCount" : 64,
+    "promptTime" : 122.00000703334808,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 119.07376362715388,
+    "tokensPerSecond" : 4.3283988793830055
+  },
+  "output" : "Okay, the user has shared a very long, repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this or if it's some kind of spam. The text repeats the same sentence over and over with minor variations.\n\nFirst, I need to understand what the user is really asking.",
+  "outputCharacters" : 322,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}
+
+{
+  "elapsedSeconds" : 125.54302608966827,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.180469036102295,
+    "generationTokenCount" : 64,
+    "promptTime" : 114.48064005374908,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 126.89481813850377,
+    "tokensPerSecond" : 6.97132137239604
+  },
+  "output" : "Okay, the user has shared a very long, repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this or if it's some kind of spam. The text repeats the same sentence over and over with minor variations.\n\nFirst, I need to understand what the user is really asking.",
+  "outputCharacters" : 322,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}
+
+{
+  "elapsedSeconds" : 121.22654402256012,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.206939935684204,
+    "generationTokenCount" : 64,
+    "promptTime" : 110.03645813465118,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 132.01988001307137,
+    "tokensPerSecond" : 6.951278106197823
+  },
+  "output" : "Okay, the user has shared a very long, repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this or if it's some kind of spam. The text repeats the same sentence over and over with minor variations.\n\nFirst, I need to understand what the user is really asking.",
+  "outputCharacters" : 322,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}
+
+{
+  "elapsedSeconds" : 121.21115696430206,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.113338947296143,
+    "generationTokenCount" : 64,
+    "promptTime" : 110.25279903411865,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 131.7608271832128,
+    "tokensPerSecond" : 7.022673069675337
+  },
+  "output" : "Okay, the user has shared a very long, repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this or if it's some kind of spam. The text repeats the same sentence over and over with minor variations.\n\nFirst, I need to understand what the user is really asking.",
+  "outputCharacters" : 322,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}
+
+{
+  "elapsedSeconds" : 126.98089802265167,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.239858031272888,
+    "generationTokenCount" : 64,
+    "promptTime" : 115.83770596981049,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 125.40821555794633,
+    "tokensPerSecond" : 6.926513349381335
+  },
+  "output" : "Okay, the user has shared a very long, repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this or if it's some kind of spam. The text repeats the same sentence over and over with minor variations.\n\nFirst, I need to understand what the user is really asking.",
+  "outputCharacters" : 322,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}
+
+{
+  "elapsedSeconds" : 140.8712500333786,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.186269998550415,
+    "generationTokenCount" : 64,
+    "promptTime" : 129.8074530363083,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 111.91190998822441,
+    "tokensPerSecond" : 6.966919109725617
+  },
+  "output" : "Okay, the user has shared a very long, repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this or if it's some kind of spam. The text repeats the same sentence over and over with minor variations.\n\nFirst, I need to understand what the user is really asking.",
+  "outputCharacters" : 322,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}

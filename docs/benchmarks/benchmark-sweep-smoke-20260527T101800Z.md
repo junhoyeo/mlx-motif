@@ -24,5 +24,7 @@ Host: `Apple M1 Max` / `macOS-26.2-arm64-arm-64bit`
 
 ## Notes
 
+- This smoke report used `max_tokens=4`, `n_runs=1`, `warmup_runs=0` — it exercises the sweep plumbing on a real checkpoint and is NOT a valid throughput measurement.
 - Normal PR CI should validate this schema and dry-run plumbing only; real model sweeps require local or self-hosted Apple Silicon with cached checkpoints.
 - Treat performance parity as unproven unless this report shows Swift candidate cells meeting the Python baseline for the exact model, host, branch, and thermal conditions.
+- The `swift_vs_python` ratios above mix measurement regions: the Python cell reports steady-state decode tok/s (first decode step discarded as warm-up) while the Swift cell's tok/s covers every generated token including the compile-heavy first step. At `max_tokens=4` the Swift first-step/compile cost dominates, so these ratios understate Swift steady-state throughput and must not be read as a steady-state speedup.

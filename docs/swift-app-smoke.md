@@ -18,6 +18,11 @@ MOTIFKIT_ENABLE_MLX=1 scripts/smoke_swift_chat_app.py \
   --output docs/benchmarks/swift-app-smoke-local.json
 ```
 
+The smoke script now starts the real Swift `MotifNativeServe` process, waits for
+`GET /v1/models`, sends a non-streaming `/v1/chat/completions` request, and then
+terminates the server. The latest checked-in native-server smoke evidence is
+[`benchmarks/swift-app-smoke-native-server-20260527T102500Z.json`](benchmarks/swift-app-smoke-native-server-20260527T102500Z.json).
+
 ## Manual UI pass
 
 1. Launch:

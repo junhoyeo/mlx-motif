@@ -32,7 +32,7 @@ struct MotifNativeServeCommand {
         let server = NativeOpenAIServer(runtime: runtime, host: host, port: port, modelID: modelID, defaultThinkMode: thinkMode)
         try server.start()
         FileHandle.standardError.write(Data("Serving \(modelID) on http://\(host):\(port)/v1\n".utf8))
-        dispatchMain()
+        await server.waitUntilCancelled()
     }
 
     private static func value(after flag: String, in arguments: [String]) -> String? {
@@ -67,6 +67,45 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         }
         listener.start(queue: .global())
         self.listener = listener
+    }
+
+    func waitUntilCancelled() async {
+        // Bridge both SIGTERM and Swift Task cancellation into a single
+        // continuation so cleanup (listener?.cancel()) is always reached.
+        //
+        // Bug fixed: the original `try await Task.sleep` loop would throw
+        // CancellationError on structured-concurrency cancellation, which
+        // propagated out of the `throws` function *before* reaching
+        // `listener?.cancel()`.  SIGTERM also never set Task.isCancelled, so
+        // the listener was never cancelled on normal external termination.
+        final class Box: @unchecked Sendable {
+            var continuation: CheckedContinuation<Void, Never>?
+            var resumed = false
+            func resume() {
+                guard !resumed else { return }
+                resumed = true
+                continuation?.resume()
+            }
+        }
+        let box = Box()
+        // Suppress the default SIGTERM disposition so our handler runs instead.
+        signal(SIGTERM, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+        src.setEventHandler { box.resume() }
+        src.resume()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                box.continuation = c
+                // If the Task was already cancelled before we stored the
+                // continuation, resume immediately.
+                if Task.isCancelled { box.resume() }
+            }
+        } onCancel: {
+            box.resume()
+        }
+        src.cancel()
+        signal(SIGTERM, SIG_DFL)
+        listener?.cancel()
     }
 
     private func receive(connection: NWConnection, accumulated: Data) {

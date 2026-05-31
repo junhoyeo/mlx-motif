@@ -3,25 +3,8 @@
 import PackageDescription
 
 var dependencies: [Package.Dependency] = []
-var targets: [Target] = [
-    .target(
-        name: "MotifKit",
-        path: "Sources/MotifKit"
-    ),
-    .executableTarget(
-        name: "MotifChatApp",
-        dependencies: ["MotifKit"],
-        path: "Sources/MotifChatApp"
-    ),
-    .testTarget(
-        name: "MotifKitTests",
-        dependencies: ["MotifKit"],
-        path: "Tests/MotifKitTests",
-        resources: [
-            .process("Fixtures"),
-        ]
-    ),
-]
+var motifChatAppDependencies: [Target.Dependency] = ["MotifKit"]
+var motifChatAppSwiftSettings: [SwiftSetting] = []
 
 // Keep the default package lightweight and buildable on the current repo
 // toolchain (Xcode 16.2 / Swift 6.0.3). Enable this overlay when actively
@@ -38,6 +21,32 @@ if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {
         .package(url: "https://github.com/ml-explore/mlx-swift-lm", exact: "2.30.6"),
         .package(url: "https://github.com/huggingface/swift-transformers", .upToNextMinor(from: "1.1.6")),
     ])
+    motifChatAppDependencies.append("MotifKitMLX")
+    motifChatAppSwiftSettings.append(.define("MOTIFKIT_ENABLE_MLX"))
+}
+
+var targets: [Target] = [
+    .target(
+        name: "MotifKit",
+        path: "Sources/MotifKit"
+    ),
+    .executableTarget(
+        name: "MotifChatApp",
+        dependencies: motifChatAppDependencies,
+        path: "Sources/MotifChatApp",
+        swiftSettings: motifChatAppSwiftSettings
+    ),
+    .testTarget(
+        name: "MotifKitTests",
+        dependencies: ["MotifKit"],
+        path: "Tests/MotifKitTests",
+        resources: [
+            .process("Fixtures"),
+        ]
+    ),
+]
+
+if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {
     targets.append(contentsOf: [
         .target(
             name: "MotifKitMLX",

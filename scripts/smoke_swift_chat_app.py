@@ -17,7 +17,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
@@ -55,12 +54,6 @@ def run(
         "stdout": proc.stdout,
         "stderr": proc.stderr,
     }
-
-
-def open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def request_json(
@@ -213,16 +206,20 @@ def main() -> int:
     )
     time.sleep(2)
     stdout, stderr = terminate_process_group(cancel_proc)
+    terminated = cancel_proc.returncode not in (0, None)
     report["checks"]["cancel_generation"] = {
         "returncode": cancel_proc.returncode,
         "stdout": stdout,
         "stderr": stderr,
-        "terminated": cancel_proc.returncode not in (0, None),
+        "terminated": terminated,
     }
+    if not terminated:
+        print(json.dumps(report, indent=2))
+        return 1
 
-    port = open_port()
     print("smoke: OpenAI-compatible server fallback", file=sys.stderr, flush=True)
-    server = ThreadingHTTPServer(("127.0.0.1", port), FakeOpenAIServer)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), FakeOpenAIServer)
+    port = server.server_address[1]
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     try:

@@ -26,7 +26,6 @@ import time
 
 import mlx.core as mx
 
-
 SEED_TEXT = (
     "The development of large language models has accelerated rapidly in recent years, "
     "with new architectures emerging that challenge conventional wisdom about attention mechanisms. "
@@ -80,6 +79,7 @@ def main():
 
     print(f"[bench] {label} — loading {args.model}", file=sys.stderr, flush=True)
     from mlx_motif import load
+
     model, tokenizer = load(args.model)
     print("[bench] model loaded", file=sys.stderr, flush=True)
 

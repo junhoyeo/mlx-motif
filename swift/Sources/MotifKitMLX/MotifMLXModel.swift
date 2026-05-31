@@ -168,9 +168,9 @@ public final class MotifMLXAttentionScaffold: Module {
         self._lambdaK2.wrappedValue = MLXArray.zeros([layout.headDim], dtype: .float32)
     }
 
-    /// Reference Motif attention path in MLX Swift. This intentionally starts
-    /// with pure MLX Swift operations so checkpoint loading/generation can be
-    /// validated before custom Metal kernels are enabled in the app path.
+    /// Motif attention path in MLX Swift. Decode-time grouped attention now
+    /// prefers the direct custom Metal kernels, while reference paths remain
+    /// available through `MLX_MOTIF_DISABLE_KERNELS=1`.
     public func callAsFunction(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
@@ -248,10 +248,14 @@ public final class MotifMLXAttentionScaffold: Module {
                 slices = MotifGroupedProjectionSlices(
                     qOrigin: prepared.qOrigin,
                     qNoise: prepared.qNoise,
-                    kOrigin: grouped.dequantize(packed.kOrigin, dtype: x.dtype),
-                    kNoise: grouped.dequantize(packed.kNoise, dtype: x.dtype),
-                    value1: grouped.dequantize(packed.value1, dtype: x.dtype),
-                    value2: grouped.dequantize(packed.value2, dtype: x.dtype)
+                    // In the optimized q4 route the cached K/V slabs stay packed
+                    // and are consumed directly by `MotifSDPADualVQ4.apply`.
+                    // These per-token tensors are not used by that branch; keeping
+                    // them here avoids materializing a full dequantized cache.
+                    kOrigin: kOrigin,
+                    kNoise: kNoise,
+                    value1: prepared.value1,
+                    value2: prepared.value2
                 )
             } else {
                 let cached = grouped.updateAndFetch4(
@@ -304,9 +308,11 @@ public final class MotifMLXAttentionScaffold: Module {
         }
 
         let lambda = lambdaFull(dtype: x.dtype).reshaped([1])
+        let kernelExecutionMode: MotifMetalKernelExecutionMode =
+            runtimeFeatures.disableCustomKernels ? .referenceOnly : .metalPreferred
         let out: MLXArray
         if attentionPath == .quantizedSDPA, let quantizedSlices, let grouped = cache as? MotifGroupedQuantizedKVCache {
-            let attnOrigin = MotifSDPADualVQ4.reference(
+            let attnOrigin = MotifSDPADualVQ4.apply(
                 queries: slices.qOrigin,
                 quantizedKeys: quantizedSlices.kOrigin,
                 quantizedValue1: quantizedSlices.value1,
@@ -315,9 +321,10 @@ public final class MotifMLXAttentionScaffold: Module {
                 groupSize: grouped.groupSize,
                 bits: grouped.bits,
                 mode: grouped.mode,
-                dtype: x.dtype
+                dtype: x.dtype,
+                executionMode: kernelExecutionMode
             )
-            let attnNoise = MotifSDPADualVQ4.reference(
+            let attnNoise = MotifSDPADualVQ4.apply(
                 queries: slices.qNoise,
                 quantizedKeys: quantizedSlices.kNoise,
                 quantizedValue1: quantizedSlices.value1,
@@ -326,7 +333,8 @@ public final class MotifMLXAttentionScaffold: Module {
                 groupSize: grouped.groupSize,
                 bits: grouped.bits,
                 mode: grouped.mode,
-                dtype: x.dtype
+                dtype: x.dtype,
+                executionMode: kernelExecutionMode
             )
             out = MotifGDAPostSplit.apply(
                 attnOrigin: attnOrigin,
@@ -335,7 +343,8 @@ public final class MotifMLXAttentionScaffold: Module {
                 lambda: lambda,
                 lambdaInit: Double(lambdaInit),
                 groupedRatio: layout.groupedRatio,
-                eps: Float(configuration.attnRMSNormEps)
+                eps: Float(configuration.attnRMSNormEps),
+                executionMode: kernelExecutionMode
             )
         } else if attentionPath == .dualV {
             let attnOrigin = MotifSDPADualV.apply(
@@ -344,7 +353,8 @@ public final class MotifMLXAttentionScaffold: Module {
                 value1: repeatHeadsIfNeeded(slices.value1, count: layout.groupedRatio),
                 value2: repeatHeadsIfNeeded(slices.value2, count: layout.groupedRatio),
                 scale: scale,
-                mask: mask
+                mask: mask,
+                executionMode: kernelExecutionMode
             )
             let attnNoise = MotifSDPADualV.apply(
                 queries: slices.qNoise,
@@ -352,7 +362,8 @@ public final class MotifMLXAttentionScaffold: Module {
                 value1: slices.value1,
                 value2: slices.value2,
                 scale: scale,
-                mask: mask
+                mask: mask,
+                executionMode: kernelExecutionMode
             )
             out = MotifGDAPostSplit.apply(
                 attnOrigin: attnOrigin,
@@ -361,7 +372,8 @@ public final class MotifMLXAttentionScaffold: Module {
                 lambda: lambda,
                 lambdaInit: Double(lambdaInit),
                 groupedRatio: layout.groupedRatio,
-                eps: Float(configuration.attnRMSNormEps)
+                eps: Float(configuration.attnRMSNormEps),
+                executionMode: kernelExecutionMode
             )
         } else {
             out = MotifGroupedDifferentialAttentionReference.apply(

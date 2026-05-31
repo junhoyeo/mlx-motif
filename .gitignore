@@ -19,3 +19,6 @@ dist/
 # SwiftPM
 **/.build/
 swift/Package.resolved
+
+# Local benchmark/metallib build outputs
+.build-motif/

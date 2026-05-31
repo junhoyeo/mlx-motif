@@ -19,6 +19,7 @@ deterministic and not dependent on a network download.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import sys
 import time
@@ -86,6 +87,37 @@ def perplexity(
     }
 
 
+def logit_snapshot(
+    model: nn.Module, tokenizer, text: str, max_tokens: int = 512, top_k: int = 10
+) -> dict:
+    """Return a deterministic final-position logit checksum/top-k snapshot."""
+    if hasattr(tokenizer, "encode"):
+        ids = tokenizer.encode(text)
+    else:
+        ids = tokenizer(text)["input_ids"]
+    if isinstance(ids, mx.array):
+        ids = ids.tolist()
+    if max_tokens > 0:
+        ids = ids[:max_tokens]
+    if not ids:
+        raise ValueError("Need at least 1 token to compute logits")
+
+    t0 = time.perf_counter()
+    logits = model(mx.array([ids])).astype(mx.float32)
+    last = logits[0, len(ids) - 1]
+    mx.eval(last)
+    values = last.tolist()
+    top = sorted(enumerate(values), key=lambda item: item[1], reverse=True)[: max(1, top_k)]
+    elapsed = time.perf_counter() - t0
+    return {
+        "prompt_tokens": len(ids),
+        "vocabulary_size": len(values),
+        "checksum": float(sum(values)),
+        "top_k": [{"token": int(token), "logit": float(logit)} for token, logit in top],
+        "elapsed_s": elapsed,
+    }
+
+
 # 4 paragraphs of encyclopedic prose (~2k tokens with most tokenizers).
 _DEFAULT_TEXT = """
 The differential transformer is a class of attention mechanism introduced in 2024 that
@@ -135,11 +167,16 @@ searching the recent context for matching n-gram continuations.
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", required=True, help="Path to converted MLX checkpoint")
-    p.add_argument("--text-file", default=None,
-                   help="Optional UTF-8 text file (defaults to bundled snippet)")
+    p.add_argument(
+        "--text-file", default=None, help="Optional UTF-8 text file (defaults to bundled snippet)"
+    )
     p.add_argument("--chunk", type=int, default=512)
-    p.add_argument("--max-tokens", type=int, default=2048,
-                   help="Cap on tokens evaluated; 0 = no cap")
+    p.add_argument(
+        "--max-tokens", type=int, default=2048, help="Cap on tokens evaluated; 0 = no cap"
+    )
+    p.add_argument("--mode", choices=["perplexity", "logits"], default="perplexity")
+    p.add_argument("--top-k", type=int, default=10)
+    p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     p.add_argument("--quiet", action="store_true")
     args = p.parse_args()
 
@@ -152,16 +189,37 @@ def main():
         print(f"Loading model from {args.model} …", file=sys.stderr)
     model, tokenizer = load(args.model)
 
-    if not args.quiet:
-        print(f"Tokenizing + evaluating chunks of {args.chunk} tokens …", file=sys.stderr)
-    res = perplexity(model, tokenizer, text, chunk_size=args.chunk, max_tokens=args.max_tokens)
+    if args.mode == "logits":
+        if not args.quiet:
+            print(
+                f"Tokenizing + evaluating final-position top-{args.top_k} logits …", file=sys.stderr
+            )
+        res = logit_snapshot(model, tokenizer, text, max_tokens=args.max_tokens, top_k=args.top_k)
+    else:
+        if not args.quiet:
+            print(f"Tokenizing + evaluating chunks of {args.chunk} tokens …", file=sys.stderr)
+        res = perplexity(model, tokenizer, text, chunk_size=args.chunk, max_tokens=args.max_tokens)
 
-    print(f"perplexity:   {res['ppl']:.3f}")
-    print(f"nll/token:    {res['nll_per_token']:.4f}")
-    print(f"tokens:       {res['tokens']}")
-    print(f"chunks:       {res['chunks']}")
-    print(f"elapsed:      {res['elapsed_s']:.2f}s")
-    print(f"tps:          {res['tps']:.1f}")
+    if args.json:
+        print(
+            json.dumps(
+                {"mode": args.mode, "model": args.model, "result": res}, indent=2, sort_keys=True
+            )
+        )
+    elif args.mode == "logits":
+        print(f"prompt tokens: {res['prompt_tokens']}")
+        print(f"vocab size:    {res['vocabulary_size']}")
+        print(f"checksum:      {res['checksum']:.6f}")
+        print("top_k:")
+        for item in res["top_k"]:
+            print(f"  {item['token']}: {item['logit']:.6f}")
+    else:
+        print(f"perplexity:   {res['ppl']:.3f}")
+        print(f"nll/token:    {res['nll_per_token']:.4f}")
+        print(f"tokens:       {res['tokens']}")
+        print(f"chunks:       {res['chunks']}")
+        print(f"elapsed:      {res['elapsed_s']:.2f}s")
+        print(f"tps:          {res['tps']:.1f}")
     return 0
 
 

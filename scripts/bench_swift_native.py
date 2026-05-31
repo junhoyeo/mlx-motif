@@ -21,12 +21,19 @@ def run(cmd: list[str], cwd: Path, env: dict[str, str] | None = None) -> dict:
     start = time.perf_counter()
     proc = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, env=env)
     elapsed = time.perf_counter() - start
+    parsed = None
+    if proc.stdout.strip():
+        try:
+            parsed = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            parsed = None
     return {
         "command": cmd,
         "returncode": proc.returncode,
         "elapsed_seconds": elapsed,
         "stdout": proc.stdout,
         "stderr": proc.stderr,
+        "json": parsed,
     }
 
 

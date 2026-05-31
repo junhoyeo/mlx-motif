@@ -4,18 +4,24 @@ import Foundation
 import MLX
 
 public enum MotifMetalKernelExecutionMode: Sendable {
-    /// Keep the native port on pure MLX Swift reference ops. This is the safe
-    /// default until each kernel has golden-fixture parity with Python.
+    /// Keep the native port on pure MLX Swift reference ops. This remains the
+    /// debugging/escape-hatch path and is selected by `MLX_MOTIF_DISABLE_KERNELS=1`.
     case referenceOnly
 
-    /// Allow the wrapped MLX custom Metal kernel for kernels whose Swift wrapper
-    /// has parity coverage. Callers should opt in only from benchmark/parity runs.
+    /// Prefer the direct Swift custom Metal kernel and fall back only for shapes
+    /// outside a kernel's decode contract. This is the production default.
+    case metalPreferred
+
+    /// Backwards-compatible spelling for older parity harnesses. It now has the
+    /// same behavior as `.metalPreferred`; the old env opt-in is intentionally no
+    /// longer required because this PR makes custom kernels default-on.
     case experimentalMetal
 }
 
 public enum MotifMetalKernelStatus: String, Sendable {
     case referenceReady
     case wrapperScaffolded
+    case metalReady
     case parityPending
 }
 
@@ -112,7 +118,7 @@ public struct MotifMetalKernelBenchmarkCase: Sendable, Equatable {
         warmupIterations: Int = 3,
         iterations: Int = 20,
         requiresRuntime: Bool = true,
-        requiresExperimentalMetal: Bool = true
+        requiresExperimentalMetal: Bool = false
     ) {
         self.name = name
         self.kernel = kernel
@@ -170,20 +176,22 @@ public struct MotifMetalKernelBenchmarkResult: Sendable, Equatable {
 }
 
 public enum MotifMetalKernels {
+    public static let disableEnvironmentVariable = "MLX_MOTIF_DISABLE_KERNELS"
+    public static let legacyDisableEnvironmentVariable = "MOTIFKIT_DISABLE_CUSTOM_METAL_KERNELS"
     public static let experimentalOptInEnvironmentVariable =
         "MOTIFKIT_ENABLE_EXPERIMENTAL_METAL_KERNELS"
 
     /// Swift-side manifest that mirrors `src/mlx_motif/kernels`. All entries
-    /// stay disabled by default so the app cannot silently route through an
-    /// unverified native Metal implementation.
+    /// are enabled by default in the hard-parity branch; callers can force the
+    /// reference path with `MLX_MOTIF_DISABLE_KERNELS=1`.
     public static let descriptors: [MotifMetalKernelDescriptor] = [
         MotifMetalKernelDescriptor(
             name: .polynorm,
             pythonSymbol: "polynorm",
             pythonSource: "src/mlx_motif/kernels/mlp.py",
             swiftWrapper: "MotifPolynorm.apply",
-            status: .wrapperScaffolded,
-            defaultEnabled: false,
+            status: .metalReady,
+            defaultEnabled: true,
             parityFixture: "polynorm small-row + decode hidden-size golden tensors",
             benchmarkShape: "(..., D) with D in {128, 4096}"
         ),
@@ -192,8 +200,8 @@ public enum MotifMetalKernels {
             pythonSymbol: "gda_post",
             pythonSource: "src/mlx_motif/kernels/gda.py",
             swiftWrapper: "MotifGDAPost.apply",
-            status: .referenceReady,
-            defaultEnabled: false,
+            status: .metalReady,
+            defaultEnabled: true,
             parityFixture: "legacy grouped differential attention postprocess fixture",
             benchmarkShape: "B=1, q_origin=32, q_groups=8, S in {1, 32}, channels=256"
         ),
@@ -202,8 +210,8 @@ public enum MotifMetalKernels {
             pythonSymbol: "gda_post_split",
             pythonSource: "src/mlx_motif/kernels/gda.py",
             swiftWrapper: "MotifGDAPostSplit.apply",
-            status: .referenceReady,
-            defaultEnabled: false,
+            status: .metalReady,
+            defaultEnabled: true,
             parityFixture: "attn_o/attn_n/subln/lambda fixture from Python gda_post_split_reference",
             benchmarkShape: "B=1, q_origin=32, q_groups=8, S in {1, 32}, channels=256"
         ),
@@ -212,8 +220,8 @@ public enum MotifMetalKernels {
             pythonSymbol: "sdpa_dual_v",
             pythonSource: "src/mlx_motif/kernels/attention.py",
             swiftWrapper: "MotifSDPADualV.apply",
-            status: .referenceReady,
-            defaultEnabled: false,
+            status: .metalReady,
+            defaultEnabled: true,
             parityFixture: "q/k/v1/v2 decode fixture from Python sdpa_dual_v_reference",
             benchmarkShape: "B=1, Hq=40, Hkv=8, KV in {256, 1024}, D=128"
         ),
@@ -221,21 +229,42 @@ public enum MotifMetalKernels {
             name: .sdpaDualVQ4,
             pythonSymbol: "sdpa_dual_v_q4",
             pythonSource: "src/mlx_motif/kernels/attention.py",
-            swiftWrapper: "MotifSDPADualVQ4.reference",
-            status: .wrapperScaffolded,
-            defaultEnabled: false,
+            swiftWrapper: "MotifSDPADualVQ4.apply",
+            status: .metalReady,
+            defaultEnabled: true,
             parityFixture: "packed uint32/scales/biases fixture shared with Python sdpa_dual_v_q4_reference",
             benchmarkShape: "B=1, Hq=40, Hkv=8, KV in {256, 1024}, D=128, bits in {4, 8}"
         ),
     ]
+
+    public static var customMetalDisabled: Bool {
+        isTruthy(ProcessInfo.processInfo.environment[disableEnvironmentVariable])
+            || isTruthy(ProcessInfo.processInfo.environment[legacyDisableEnvironmentVariable])
+    }
 
     public static var experimentalMetalRequested: Bool {
         let value = ProcessInfo.processInfo.environment[experimentalOptInEnvironmentVariable] ?? ""
         return ["1", "true", "TRUE", "yes", "YES"].contains(value)
     }
 
+    public static func shouldUseMetal(executionMode: MotifMetalKernelExecutionMode) -> Bool {
+        switch executionMode {
+        case .referenceOnly:
+            return false
+        case .metalPreferred, .experimentalMetal:
+            return !customMetalDisabled
+        }
+    }
+
     public static func descriptor(for name: MotifMetalKernelName) -> MotifMetalKernelDescriptor {
         descriptors.first { $0.name == name }!
+    }
+
+    private static func isTruthy(_ value: String?) -> Bool {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+            return false
+        }
+        return ["1", "true", "yes", "on"].contains(value)
     }
 }
 
@@ -261,7 +290,7 @@ public enum MotifMetalKernelHarness {
             dtype: "float32",
             relativeTolerance: 1e-5,
             absoluteTolerance: 1e-5,
-            requiresExperimentalMetal: true
+            requiresExperimentalMetal: false
         ),
     ]
 
@@ -271,14 +300,14 @@ public enum MotifMetalKernelHarness {
             kernel: .polynorm,
             shape: [1, 1, 4_096],
             baseline: "MotifPolynorm.reference",
-            candidate: "MotifPolynorm.apply(.experimentalMetal)"
+            candidate: "MotifPolynorm.apply(.metalPreferred)"
         ),
         MotifMetalKernelBenchmarkCase(
             name: "polynorm_prefill_128x4096",
             kernel: .polynorm,
             shape: [1, 128, 4_096],
             baseline: "MotifPolynorm.reference",
-            candidate: "MotifPolynorm.apply(.experimentalMetal)",
+            candidate: "MotifPolynorm.apply(.metalPreferred)",
             warmupIterations: 2,
             iterations: 10
         ),
@@ -347,7 +376,7 @@ public enum MotifMetalKernelHarness {
         weight: MLXArray = MLXArray([Float(0.4), 0.3, 0.3], [3]),
         bias: MLXArray = MLXArray([Float(0.05)], [1]),
         eps: Float = 1e-6,
-        executionMode: MotifMetalKernelExecutionMode = .experimentalMetal
+        executionMode: MotifMetalKernelExecutionMode = .metalPreferred
     ) -> MotifMetalKernelBenchmarkResult {
         precondition(benchmarkCase.kernel == .polynorm, "Only PolyNorm benchmark cases are implemented")
         precondition(benchmarkCase.iterations > 0, "Benchmark iterations must be positive")
@@ -380,6 +409,13 @@ public enum MotifMetalKernelHarness {
 }
 
 public enum MotifSDPADualV {
+    private static let metalKernel = MLXFast.metalKernel(
+        name: "motif_sdpa_dual_v",
+        inputNames: ["q", "k", "v1", "v2", "scale_in"],
+        outputNames: ["y"],
+        source: motifSDPADualVMetalSource
+    )
+
     public static func reference(
         queries: MLXArray,
         keys: MLXArray,
@@ -423,16 +459,76 @@ public enum MotifSDPADualV {
         value2: MLXArray,
         scale: Float,
         mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
-        executionMode _: MotifMetalKernelExecutionMode = .referenceOnly
+        executionMode: MotifMetalKernelExecutionMode = .metalPreferred
     ) -> MLXArray {
-        // The Python Metal kernel is decode-only and disabled in Swift until
-        // golden fixtures prove numerical parity. This callable wrapper gives
-        // the model/server/bench paths the same routing surface today.
-        reference(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale, mask: mask)
+        guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode),
+              queries.dim(2) == 1,
+              queries.dim(3) % 32 == 0,
+              keys.dim(1) > 0,
+              queries.dim(1) % keys.dim(1) == 0,
+              value1.shape == value2.shape
+        else {
+            return reference(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale, mask: mask)
+        }
+        return metal(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale)
+    }
+
+    private static func metal(
+        queries: MLXArray,
+        keys: MLXArray,
+        value1: MLXArray,
+        value2: MLXArray,
+        scale: Float
+    ) -> MLXArray {
+        let batch = queries.dim(0)
+        let queryHeads = queries.dim(1)
+        let keyHeads = keys.dim(1)
+        let kvSequenceLength = keys.dim(2)
+        let headDim = queries.dim(3)
+        guard keyHeads > 0, kvSequenceLength > 0 else {
+            return reference(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale)
+        }
+        let gqaFactor = queryHeads / keyHeads
+        let rows = batch * queryHeads
+        let threads = 32 * 32
+        let scaleArray = MLXArray([scale])
+        let outputs = metalKernel(
+            [queries, keys, value1, value2, scaleArray],
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("KV_SEQ", kvSequenceLength),
+                ("GQA_FACTOR", gqaFactor),
+            ],
+            grid: (rows * threads, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [[batch, queryHeads, 1, 2 * headDim]],
+            outputDTypes: [queries.dtype]
+        )
+        return outputs[0]
     }
 }
 
 public enum MotifSDPADualVQ4 {
+    private static let metalKernel = MLXFast.metalKernel(
+        name: "motif_sdpa_dual_v_q4",
+        inputNames: [
+            "q",
+            "k_data",
+            "k_scales",
+            "k_biases",
+            "v1_data",
+            "v1_scales",
+            "v1_biases",
+            "v2_data",
+            "v2_scales",
+            "v2_biases",
+            "scale_in",
+        ],
+        outputNames: ["y"],
+        source: motifSDPADualVQ4MetalSource
+    )
+
     public static func reference(
         queries: MLXArray,
         quantizedKeys: MotifQuantizedTuple,
@@ -473,9 +569,123 @@ public enum MotifSDPADualVQ4 {
         )
         return MotifSDPADualV.reference(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale)
     }
+
+    public static func apply(
+        queries: MLXArray,
+        quantizedKeys: MotifQuantizedTuple,
+        quantizedValue1: MotifQuantizedTuple,
+        quantizedValue2: MotifQuantizedTuple,
+        scale: Float,
+        groupSize: Int,
+        bits: Int,
+        mode: QuantizationMode = .affine,
+        dtype: DType? = nil,
+        executionMode: MotifMetalKernelExecutionMode = .metalPreferred
+    ) -> MLXArray {
+        guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode),
+              mode == .affine,
+              queries.dim(2) == 1,
+              queries.dim(3) % 32 == 0,
+              queries.dim(3) % groupSize == 0,
+              bits == 4 || bits == 8,
+              let keyBiases = quantizedKeys.biases,
+              let value1Biases = quantizedValue1.biases,
+              let value2Biases = quantizedValue2.biases,
+              quantizedKeys.data.dim(1) > 0,
+              queries.dim(1) % quantizedKeys.data.dim(1) == 0
+        else {
+            return reference(
+                queries: queries,
+                quantizedKeys: quantizedKeys,
+                quantizedValue1: quantizedValue1,
+                quantizedValue2: quantizedValue2,
+                scale: scale,
+                groupSize: groupSize,
+                bits: bits,
+                mode: mode,
+                dtype: dtype
+            )
+        }
+        return metal(
+            queries: queries,
+            quantizedKeys: (quantizedKeys.data, quantizedKeys.scales, keyBiases),
+            quantizedValue1: (quantizedValue1.data, quantizedValue1.scales, value1Biases),
+            quantizedValue2: (quantizedValue2.data, quantizedValue2.scales, value2Biases),
+            scale: scale,
+            groupSize: groupSize,
+            bits: bits
+        )
+    }
+
+    private static func metal(
+        queries: MLXArray,
+        quantizedKeys: (data: MLXArray, scales: MLXArray, biases: MLXArray),
+        quantizedValue1: (data: MLXArray, scales: MLXArray, biases: MLXArray),
+        quantizedValue2: (data: MLXArray, scales: MLXArray, biases: MLXArray),
+        scale: Float,
+        groupSize: Int,
+        bits: Int
+    ) -> MLXArray {
+        let batch = queries.dim(0)
+        let queryHeads = queries.dim(1)
+        let keyHeads = quantizedKeys.data.dim(1)
+        let kvSequenceLength = quantizedKeys.data.dim(2)
+        let headDim = queries.dim(3)
+        let elementsPerInt = 32 / bits
+        guard keyHeads > 0, kvSequenceLength > 0, quantizedKeys.data.dim(3) * elementsPerInt == headDim else {
+            return reference(
+                queries: queries,
+                quantizedKeys: (quantizedKeys.data, quantizedKeys.scales, quantizedKeys.biases),
+                quantizedValue1: (quantizedValue1.data, quantizedValue1.scales, quantizedValue1.biases),
+                quantizedValue2: (quantizedValue2.data, quantizedValue2.scales, quantizedValue2.biases),
+                scale: scale,
+                groupSize: groupSize,
+                bits: bits
+            )
+        }
+        let gqaFactor = queryHeads / keyHeads
+        let rows = batch * queryHeads
+        let threads = 32 * 32
+        let scaleArray = MLXArray([scale])
+        let outputs = metalKernel(
+            [
+                queries,
+                quantizedKeys.data,
+                quantizedKeys.scales,
+                quantizedKeys.biases,
+                quantizedValue1.data,
+                quantizedValue1.scales,
+                quantizedValue1.biases,
+                quantizedValue2.data,
+                quantizedValue2.scales,
+                quantizedValue2.biases,
+                scaleArray,
+            ],
+            template: [
+                ("T", queries.dtype),
+                ("D", headDim),
+                ("KV_SEQ", kvSequenceLength),
+                ("GQA_FACTOR", gqaFactor),
+                ("BITS", bits),
+                ("GROUP_SIZE", groupSize),
+            ],
+            grid: (rows * threads, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [[batch, queryHeads, 1, 2 * headDim]],
+            outputDTypes: [queries.dtype]
+        )
+        return outputs[0]
+    }
 }
 
 public enum MotifGDAPostSplit {
+    private static let metalKernel = MLXFast.metalKernel(
+        name: "motif_gda_post_split",
+        inputNames: ["attn_o", "attn_n", "subln_w", "lambda_full", "scale_in", "eps_in"],
+        outputNames: ["y"],
+        source: motifGDAPostSplitMetalSource
+    )
+
     public static func reference(
         attnOrigin: MLXArray,
         attnNoise: MLXArray,
@@ -503,9 +713,23 @@ public enum MotifGDAPostSplit {
         lambdaInit: Double,
         groupedRatio: Int,
         eps: Float = 1e-5,
-        executionMode _: MotifMetalKernelExecutionMode = .referenceOnly
+        executionMode: MotifMetalKernelExecutionMode = .metalPreferred
     ) -> MLXArray {
-        reference(
+        guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode),
+              groupedRatio > 0,
+              attnOrigin.dim(1) == attnNoise.dim(1) * groupedRatio
+        else {
+            return reference(
+                attnOrigin: attnOrigin,
+                attnNoise: attnNoise,
+                sublnWeight: sublnWeight,
+                lambda: lambda,
+                lambdaInit: lambdaInit,
+                groupedRatio: groupedRatio,
+                eps: eps
+            )
+        }
+        return metal(
             attnOrigin: attnOrigin,
             attnNoise: attnNoise,
             sublnWeight: sublnWeight,
@@ -515,9 +739,59 @@ public enum MotifGDAPostSplit {
             eps: eps
         )
     }
+
+    private static func metal(
+        attnOrigin: MLXArray,
+        attnNoise: MLXArray,
+        sublnWeight: MLXArray,
+        lambda: MLXArray,
+        lambdaInit: Double,
+        groupedRatio: Int,
+        eps: Float
+    ) -> MLXArray {
+        let batch = attnOrigin.dim(0)
+        let queryOrigin = attnOrigin.dim(1)
+        let sequenceLength = attnOrigin.dim(2)
+        let channels = attnOrigin.dim(3)
+        let queryGroups = attnNoise.dim(1)
+        let rows = batch * queryOrigin * sequenceLength
+        let threads = min(256, max(32, ((channels + 31) / 32) * 32))
+        let scaleArray = MLXArray([Float(1.0 - lambdaInit)])
+        let epsArray = MLXArray([eps])
+        let outputs = metalKernel(
+            [
+                attnOrigin,
+                attnNoise,
+                sublnWeight.asType(attnOrigin.dtype),
+                lambda.asType(.float32),
+                scaleArray,
+                epsArray,
+            ],
+            template: [
+                ("T", attnOrigin.dtype),
+                ("Q_ORIGIN", queryOrigin),
+                ("Q_GROUPS", queryGroups),
+                ("GR", groupedRatio),
+                ("S", sequenceLength),
+                ("CHANNELS", channels),
+            ],
+            grid: (rows * threads, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [[batch, queryOrigin, sequenceLength, channels]],
+            outputDTypes: [attnOrigin.dtype]
+        )
+        return outputs[0]
+    }
 }
 
 public enum MotifGDAPost {
+    private static let metalKernel = MLXFast.metalKernel(
+        name: "motif_gda_post",
+        inputNames: ["merged", "subln_w", "lambda_full", "scale_in", "eps_in"],
+        outputNames: ["y"],
+        source: motifGDAPostMetalSource
+    )
+
     public static func reference(
         merged: MLXArray,
         sublnWeight: MLXArray,
@@ -548,9 +822,24 @@ public enum MotifGDAPost {
         queryGroups: Int,
         groupedRatio: Int,
         eps: Float = 1e-5,
-        executionMode _: MotifMetalKernelExecutionMode = .referenceOnly
+        executionMode: MotifMetalKernelExecutionMode = .metalPreferred
     ) -> MLXArray {
-        reference(
+        guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode),
+              queryGroups > 0,
+              groupedRatio > 0,
+              merged.dim(1) == queryGroups * groupedRatio + queryGroups
+        else {
+            return reference(
+                merged: merged,
+                sublnWeight: sublnWeight,
+                lambda: lambda,
+                lambdaInit: lambdaInit,
+                queryGroups: queryGroups,
+                groupedRatio: groupedRatio,
+                eps: eps
+            )
+        }
+        return metal(
             merged: merged,
             sublnWeight: sublnWeight,
             lambda: lambda,
@@ -559,6 +848,47 @@ public enum MotifGDAPost {
             groupedRatio: groupedRatio,
             eps: eps
         )
+    }
+
+    private static func metal(
+        merged: MLXArray,
+        sublnWeight: MLXArray,
+        lambda: MLXArray,
+        lambdaInit: Double,
+        queryGroups: Int,
+        groupedRatio: Int,
+        eps: Float
+    ) -> MLXArray {
+        let batch = merged.dim(0)
+        let queryOrigin = queryGroups * groupedRatio
+        let sequenceLength = merged.dim(2)
+        let channels = merged.dim(3)
+        let rows = batch * queryOrigin * sequenceLength
+        let threads = min(256, max(32, ((channels + 31) / 32) * 32))
+        let scaleArray = MLXArray([Float(1.0 - lambdaInit)])
+        let epsArray = MLXArray([eps])
+        let outputs = metalKernel(
+            [
+                merged,
+                sublnWeight.asType(merged.dtype),
+                lambda.asType(.float32),
+                scaleArray,
+                epsArray,
+            ],
+            template: [
+                ("T", merged.dtype),
+                ("Q_ORIGIN", queryOrigin),
+                ("Q_GROUPS", queryGroups),
+                ("GR", groupedRatio),
+                ("S", sequenceLength),
+                ("CHANNELS", channels),
+            ],
+            grid: (rows * threads, 1, 1),
+            threadGroup: (threads, 1, 1),
+            outputShapes: [[batch, queryOrigin, sequenceLength, channels]],
+            outputDTypes: [merged.dtype]
+        )
+        return outputs[0]
     }
 }
 
@@ -587,17 +917,17 @@ public enum MotifPolynorm {
             + bias
     }
 
-    /// Safe entry point for the native port. The reference path is the default;
-    /// the Metal wrapper is opt-in so app/runtime code cannot use it before
-    /// parity fixtures and benchmark thresholds are added.
+    /// Production entry point. The direct Metal wrapper is default-on; set
+    /// `MLX_MOTIF_DISABLE_KERNELS=1` or pass `.referenceOnly` to force the
+    /// reference path for debugging and differential checks.
     public static func apply(
         _ x: MLXArray,
         weight: MLXArray,
         bias: MLXArray,
         eps: Float = 1e-6,
-        executionMode: MotifMetalKernelExecutionMode = .referenceOnly
+        executionMode: MotifMetalKernelExecutionMode = .metalPreferred
     ) -> MLXArray {
-        guard executionMode == .experimentalMetal, MotifMetalKernels.experimentalMetalRequested else {
+        guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode) else {
             return reference(x, weight: weight, bias: bias, eps: eps)
         }
         return metal(x, weight: weight, bias: bias, eps: eps)
@@ -639,6 +969,371 @@ public enum MotifPolynorm {
         return outputs[0].reshaped(x.shape)
     }
 }
+
+private let motifSDPADualVMetalSource = #"""
+    constexpr int BN = 32;
+    constexpr int BD = 32;
+    constexpr int qk_per_thread = D / BD;
+    constexpr int v_per_thread  = D / BD;
+
+    typedef float U;
+
+    uint head_idx = threadgroup_position_in_grid.x;     // batch*Q_HEADS linear index
+    uint sg_gid   = simdgroup_index_in_threadgroup;
+    uint sg_lid   = thread_index_in_simdgroup;
+
+    // GQA broadcast: each `GQA_FACTOR` consecutive Q heads share one (K, V*) head.
+    // For GQA_FACTOR=1 this is the standard one-to-one mapping.
+    uint kv_head_idx = head_idx / uint(GQA_FACTOR);
+
+    const device T* q_p  = q  + head_idx    * D                       + sg_lid * qk_per_thread;
+    const device T* k_p  = k  + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * qk_per_thread;
+    const device T* v1_p = v1 + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
+    const device T* v2_p = v2 + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
+    device T*       y_p  = y  + head_idx    * (2 * D);
+
+    float scale = float(scale_in[0]);
+
+    // Per-lane Q (scaled once).
+    thread U q_r[qk_per_thread];
+    for (int j = 0; j < qk_per_thread; ++j) {
+        q_r[j] = scale * U(q_p[j]);
+    }
+
+    // Per-lane V accumulators — two slabs, v_per_thread channels each.
+    thread U o1[v_per_thread];
+    thread U o2[v_per_thread];
+    for (int j = 0; j < v_per_thread; ++j) { o1[j] = 0; o2[j] = 0; }
+
+    // -1e30 instead of -INF so fast::exp(-INF - finite) doesn't return NaN
+    // on M-series (lesson from commits 6922acb / acc2de7).
+    U max_score = U(-1e30f);
+    U sum_exp_score = U(0);
+
+    int kv_stride = BN * D;
+    for (int p = sg_gid; p < KV_SEQ; p += BN) {
+        // Load this lane's K slice.
+        thread U k_r[qk_per_thread];
+        for (int j = 0; j < qk_per_thread; ++j) k_r[j] = U(k_p[j]);
+
+        // QK dot, then simd_sum across the 32-lane simdgroup.
+        U score = 0;
+        for (int j = 0; j < qk_per_thread; ++j) score += q_r[j] * k_r[j];
+        score = simd_sum(score);
+
+        // Online softmax update.
+        U new_max = max(max_score, score);
+        U fac = metal::fast::exp(max_score - new_max);
+        U exp_score = metal::fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * fac + exp_score;
+
+        // Update BOTH V accumulators with the same softmax weight.
+        for (int j = 0; j < v_per_thread; ++j) {
+            o1[j] = o1[j] * fac + exp_score * U(v1_p[j]);
+            o2[j] = o2[j] * fac + exp_score * U(v2_p[j]);
+        }
+
+        k_p  += kv_stride;
+        v1_p += kv_stride;
+        v2_p += kv_stride;
+    }
+
+    // Cross-simdgroup max/sum reduce — exact MLX SDPA pattern.
+    threadgroup U max_scores[BN];
+    threadgroup U sum_exp_scores[BN];
+    threadgroup U outputs[BN * BD];
+
+    if (sg_lid == 0) {
+        max_scores[sg_gid] = max_score;
+        sum_exp_scores[sg_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U lane_max = max_scores[sg_lid];
+    U new_max = simd_max(lane_max);
+    U lane_factor = metal::fast::exp(lane_max - new_max);
+    U lane_sum = simd_sum(sum_exp_scores[sg_lid] * lane_factor);
+
+    // Reduce both V slabs across simdgroups.
+    for (int i = 0; i < v_per_thread; ++i) {
+        // V1 slab
+        outputs[sg_lid * BD + sg_gid] = o1[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o1[i] = simd_sum(outputs[sg_gid * BD + sg_lid] * lane_factor);
+        o1[i] = (lane_sum == 0) ? o1[i] : (o1[i] / lane_sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // V2 slab
+        outputs[sg_lid * BD + sg_gid] = o2[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o2[i] = simd_sum(outputs[sg_gid * BD + sg_lid] * lane_factor);
+        o2[i] = (lane_sum == 0) ? o2[i] : (o2[i] / lane_sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Lane 0 of each simdgroup writes its v_per_thread channels of each slab.
+    if (sg_lid == 0) {
+        for (int i = 0; i < v_per_thread; ++i) {
+            y_p[sg_gid * v_per_thread + i] = T(o1[i]);
+            y_p[D + sg_gid * v_per_thread + i] = T(o2[i]);
+        }
+    }
+"""#
+
+private let motifSDPADualVQ4MetalSource = #"""
+    constexpr int  BN            = 32;
+    constexpr int  BD            = 32;
+    constexpr int  qk_per_thread = D / BD;          // 4 for D=128
+    constexpr int  v_per_thread  = D / BD;          // 4
+    constexpr int  EL_PER_INT    = 32 / BITS;
+    constexpr uint MASK          = (1u << BITS) - 1u;
+    constexpr int  U32_PER_ROW   = D / EL_PER_INT;
+    constexpr int  SCB_PER_ROW   = D / GROUP_SIZE;
+
+    typedef float U;
+
+    uint head_idx = threadgroup_position_in_grid.x;     // batch*Q_HEADS linear index
+    uint sg_gid   = simdgroup_index_in_threadgroup;
+    uint sg_lid   = thread_index_in_simdgroup;
+    uint kv_head_idx = head_idx / uint(GQA_FACTOR);
+
+    // Per-lane channel slice — same uint32_idx, shift, group_idx for K, V1, V2.
+    uint base         = uint(sg_lid) * uint(qk_per_thread);
+    uint u32_idx_base = base / uint(EL_PER_INT);
+    uint shift_base   = (base % uint(EL_PER_INT)) * uint(BITS);
+    uint group_idx    = base / uint(GROUP_SIZE);
+
+    // Per-tensor row offset for this kv_head (computed once).
+    uint head_row_u32 = kv_head_idx * uint(KV_SEQ) * uint(U32_PER_ROW);
+    uint head_row_scb = kv_head_idx * uint(KV_SEQ) * uint(SCB_PER_ROW);
+
+    // Q (fp16/bf16): same indexing as sdpa_dual_v.
+    const device T* q_p = q + head_idx * uint(D) + sg_lid * uint(qk_per_thread);
+
+    float scale = float(scale_in[0]);
+
+    // Per-lane Q with the MLX qdot trick: precompute q_pre[j] = scale * q[j] /
+    // 2^(shift_base + j*BITS). Then in the kv loop, K's nibble at position j —
+    // which appears in the packed word as `nibble * 2^(shift_base + j*BITS)`
+    // when masked WITHOUT shifting — multiplied by q_pre[j] gives the
+    // correctly-weighted partial dot. Saves one shift per channel per step.
+    thread U q_pre[qk_per_thread];
+    U q_sum = U(0);
+    for (int j = 0; j < qk_per_thread; ++j) {
+        U qj = scale * U(q_p[j]);
+        q_sum += qj;
+        // Inverse of the bit-position factor 2^(shift_base + j*BITS).
+        U inv_factor = U(1.0f) / U(1u << (shift_base + uint(j * BITS)));
+        q_pre[j] = qj * inv_factor;
+    }
+
+    // Per-lane V accumulators — two slabs.
+    thread U o1[v_per_thread];
+    thread U o2[v_per_thread];
+    for (int j = 0; j < v_per_thread; ++j) { o1[j] = 0; o2[j] = 0; }
+
+    // Per-lane masks for the in-place K mask-without-shift trick.
+    thread uint k_masks[qk_per_thread];
+    for (int j = 0; j < qk_per_thread; ++j) {
+        k_masks[j] = MASK << (shift_base + uint(j * BITS));
+    }
+
+    // -1e30 sentinel (avoid -INF / NaN trap in fast::exp).
+    U max_score = U(-1e30f);
+    U sum_exp_score = U(0);
+
+    for (int p = sg_gid; p < KV_SEQ; p += BN) {
+        uint row_u32 = head_row_u32 + uint(p) * uint(U32_PER_ROW) + u32_idx_base;
+        uint row_scb = head_row_scb + uint(p) * uint(SCB_PER_ROW) + group_idx;
+
+        // ---- K: in-place mask + qdot trick -----------------------------
+        // dot(q, dequant(k)) = scale_k * sum_j(q[j] * raw[j]) + bias_k * sum_j(q[j])
+        //                    = scale_k * sum_j(q_pre[j] * (k_pkd & k_masks[j])) + bias_k * q_sum
+        uint32_t k_pkd = k_data[row_u32];
+        U partial = 0;
+        for (int j = 0; j < qk_per_thread; ++j) {
+            partial += q_pre[j] * U(k_pkd & k_masks[j]);
+        }
+        U score = U(k_scales[row_scb]) * partial + U(k_biases[row_scb]) * q_sum;
+        score = simd_sum(score);
+
+        // ---- Online softmax update -------------------------------------
+        U new_max = max(max_score, score);
+        U fac = metal::fast::exp(max_score - new_max);
+        U exp_score = metal::fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * fac + exp_score;
+
+        // ---- V1: bit-extract + accumulate ------------------------------
+        {
+            uint32_t v_pkd = v1_data[row_u32];
+            U s = U(v1_scales[row_scb]);
+            U b = U(v1_biases[row_scb]);
+            for (int j = 0; j < v_per_thread; ++j) {
+                uint raw = (v_pkd >> (shift_base + uint(j * BITS))) & MASK;
+                o1[j] = o1[j] * fac + exp_score * (s * U(raw) + b);
+            }
+        }
+
+        // ---- V2: bit-extract + accumulate ------------------------------
+        {
+            uint32_t v_pkd = v2_data[row_u32];
+            U s = U(v2_scales[row_scb]);
+            U b = U(v2_biases[row_scb]);
+            for (int j = 0; j < v_per_thread; ++j) {
+                uint raw = (v_pkd >> (shift_base + uint(j * BITS))) & MASK;
+                o2[j] = o2[j] * fac + exp_score * (s * U(raw) + b);
+            }
+        }
+    }
+
+    device T* y_p = y + head_idx * uint(2 * D);
+
+    // Cross-simdgroup max/sum reduce — exact MLX SDPA pattern.
+    threadgroup U max_scores[BN];
+    threadgroup U sum_exp_scores[BN];
+    threadgroup U outputs[BN * BD];
+
+    if (sg_lid == 0) {
+        max_scores[sg_gid] = max_score;
+        sum_exp_scores[sg_gid] = sum_exp_score;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U lane_max = max_scores[sg_lid];
+    U new_max = simd_max(lane_max);
+    U lane_factor = metal::fast::exp(lane_max - new_max);
+    U lane_sum = simd_sum(sum_exp_scores[sg_lid] * lane_factor);
+
+    for (int i = 0; i < v_per_thread; ++i) {
+        outputs[sg_lid * BD + sg_gid] = o1[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o1[i] = simd_sum(outputs[sg_gid * BD + sg_lid] * lane_factor);
+        o1[i] = (lane_sum == 0) ? o1[i] : (o1[i] / lane_sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        outputs[sg_lid * BD + sg_gid] = o2[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        o2[i] = simd_sum(outputs[sg_gid * BD + sg_lid] * lane_factor);
+        o2[i] = (lane_sum == 0) ? o2[i] : (o2[i] / lane_sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (sg_lid == 0) {
+        for (int i = 0; i < v_per_thread; ++i) {
+            y_p[sg_gid * v_per_thread + i] = T(o1[i]);
+            y_p[D + sg_gid * v_per_thread + i] = T(o2[i]);
+        }
+    }
+"""#
+
+private let motifGDAPostMetalSource = #"""
+    // Layout: one threadgroup per output row (b, h_o, s). Each row has
+    // CHANNELS = 2 * head_dim contiguous channels.
+    uint row     = threadgroup_position_in_grid.x;
+    uint tid     = thread_position_in_threadgroup.x;
+    uint tgsize  = threads_per_threadgroup.x;
+
+    // Decompose row into (b, h_o, s) using contiguous (B, q_origin, S) layout.
+    uint hs    = (Q_ORIGIN * S);
+    uint b     = row / hs;
+    uint hosx  = row - b * hs;
+    uint h_o   = hosx / S;
+    uint s     = hosx - h_o * S;
+    uint h_n   = Q_ORIGIN + (h_o / GR);   // matching noise head
+
+    // merged is (B, Q_HEADS, S, CHANNELS) where Q_HEADS = Q_ORIGIN + Q_GROUPS.
+    uint q_heads_total = Q_ORIGIN + Q_GROUPS;
+    const device T* row_o = merged + (((b * q_heads_total + h_o) * S) + s) * CHANNELS;
+    const device T* row_n = merged + (((b * q_heads_total + h_n) * S) + s) * CHANNELS;
+    device T*       row_y = y      + (((b * Q_ORIGIN     + h_o) * S) + s) * CHANNELS;
+
+    float lam   = float(lambda_full[0]);
+    float scale = float(scale_in[0]);
+    float eps   = float(eps_in[0]);
+
+    // Pass 1: compute the per-row sum of squares of the differential.
+    float ssq = 0.0f;
+    for (uint i = tid; i < CHANNELS; i += tgsize) {
+        float d = float(row_o[i]) - lam * float(row_n[i]);
+        ssq += d * d;
+    }
+
+    threadgroup float tg_partial[32];
+    float r = simd_sum(ssq);
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint lane  = thread_index_in_simdgroup;
+    if (lane == 0) tg_partial[sg_id] = r;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0) {
+        uint n_sg = simdgroups_per_threadgroup;
+        float v = (lane < n_sg) ? tg_partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0) tg_partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_inv = metal::rsqrt(tg_partial[0] / float(CHANNELS) + eps);
+
+    // Pass 2: emit the SubLN-normalised, scaled output.
+    for (uint i = tid; i < CHANNELS; i += tgsize) {
+        float d  = float(row_o[i]) - lam * float(row_n[i]);
+        float sw = float(subln_w[i]);
+        row_y[i] = T(d * rms_inv * sw * scale);
+    }
+"""#
+
+private let motifGDAPostSplitMetalSource = #"""
+    // Same as gda_post but reads attn_o (B, q_origin, S, 2d) and
+    // attn_n (B, q_groups, S, 2d) as separate buffers — saves the
+    // (B, q_origin+q_groups, S, 2d) concat allocation upstream.
+    uint row     = threadgroup_position_in_grid.x;
+    uint tid     = thread_position_in_threadgroup.x;
+    uint tgsize  = threads_per_threadgroup.x;
+
+    uint hs    = (Q_ORIGIN * S);
+    uint b     = row / hs;
+    uint hosx  = row - b * hs;
+    uint h_o   = hosx / S;
+    uint s     = hosx - h_o * S;
+    uint h_n   = h_o / GR;       // noise head index (0..q_groups-1)
+
+    const device T* row_o = attn_o + (((b * Q_ORIGIN + h_o) * S) + s) * CHANNELS;
+    const device T* row_n = attn_n + (((b * Q_GROUPS + h_n) * S) + s) * CHANNELS;
+    device T*       row_y = y      + (((b * Q_ORIGIN + h_o) * S) + s) * CHANNELS;
+
+    float lam   = float(lambda_full[0]);
+    float scale = float(scale_in[0]);
+    float eps   = float(eps_in[0]);
+
+    float ssq = 0.0f;
+    for (uint i = tid; i < CHANNELS; i += tgsize) {
+        float d = float(row_o[i]) - lam * float(row_n[i]);
+        ssq += d * d;
+    }
+
+    threadgroup float tg_partial[32];
+    float r = simd_sum(ssq);
+    uint sg_id = simdgroup_index_in_threadgroup;
+    uint lane  = thread_index_in_simdgroup;
+    if (lane == 0) tg_partial[sg_id] = r;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg_id == 0) {
+        uint n_sg = simdgroups_per_threadgroup;
+        float v = (lane < n_sg) ? tg_partial[lane] : 0.0f;
+        v = simd_sum(v);
+        if (lane == 0) tg_partial[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float rms_inv = metal::rsqrt(tg_partial[0] / float(CHANNELS) + eps);
+
+    for (uint i = tid; i < CHANNELS; i += tgsize) {
+        float d  = float(row_o[i]) - lam * float(row_n[i]);
+        float sw = float(subln_w[i]);
+        row_y[i] = T(d * rms_inv * sw * scale);
+    }
+"""#
 
 private let motifPolynormMetalSource = #"""
     // Each threadgroup handles one row of length D. Ported from

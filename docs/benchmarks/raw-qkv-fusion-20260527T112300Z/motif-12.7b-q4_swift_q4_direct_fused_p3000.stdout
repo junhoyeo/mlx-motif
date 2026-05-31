@@ -1,0 +1,16 @@
+{
+  "elapsedSeconds" : 18.728641033172607,
+  "generatedTokens" : 8,
+  "generationInfo" : {
+    "generateTime" : 1.0605549812316895,
+    "generationTokenCount" : 8,
+    "promptTime" : 17.29286503791809,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 158.15771383185847,
+    "tokensPerSecond" : 7.5432204285242195
+  },
+  "output" : "Okay, the user provided a long,",
+  "outputCharacters" : 31,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}

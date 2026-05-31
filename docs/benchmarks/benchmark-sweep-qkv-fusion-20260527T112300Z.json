@@ -1,0 +1,311 @@
+{
+  "cells": [
+    {
+      "artifacts": {
+        "stderr": "artifacts/benchmarks/raw-qkv-fusion-20260527T112300Z/motif-12.7b-q4_swift_q4_direct_p500.stderr",
+        "stdout": "artifacts/benchmarks/raw-qkv-fusion-20260527T112300Z/motif-12.7b-q4_swift_q4_direct_p500.stdout"
+      },
+      "backend": "swift",
+      "cache_cell": "q4_direct",
+      "cell_id": "motif-12.7b-q4/swift/q4_direct/p500",
+      "command": [
+        "swift",
+        "run",
+        "--package-path",
+        "swift",
+        "MotifNativeEvaluate",
+        "--model",
+        ".models/motif-12.7b-reasoning-q4",
+        "--mode",
+        "bench",
+        "--prompt-file",
+        "/var/folders/6g/rtxss9kn6cbf4mynlps609sr0000gn/T/tmpyobao9sg.txt",
+        "--max-tokens",
+        "8",
+        "--temperature",
+        "0"
+      ],
+      "elapsed_seconds": 16.7955125840017,
+      "env": {
+        "MLX_MOTIF_4SLOT_CACHE": "q4",
+        "MLX_MOTIF_DISABLE_KERNELS": "0",
+        "MLX_MOTIF_FUSE_QKV": "0",
+        "MLX_MOTIF_QUANT_SDPA": "1"
+      },
+      "error": null,
+      "max_tokens": 8,
+      "model_id": "motif-12.7b-q4",
+      "prompt_actual_tokens": 469,
+      "prompt_target_tokens": 500,
+      "returncode": 0,
+      "runs": [
+        {
+          "elapsed_seconds": 4.347417950630188,
+          "generate_time_seconds": 1.1682130098342896,
+          "generated_tokens": 8,
+          "output_characters": 32,
+          "output_hash": "c49c3c8b2eb5000645982c7c594092382c11f40a405bce029095465a25bc5faa",
+          "prompt_actual_tokens": 469,
+          "prompt_time_seconds": 3.1036349534988403,
+          "prompt_tokens_per_second": 151.11313251298427,
+          "run_index": 0,
+          "tokens_per_second": 6.848066176848001
+        }
+      ],
+      "status": "pass",
+      "summary": {
+        "max_tokens_per_second": 6.848066176848001,
+        "mean_tokens_per_second": 6.848066176848001,
+        "median_tokens_per_second": 6.848066176848001,
+        "min_tokens_per_second": 6.848066176848001,
+        "stdev_tokens_per_second": 0.0
+      }
+    },
+    {
+      "artifacts": {
+        "stderr": "artifacts/benchmarks/raw-qkv-fusion-20260527T112300Z/motif-12.7b-q4_swift_q4_direct_p3000.stderr",
+        "stdout": "artifacts/benchmarks/raw-qkv-fusion-20260527T112300Z/motif-12.7b-q4_swift_q4_direct_p3000.stdout"
+      },
+      "backend": "swift",
+      "cache_cell": "q4_direct",
+      "cell_id": "motif-12.7b-q4/swift/q4_direct/p3000",
+      "command": [
+        "swift",
+        "run",
+        "--package-path",
+        "swift",
+        "MotifNativeEvaluate",
+        "--model",
+        ".models/motif-12.7b-reasoning-q4",
+        "--mode",
+        "bench",
+        "--prompt-file",
+        "/var/folders/6g/rtxss9kn6cbf4mynlps609sr0000gn/T/tmpclrtq3jd.txt",
+        "--max-tokens",
+        "8",
+        "--temperature",
+        "0"
+      ],
+      "elapsed_seconds": 23.46849375000238,
+      "env": {
+        "MLX_MOTIF_4SLOT_CACHE": "q4",
+        "MLX_MOTIF_DISABLE_KERNELS": "0",
+        "MLX_MOTIF_FUSE_QKV": "0",
+        "MLX_MOTIF_QUANT_SDPA": "1"
+      },
+      "error": null,
+      "max_tokens": 8,
+      "model_id": "motif-12.7b-q4",
+      "prompt_actual_tokens": 2735,
+      "prompt_target_tokens": 3000,
+      "returncode": 0,
+      "runs": [
+        {
+          "elapsed_seconds": 18.85260498523712,
+          "generate_time_seconds": 1.2760339975357056,
+          "generated_tokens": 8,
+          "output_characters": 31,
+          "output_hash": "463d905c1645936b55cf79142ae96e4de9fafa432fb8374f0133f38cb2ed07a1",
+          "prompt_actual_tokens": 2735,
+          "prompt_time_seconds": 17.208792090415955,
+          "prompt_tokens_per_second": 158.9303877709811,
+          "run_index": 0,
+          "tokens_per_second": 6.269425434941161
+        }
+      ],
+      "status": "pass",
+      "summary": {
+        "max_tokens_per_second": 6.269425434941161,
+        "mean_tokens_per_second": 6.269425434941161,
+        "median_tokens_per_second": 6.269425434941161,
+        "min_tokens_per_second": 6.269425434941161,
+        "stdev_tokens_per_second": 0.0
+      }
+    },
+    {
+      "artifacts": {
+        "stderr": "artifacts/benchmarks/raw-qkv-fusion-20260527T112300Z/motif-12.7b-q4_swift_q4_direct_fused_p500.stderr",
+        "stdout": "artifacts/benchmarks/raw-qkv-fusion-20260527T112300Z/motif-12.7b-q4_swift_q4_direct_fused_p500.stdout"
+      },
+      "backend": "swift",
+      "cache_cell": "q4_direct_fused",
+      "cell_id": "motif-12.7b-q4/swift/q4_direct_fused/p500",
+      "command": [
+        "swift",
+        "run",
+        "--package-path",
+        "swift",
+        "MotifNativeEvaluate",
+        "--model",
+        ".models/motif-12.7b-reasoning-q4",
+        "--mode",
+        "bench",
+        "--prompt-file",
+        "/var/folders/6g/rtxss9kn6cbf4mynlps609sr0000gn/T/tmpgsta3_75.txt",
+        "--max-tokens",
+        "8",
+        "--temperature",
+        "0"
+      ],
+      "elapsed_seconds": 14.870595334003156,
+      "env": {
+        "MLX_MOTIF_4SLOT_CACHE": "q4",
+        "MLX_MOTIF_DISABLE_KERNELS": "0",
+        "MLX_MOTIF_FUSE_QKV": "1",
+        "MLX_MOTIF_QUANT_SDPA": "1"
+      },
+      "error": null,
+      "max_tokens": 8,
+      "model_id": "motif-12.7b-q4",
+      "prompt_actual_tokens": 469,
+      "prompt_target_tokens": 500,
+      "returncode": 0,
+      "runs": [
+        {
+          "elapsed_seconds": 4.241024017333984,
+          "generate_time_seconds": 1.112515926361084,
+          "generated_tokens": 8,
+          "output_characters": 32,
+          "output_hash": "c49c3c8b2eb5000645982c7c594092382c11f40a405bce029095465a25bc5faa",
+          "prompt_actual_tokens": 469,
+          "prompt_time_seconds": 3.0533021688461304,
+          "prompt_tokens_per_second": 153.60418788070334,
+          "run_index": 0,
+          "tokens_per_second": 7.19090829213305
+        }
+      ],
+      "status": "pass",
+      "summary": {
+        "max_tokens_per_second": 7.19090829213305,
+        "mean_tokens_per_second": 7.19090829213305,
+        "median_tokens_per_second": 7.19090829213305,
+        "min_tokens_per_second": 7.19090829213305,
+        "stdev_tokens_per_second": 0.0
+      }
+    },
+    {
+      "artifacts": {
+        "stderr": "artifacts/benchmarks/raw-qkv-fusion-20260527T112300Z/motif-12.7b-q4_swift_q4_direct_fused_p3000.stderr",
+        "stdout": "artifacts/benchmarks/raw-qkv-fusion-20260527T112300Z/motif-12.7b-q4_swift_q4_direct_fused_p3000.stdout"
+      },
+      "backend": "swift",
+      "cache_cell": "q4_direct_fused",
+      "cell_id": "motif-12.7b-q4/swift/q4_direct_fused/p3000",
+      "command": [
+        "swift",
+        "run",
+        "--package-path",
+        "swift",
+        "MotifNativeEvaluate",
+        "--model",
+        ".models/motif-12.7b-reasoning-q4",
+        "--mode",
+        "bench",
+        "--prompt-file",
+        "/var/folders/6g/rtxss9kn6cbf4mynlps609sr0000gn/T/tmph8d295g6.txt",
+        "--max-tokens",
+        "8",
+        "--temperature",
+        "0"
+      ],
+      "elapsed_seconds": 23.38661299999876,
+      "env": {
+        "MLX_MOTIF_4SLOT_CACHE": "q4",
+        "MLX_MOTIF_DISABLE_KERNELS": "0",
+        "MLX_MOTIF_FUSE_QKV": "1",
+        "MLX_MOTIF_QUANT_SDPA": "1"
+      },
+      "error": null,
+      "max_tokens": 8,
+      "model_id": "motif-12.7b-q4",
+      "prompt_actual_tokens": 2735,
+      "prompt_target_tokens": 3000,
+      "returncode": 0,
+      "runs": [
+        {
+          "elapsed_seconds": 18.728641033172607,
+          "generate_time_seconds": 1.0605549812316895,
+          "generated_tokens": 8,
+          "output_characters": 31,
+          "output_hash": "463d905c1645936b55cf79142ae96e4de9fafa432fb8374f0133f38cb2ed07a1",
+          "prompt_actual_tokens": 2735,
+          "prompt_time_seconds": 17.29286503791809,
+          "prompt_tokens_per_second": 158.15771383185847,
+          "run_index": 0,
+          "tokens_per_second": 7.5432204285242195
+        }
+      ],
+      "status": "pass",
+      "summary": {
+        "max_tokens_per_second": 7.5432204285242195,
+        "mean_tokens_per_second": 7.5432204285242195,
+        "median_tokens_per_second": 7.5432204285242195,
+        "min_tokens_per_second": 7.5432204285242195,
+        "stdev_tokens_per_second": 0.0
+      }
+    }
+  ],
+  "comparisons": [
+    {
+      "baseline_cell": "motif-12.7b-q4/swift/q4_direct/p500",
+      "candidate_cell": "motif-12.7b-q4/swift/q4_direct_fused/p500",
+      "comparison": "fused_vs_default",
+      "model_id": "motif-12.7b-q4",
+      "prompt_target_tokens": 500,
+      "speedup": 1.0500640774243877
+    },
+    {
+      "baseline_cell": "motif-12.7b-q4/swift/q4_direct/p3000",
+      "candidate_cell": "motif-12.7b-q4/swift/q4_direct_fused/p3000",
+      "comparison": "fused_vs_default",
+      "model_id": "motif-12.7b-q4",
+      "prompt_target_tokens": 3000,
+      "speedup": 1.2031757147128448
+    }
+  ],
+  "config": {
+    "backends": [
+      "swift"
+    ],
+    "cache_cells": [
+      "q4_direct",
+      "q4_direct_fused"
+    ],
+    "dry_run": false,
+    "max_tokens": 8,
+    "n_runs": 1,
+    "prompt_lens": [
+      500,
+      3000
+    ],
+    "warmup_runs": 0
+  },
+  "generated_at": "2026-05-27T11:23:43Z",
+  "git": {
+    "branch": "feature/swift-qkv-fusion-perf",
+    "commit": "bbc2c613def97e9f8fdebebff0a521729c33743f",
+    "dirty": false
+  },
+  "host": {
+    "chip": "Apple M1 Max",
+    "machine": "arm64",
+    "memory_bytes": 68719476736,
+    "metal_devices": [
+      "Chipset Model: Apple M1 Max"
+    ],
+    "os": "macOS-26.2-arm64-arm-64bit",
+    "python": "3.11.14 (main, Oct 14 2025, 21:33:50) [Clang 20.1.4 ]",
+    "runner": "local",
+    "swift": "Apple Swift version 6.0.3 (swiftlang-6.0.3.1.10 clang-1600.0.30.1)\nTarget: arm64-apple-macosx16.0",
+    "xcode": "Xcode 16.2\nBuild version 16C5032a"
+  },
+  "models": [
+    {
+      "id": "motif-12.7b-q4",
+      "params_b": null,
+      "path": ".models/motif-12.7b-reasoning-q4",
+      "quantization": null
+    }
+  ],
+  "schema_version": 1
+}

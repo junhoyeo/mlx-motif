@@ -480,17 +480,20 @@ public struct MotifRuntimeFeatureFlags: Equatable, Sendable {
     public var fourSlotCache: String?
     public var quantizedSDPA: Bool
     public var disableCustomKernels: Bool
+    public var fuseQueryKeyValue: Bool
 
     public init(
         dualVAttention: Bool = true,
         fourSlotCache: String? = nil,
         quantizedSDPA: Bool = true,
-        disableCustomKernels: Bool = false
+        disableCustomKernels: Bool = false,
+        fuseQueryKeyValue: Bool = false
     ) {
         self.dualVAttention = dualVAttention
         self.fourSlotCache = fourSlotCache
         self.quantizedSDPA = quantizedSDPA
         self.disableCustomKernels = disableCustomKernels
+        self.fuseQueryKeyValue = fuseQueryKeyValue
     }
 
     public enum FourSlotCacheMode: String, Codable, Equatable, Sendable {
@@ -524,7 +527,8 @@ public struct MotifRuntimeFeatureFlags: Equatable, Sendable {
             dualVAttention: !isFalsy(environment["MLX_MOTIF_DUAL_V"], defaultValue: true),
             fourSlotCache: environment["MLX_MOTIF_4SLOT_CACHE"],
             quantizedSDPA: !isFalsy(environment["MLX_MOTIF_QUANT_SDPA"], defaultValue: true),
-            disableCustomKernels: !isFalsy(environment["MLX_MOTIF_DISABLE_KERNELS"], defaultValue: false)
+            disableCustomKernels: !isFalsy(environment["MLX_MOTIF_DISABLE_KERNELS"], defaultValue: false),
+            fuseQueryKeyValue: !isFalsy(environment["MLX_MOTIF_FUSE_QKV"], defaultValue: false)
         )
     }
 

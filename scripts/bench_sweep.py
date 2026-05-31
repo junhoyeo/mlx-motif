@@ -46,6 +46,7 @@ class CacheCell:
     cache_mode: str
     quant_sdpa: str | None = None
     disable_kernels: bool = False
+    fuse_qkv: str | None = None
 
     @property
     def env(self) -> dict[str, str]:
@@ -53,6 +54,8 @@ class CacheCell:
         if self.quant_sdpa is not None:
             env["MLX_MOTIF_QUANT_SDPA"] = self.quant_sdpa
         env["MLX_MOTIF_DISABLE_KERNELS"] = "1" if self.disable_kernels else "0"
+        if self.fuse_qkv is not None:
+            env["MLX_MOTIF_FUSE_QKV"] = self.fuse_qkv
         return env
 
 
@@ -179,6 +182,7 @@ def parse_cache_cell(value: str) -> CacheCell:
         cache_mode=cache_mode,
         quant_sdpa=settings.get("quant_sdpa"),
         disable_kernels=disable,
+        fuse_qkv=settings.get("fuse_qkv"),
     )
 
 
@@ -458,10 +462,13 @@ def build_comparisons(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for baseline_backend, baseline_cache, label in [
             (cell["backend"], "q4_bridge", "direct_vs_bridge"),
             ("python", cell["cache_cell"], "swift_vs_python"),
+            (cell["backend"], cell["cache_cell"].removesuffix("_fused"), "fused_vs_default"),
         ]:
             if label == "direct_vs_bridge" and not cell["cache_cell"].endswith("direct"):
                 continue
             if label == "swift_vs_python" and cell["backend"] != "swift":
+                continue
+            if label == "fused_vs_default" and not cell["cache_cell"].endswith("_fused"):
                 continue
             baseline = by_key.get((model_id, baseline_backend, baseline_cache, prompt))
             if not baseline or baseline is cell:

@@ -118,6 +118,8 @@ public final class MotifMLXAttentionScaffold: Module {
     private let rope: any OffsetLayer
     private let configuration: MotifModelConfiguration
     private let runtimeFeatures: MotifRuntimeFeatureFlags
+    private var fusedQueryKeyValueProjection: Linear?
+    private var fusedProjectionUsesOriginFirstQueries = false
 
     public init(
         configuration: MotifModelConfiguration,
@@ -209,13 +211,34 @@ public final class MotifMLXAttentionScaffold: Module {
             featureFlags: runtimeFeatures
         )
 
-        var q = queryProjection(x)
+        let qFlat: MLXArray
+        let kFlat: MLXArray
+        let vFlat: MLXArray
+        let qOriginFirst: Bool
+        if let fusedQueryKeyValueProjection {
+            let qkv = fusedQueryKeyValueProjection(x)
+            qFlat = qkv[0..., 0..., ..<layout.qProjectionSize]
+            kFlat = qkv[
+                0...,
+                0...,
+                layout.qProjectionSize ..< (layout.qProjectionSize + layout.kProjectionSize)
+            ]
+            vFlat = qkv[0..., 0..., (layout.qProjectionSize + layout.kProjectionSize)...]
+            qOriginFirst = fusedProjectionUsesOriginFirstQueries
+        } else {
+            qFlat = queryProjection(x)
+            kFlat = keyProjection(x)
+            vFlat = valueProjection(x)
+            qOriginFirst = false
+        }
+
+        var q = qFlat
             .reshaped([batch, sequenceLength, layout.queryHeads, layout.headDim])
             .transposed(0, 2, 1, 3)
-        var k = keyProjection(x)
+        var k = kFlat
             .reshaped([batch, sequenceLength, layout.keyValueHeads, layout.headDim])
             .transposed(0, 2, 1, 3)
-        var v = valueProjection(x)
+        var v = vFlat
             .reshaped([batch, sequenceLength, 2 * keyGroups, layout.headDim])
             .transposed(0, 2, 1, 3)
 
@@ -233,7 +256,8 @@ public final class MotifMLXAttentionScaffold: Module {
                 q: q,
                 k: k,
                 v: v,
-                layout: layout
+                layout: layout,
+                qOriginFirst: qOriginFirst
             )
             let kOrigin = rope(prepared.kOrigin, offset: offset)
             let kNoise = rope(prepared.kNoise, offset: offset)
@@ -278,7 +302,8 @@ public final class MotifMLXAttentionScaffold: Module {
                 q: q,
                 k: k,
                 v: v,
-                layout: layout
+                layout: layout,
+                qOriginFirst: qOriginFirst
             )
             let cached = grouped.updateAndFetch4(
                 kOrigin: rope(prepared.kOrigin, offset: offset),
@@ -303,7 +328,8 @@ public final class MotifMLXAttentionScaffold: Module {
                 q: q,
                 k: k,
                 v: v,
-                layout: layout
+                layout: layout,
+                qOriginFirst: qOriginFirst
             )
         }
 
@@ -476,6 +502,103 @@ public final class MotifMLXAttentionScaffold: Module {
     private func repeatHeadsIfNeeded(_ x: MLXArray, count: Int) -> MLXArray {
         count == 1 ? x : repeated(x, count: count, axis: 1)
     }
+
+    @discardableResult
+    public func fuseQueryKeyValueProjectionIfPossible() -> Bool {
+        guard runtimeFeatures.fuseQueryKeyValue,
+              layout.variant == .groupedDifferential,
+              fusedQueryKeyValueProjection == nil
+        else {
+            return false
+        }
+        guard !configuration.useBias,
+              queryProjection.bias == nil,
+              keyProjection.bias == nil,
+              valueProjection.bias == nil
+        else {
+            return false
+        }
+
+        let permutation = Self.originFirstQueryPermutation(
+            noiseGroups: layout.queryHeads / (layout.groupedRatio + 1),
+            groupedRatio: layout.groupedRatio,
+            headDim: layout.headDim
+        )
+
+        if let query = queryProjection as? QuantizedLinear {
+            guard let key = keyProjection as? QuantizedLinear,
+                  let value = valueProjection as? QuantizedLinear,
+                  query.bits == key.bits,
+                  query.bits == value.bits,
+                  query.groupSize == key.groupSize,
+                  query.groupSize == value.groupSize,
+                  query.mode == key.mode,
+                  query.mode == value.mode
+            else {
+                return false
+            }
+            let qWeight = take(query.weight, permutation, axis: 0)
+            let qScales = take(query.scales, permutation, axis: 0)
+            let qBiases = query.biases.map { take($0, permutation, axis: 0) }
+            fusedQueryKeyValueProjection = QuantizedLinear(
+                weight: concatenated([qWeight, key.weight, value.weight], axis: 0),
+                bias: nil,
+                scales: concatenated([qScales, key.scales, value.scales], axis: 0),
+                biases: concatenateOptional([qBiases, key.biases, value.biases], axis: 0),
+                groupSize: query.groupSize,
+                bits: query.bits,
+                mode: query.mode
+            )
+        } else {
+            guard !(keyProjection is QuantizedLinear), !(valueProjection is QuantizedLinear) else {
+                return false
+            }
+            fusedQueryKeyValueProjection = Linear(
+                weight: concatenated([
+                    take(queryProjection.weight, permutation, axis: 0),
+                    keyProjection.weight,
+                    valueProjection.weight,
+                ], axis: 0),
+                bias: nil
+            )
+        }
+
+        fusedProjectionUsesOriginFirstQueries = true
+        if let fused = fusedQueryKeyValueProjection as? QuantizedLinear {
+            eval([fused.weight, fused.scales] + [fused.biases].compactMap { $0 })
+        } else if let fusedQueryKeyValueProjection {
+            eval(fusedQueryKeyValueProjection.weight)
+        }
+        return true
+    }
+
+    private static func originFirstQueryPermutation(noiseGroups: Int, groupedRatio: Int, headDim: Int) -> MLXArray {
+        var rows: [Int32] = []
+        rows.reserveCapacity(noiseGroups * (groupedRatio + 1) * headDim)
+        for group in 0 ..< noiseGroups {
+            for origin in 0 ..< groupedRatio {
+                let head = group * (groupedRatio + 1) + origin
+                for row in 0 ..< headDim {
+                    rows.append(Int32(head * headDim + row))
+                }
+            }
+        }
+        for group in 0 ..< noiseGroups {
+            let head = group * (groupedRatio + 1) + groupedRatio
+            for row in 0 ..< headDim {
+                rows.append(Int32(head * headDim + row))
+            }
+        }
+        return MLXArray(rows, [rows.count])
+    }
+
+    private func concatenateOptional(_ arrays: [MLXArray?], axis: Int) -> MLXArray? {
+        let present = arrays.compactMap { $0 }
+        guard present.count == arrays.count else {
+            return nil
+        }
+        return concatenated(present, axis: axis)
+    }
 }
 
 public final class MotifMLXDecoderLayer: Module {
@@ -638,6 +761,13 @@ public final class MotifMLXModel: Module, LLMModel, KVCacheDimensionProvider {
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights.filter {
             !$0.key.contains("rotary_emb.inv_freq") && !$0.key.contains("rope.inv_freq")
+        }
+    }
+
+    @discardableResult
+    public func fuseQueryKeyValueProjectionsIfPossible() -> Int {
+        model.layers.reduce(0) { count, layer in
+            count + (layer.attention.fuseQueryKeyValueProjectionIfPossible() ? 1 : 0)
         }
     }
 

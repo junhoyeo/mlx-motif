@@ -34,7 +34,7 @@ final class ChatStore: ObservableObject {
     @Published var backendMode: MotifChatBackendMode = .openAICompatible
     @Published var endpoint = "http://127.0.0.1:8080/v1"
     @Published var model = "motif"
-    @Published var nativeModelDirectory = ProcessInfo.processInfo.environment["MOTIF_MODEL_DIR"] ?? ".models/motif-2.6b-mlx-q4"
+    @Published var nativeModelDirectory = ProcessInfo.processInfo.environment["MOTIF_MODEL_DIR"] ?? "~/.models/motif-2.6b-mlx-q4"
     @Published var thinkMode: MotifThinkMode = .hidden
     @Published var maxTokens = 512
     @Published var temperature = 0.6

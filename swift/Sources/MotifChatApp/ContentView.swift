@@ -193,7 +193,8 @@ private struct RuntimeView: View {
 
             Section("Native MLX status") {
                 Label("MotifKitMLX overlay is gated behind MOTIFKIT_ENABLE_MLX=1 for lightweight default builds", systemImage: "shippingbox")
-                Label("Native path: tokenizer/chat template, checkpoint loading, q4 cache, custom Metal, and speculative decoding", systemImage: "checklist")
+                Label("Native path: tokenizer/chat template, checkpoint loading, q4 cache, and custom Metal", systemImage: "checklist")
+                Label("Remaining: speculative decoding", systemImage: "wrench.and.screwdriver")
                 Label("Evidence: docs/benchmarks/swift-python-hard-parity-20260526T091532Z.md", systemImage: "speedometer")
             }
         }

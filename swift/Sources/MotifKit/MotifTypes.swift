@@ -492,4 +492,62 @@ public struct MotifRuntimeFeatureFlags: Equatable, Sendable {
         self.quantizedSDPA = quantizedSDPA
         self.disableCustomKernels = disableCustomKernels
     }
+
+    public enum FourSlotCacheMode: String, Codable, Equatable, Sendable {
+        case disabled
+        case fp = "1"
+        case q4
+        case q8
+
+        public var cacheKind: MotifKVCacheKind {
+            switch self {
+            case .disabled:
+                .standard
+            case .fp:
+                .groupedFourSlot
+            case .q4:
+                .groupedQuantized4Bit
+            case .q8:
+                .groupedQuantized8Bit
+            }
+        }
+    }
+
+    public var fourSlotCacheMode: FourSlotCacheMode {
+        Self.parseFourSlotCacheMode(fourSlotCache)
+    }
+
+    public static func fromEnvironment(
+        _ environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Self {
+        MotifRuntimeFeatureFlags(
+            dualVAttention: !isFalsy(environment["MLX_MOTIF_DUAL_V"], defaultValue: true),
+            fourSlotCache: environment["MLX_MOTIF_4SLOT_CACHE"],
+            quantizedSDPA: !isFalsy(environment["MLX_MOTIF_QUANT_SDPA"], defaultValue: true),
+            disableCustomKernels: !isFalsy(environment["MLX_MOTIF_DISABLE_KERNELS"], defaultValue: false)
+        )
+    }
+
+    public static func parseFourSlotCacheMode(_ value: String?) -> FourSlotCacheMode {
+        guard let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !["", "0", "false", "off", "no"].contains(normalized)
+        else {
+            return .disabled
+        }
+        switch normalized {
+        case "q4", "4":
+            return .q4
+        case "q8", "8":
+            return .q8
+        default:
+            return .fp
+        }
+    }
+
+    private static func isFalsy(_ value: String?, defaultValue: Bool) -> Bool {
+        guard let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return !defaultValue
+        }
+        return ["", "0", "false", "False", "off", "OFF", "no", "NO"].contains(normalized)
+    }
 }

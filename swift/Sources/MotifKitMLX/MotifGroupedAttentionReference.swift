@@ -42,7 +42,7 @@ public struct MotifGroupedAttentionReferencePlan: Codable, Equatable, Sendable {
         self.limitations = [
             "reference-only MLX Swift ops; no custom Metal dispatch by default",
             "expects q/k/v tensors after projection and RoPE, not a full decoder layer",
-            "quantized grouped cache is a parity hook only until sdpa_dual_v_q4 is ported",
+            "q4/q8 grouped cache uses a dequantizing Swift bridge until packed Metal fixtures prove sdpa_dual_v_q4 parity",
         ]
         self.parityHooks = [
             "Python MotifAttention._forward_grouped fallback fixture",
@@ -165,9 +165,8 @@ public struct MotifGroupedAttentionStepPlan: Codable, Equatable, Sendable {
 
 /// Four-slot grouped KV cache matching the Python `MotifGroupedKVCache` split:
 /// origin keys, noise keys, value slab 1, value slab 2. This is deliberately
-/// fp16/bf16 reference storage; quantized cache support stays represented by
-/// `MotifGroupedAttentionReferencePlan.parityHooks` until packed q4/q8 kernels
-/// have Swift fixtures.
+/// fp16/bf16 reference storage; `MotifGroupedQuantizedKVCache` below owns the
+/// opt-in q4/q8 packed-cache path.
 public final class MotifGroupedKVCacheReference {
     public private(set) var offset: Int = 0
 
@@ -236,6 +235,384 @@ public final class MotifGroupedKVCacheReference {
     private func appendCached(_ cached: MLXArray?, _ next: MLXArray) -> MLXArray {
         guard let cached else { return next }
         return concatenated([cached, next], axis: 2)
+    }
+}
+
+public typealias MotifQuantizedTuple = (data: MLXArray, scales: MLXArray, biases: MLXArray?)
+
+public enum MotifGroupedKVCacheError: Error, LocalizedError, Equatable, Sendable {
+    case unsupportedSingleSlotUpdate
+    case invalidStateCount(Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedSingleSlotUpdate:
+            "Motif grouped KV cache requires updateAndFetch4(kOrigin:kNoise:value1:value2:)."
+        case .invalidStateCount(let count):
+            "Motif grouped quantized KV cache expected 8 or 12 state arrays; got \(count)."
+        }
+    }
+}
+
+/// Production KVCache-compatible four-slot grouped cache. This mirrors the
+/// Python `MotifGroupedKVCache`: k-origin, k-noise, value-1, and value-2 are
+/// stored independently so grouped attention can avoid post-cache head splits.
+public final class MotifGroupedKVCache: KVCache, CustomDebugStringConvertible {
+    public var offset: Int = 0
+    public var maxSize: Int? { nil }
+    private var kOrigin: MLXArray?
+    private var kNoise: MLXArray?
+    private var value1: MLXArray?
+    private var value2: MLXArray?
+    public var step: Int
+
+    public init(step: Int = 256) {
+        self.step = step
+    }
+
+    public func innerState() -> [MLXArray] {
+        [kOrigin, kNoise, value1, value2].compactMap { $0 }
+    }
+
+    public func update(keys _: MLXArray, values _: MLXArray) -> (MLXArray, MLXArray) {
+        fatalError(MotifGroupedKVCacheError.unsupportedSingleSlotUpdate.localizedDescription)
+    }
+
+    public func updateAndFetch4(
+        kOrigin newKOrigin: MLXArray,
+        kNoise newKNoise: MLXArray,
+        value1 newValue1: MLXArray,
+        value2 newValue2: MLXArray
+    ) -> MotifGroupedKVCachedSlices {
+        let previous = offset
+        growIfNeeded(
+            batch: newKOrigin.dim(0),
+            heads: newKOrigin.dim(1),
+            sequenceLength: newKOrigin.dim(2),
+            headDim: newKOrigin.dim(3),
+            dtype: newKOrigin.dtype
+        )
+        offset += newKOrigin.dim(2)
+
+        kOrigin![.ellipsis, previous ..< offset, 0...] = newKOrigin
+        kNoise![.ellipsis, previous ..< offset, 0...] = newKNoise
+        value1![.ellipsis, previous ..< offset, 0...] = newValue1
+        value2![.ellipsis, previous ..< offset, 0...] = newValue2
+
+        return MotifGroupedKVCachedSlices(
+            kOrigin: kOrigin![.ellipsis, ..<offset, 0...],
+            kNoise: kNoise![.ellipsis, ..<offset, 0...],
+            value1: value1![.ellipsis, ..<offset, 0...],
+            value2: value2![.ellipsis, ..<offset, 0...]
+        )
+    }
+
+    private func growIfNeeded(batch: Int, heads: Int, sequenceLength: Int, headDim: Int, dtype: DType) {
+        let previous = offset
+        guard kOrigin == nil || previous + sequenceLength > kOrigin!.dim(2) else { return }
+        let newSteps = ((step + sequenceLength - 1) / step) * step
+        let freshShape = [batch, heads, newSteps, headDim]
+
+        func fresh() -> MLXArray {
+            MLXArray.zeros(freshShape, dtype: dtype)
+        }
+
+        if var kOrigin, var kNoise, var value1, var value2 {
+            if previous % step != 0 {
+                kOrigin = kOrigin[.ellipsis, ..<previous, 0...]
+                kNoise = kNoise[.ellipsis, ..<previous, 0...]
+                value1 = value1[.ellipsis, ..<previous, 0...]
+                value2 = value2[.ellipsis, ..<previous, 0...]
+            }
+            self.kOrigin = concatenated([kOrigin, fresh()], axis: 2)
+            self.kNoise = concatenated([kNoise, fresh()], axis: 2)
+            self.value1 = concatenated([value1, fresh()], axis: 2)
+            self.value2 = concatenated([value2, fresh()], axis: 2)
+        } else {
+            kOrigin = fresh()
+            kNoise = fresh()
+            value1 = fresh()
+            value2 = fresh()
+        }
+    }
+
+    public var state: [MLXArray] {
+        get {
+            guard let kOrigin, let kNoise, let value1, let value2 else { return [] }
+            return [
+                kOrigin[.ellipsis, ..<offset, 0...],
+                kNoise[.ellipsis, ..<offset, 0...],
+                value1[.ellipsis, ..<offset, 0...],
+                value2[.ellipsis, ..<offset, 0...],
+            ]
+        }
+        set {
+            guard newValue.count == 4 else {
+                fatalError("MotifGroupedKVCache state must have exactly 4 arrays")
+            }
+            kOrigin = newValue[0]
+            kNoise = newValue[1]
+            value1 = newValue[2]
+            value2 = newValue[3]
+            offset = newValue[0].dim(2)
+        }
+    }
+
+    public var metaState: [String] {
+        get { [String(offset), String(step)] }
+        set {
+            guard !newValue.isEmpty else { return }
+            offset = Int(newValue[0]) ?? 0
+            if newValue.count > 1 {
+                step = Int(newValue[1]) ?? step
+            }
+        }
+    }
+
+    public var isTrimmable: Bool { true }
+
+    @discardableResult
+    public func trim(_ n: Int) -> Int {
+        let trimmed = min(offset, n)
+        offset -= trimmed
+        return trimmed
+    }
+
+    public func makeMask(
+        n: Int,
+        windowSize: Int?,
+        returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n == 1 { return .none }
+        if returnArray || (windowSize != nil && n > windowSize!) {
+            return .array(createCausalMask(n: n, offset: offset, windowSize: windowSize))
+        }
+        return .causal
+    }
+
+    public var debugDescription: String {
+        "MotifGroupedKVCache(offset: \(offset), step: \(step))"
+    }
+}
+
+/// Quantized four-slot grouped cache. It exposes the packed tuples for the
+/// future `sdpa_dual_v_q4` Metal path and also provides a dequantized bridge
+/// so the native Swift model can use q4/q8 cache modes today.
+public final class MotifGroupedQuantizedKVCache: KVCache, CustomDebugStringConvertible {
+    public var offset: Int = 0
+    public var maxSize: Int? { nil }
+    private var kOrigin: MotifQuantizedTuple?
+    private var kNoise: MotifQuantizedTuple?
+    private var value1: MotifQuantizedTuple?
+    private var value2: MotifQuantizedTuple?
+    public var step: Int
+    public let groupSize: Int
+    public let bits: Int
+    public let mode: QuantizationMode
+
+    public init(groupSize: Int = 64, bits: Int = 4, mode: QuantizationMode = .affine, step: Int = 256) {
+        self.groupSize = groupSize
+        self.bits = bits
+        self.mode = mode
+        self.step = step
+    }
+
+    public func innerState() -> [MLXArray] {
+        state
+    }
+
+    public func update(keys _: MLXArray, values _: MLXArray) -> (MLXArray, MLXArray) {
+        fatalError(MotifGroupedKVCacheError.unsupportedSingleSlotUpdate.localizedDescription)
+    }
+
+    public func updateAndFetch4(
+        kOrigin newKOrigin: MLXArray,
+        kNoise newKNoise: MLXArray,
+        value1 newValue1: MLXArray,
+        value2 newValue2: MLXArray
+    ) -> MotifGroupedKVCachedSlices {
+        let packed = updateAndFetch4Quantized(
+            kOrigin: newKOrigin,
+            kNoise: newKNoise,
+            value1: newValue1,
+            value2: newValue2
+        )
+        return MotifGroupedKVCachedSlices(
+            kOrigin: dequantize(packed.kOrigin, dtype: newKOrigin.dtype),
+            kNoise: dequantize(packed.kNoise, dtype: newKNoise.dtype),
+            value1: dequantize(packed.value1, dtype: newValue1.dtype),
+            value2: dequantize(packed.value2, dtype: newValue2.dtype)
+        )
+    }
+
+    public func updateAndFetch4Quantized(
+        kOrigin newKOrigin: MLXArray,
+        kNoise newKNoise: MLXArray,
+        value1 newValue1: MLXArray,
+        value2 newValue2: MLXArray
+    ) -> (
+        kOrigin: MotifQuantizedTuple,
+        kNoise: MotifQuantizedTuple,
+        value1: MotifQuantizedTuple,
+        value2: MotifQuantizedTuple
+    ) {
+        let previous = offset
+        growIfNeeded(
+            batch: newKOrigin.dim(0),
+            heads: newKOrigin.dim(1),
+            sequenceLength: newKOrigin.dim(2),
+            headDim: newKOrigin.dim(3),
+            dtype: newKOrigin.dtype
+        )
+        offset += newKOrigin.dim(2)
+
+        writeQuantized(newKOrigin, into: &kOrigin, range: previous ..< offset)
+        writeQuantized(newKNoise, into: &kNoise, range: previous ..< offset)
+        writeQuantized(newValue1, into: &value1, range: previous ..< offset)
+        writeQuantized(newValue2, into: &value2, range: previous ..< offset)
+
+        return (
+            live(kOrigin!),
+            live(kNoise!),
+            live(value1!),
+            live(value2!)
+        )
+    }
+
+    private func initQuantizedStorage(batch: Int, heads: Int, sequenceLength: Int, headDim: Int, dtype: DType)
+        -> MotifQuantizedTuple
+    {
+        let zeros = MLXArray.zeros([batch, heads, sequenceLength, headDim], dtype: dtype)
+        let q = quantized(zeros, groupSize: groupSize, bits: bits, mode: mode)
+        return (q.wq, q.scales, q.biases)
+    }
+
+    private func growIfNeeded(batch: Int, heads: Int, sequenceLength: Int, headDim: Int, dtype: DType) {
+        let previous = offset
+        guard kOrigin == nil || previous + sequenceLength > kOrigin!.data.dim(2) else { return }
+        let newSteps = ((step + sequenceLength - 1) / step) * step
+        func fresh() -> MotifQuantizedTuple {
+            initQuantizedStorage(batch: batch, heads: heads, sequenceLength: newSteps, headDim: headDim, dtype: dtype)
+        }
+        func expand(_ tuple: MotifQuantizedTuple) -> MotifQuantizedTuple {
+            let trimmed = previous % step == 0 ? tuple : live(tuple)
+            let add = fresh()
+            return (
+                concatenated([trimmed.data, add.data], axis: 2),
+                concatenated([trimmed.scales, add.scales], axis: 2),
+                optionalConcatenate(trimmed.biases, add.biases, axis: 2)
+            )
+        }
+        if let kOrigin, let kNoise, let value1, let value2 {
+            self.kOrigin = expand(kOrigin)
+            self.kNoise = expand(kNoise)
+            self.value1 = expand(value1)
+            self.value2 = expand(value2)
+        } else {
+            kOrigin = fresh()
+            kNoise = fresh()
+            value1 = fresh()
+            value2 = fresh()
+        }
+    }
+
+    private func writeQuantized(_ fresh: MLXArray, into slot: inout MotifQuantizedTuple?, range: Range<Int>) {
+        let q = quantized(fresh, groupSize: groupSize, bits: bits, mode: mode)
+        guard let current = slot else {
+            fatalError("Quantized cache storage not initialized")
+        }
+        current.data[.ellipsis, range, 0...] = q.wq
+        current.scales[.ellipsis, range, 0...] = q.scales
+        if let biases = q.biases {
+            current.biases![.ellipsis, range, 0...] = biases
+        }
+        slot = current
+    }
+
+    private func live(_ tuple: MotifQuantizedTuple) -> MotifQuantizedTuple {
+        (
+            tuple.data[.ellipsis, ..<offset, 0...],
+            tuple.scales[.ellipsis, ..<offset, 0...],
+            tuple.biases?[.ellipsis, ..<offset, 0...]
+        )
+    }
+
+    public func dequantize(_ tuple: MotifQuantizedTuple, dtype: DType? = nil) -> MLXArray {
+        dequantized(
+            tuple.data,
+            scales: tuple.scales,
+            biases: tuple.biases,
+            groupSize: groupSize,
+            bits: bits,
+            mode: mode,
+            dtype: dtype
+        )
+    }
+
+    private func optionalConcatenate(_ lhs: MLXArray?, _ rhs: MLXArray?, axis: Int) -> MLXArray? {
+        guard let lhs, let rhs else { return nil }
+        return concatenated([lhs, rhs], axis: axis)
+    }
+
+    public var state: [MLXArray] {
+        get {
+            guard let kOrigin, let kNoise, let value1, let value2 else { return [] }
+            let tuples = [live(kOrigin), live(kNoise), live(value1), live(value2)]
+            return tuples.flatMap { [$0.data, $0.scales, $0.biases].compactMap { $0 } }
+        }
+        set {
+            switch newValue.count {
+            case 8:
+                kOrigin = (newValue[0], newValue[1], nil)
+                kNoise = (newValue[2], newValue[3], nil)
+                value1 = (newValue[4], newValue[5], nil)
+                value2 = (newValue[6], newValue[7], nil)
+            case 12:
+                kOrigin = (newValue[0], newValue[1], newValue[2])
+                kNoise = (newValue[3], newValue[4], newValue[5])
+                value1 = (newValue[6], newValue[7], newValue[8])
+                value2 = (newValue[9], newValue[10], newValue[11])
+            default:
+                fatalError(MotifGroupedKVCacheError.invalidStateCount(newValue.count).localizedDescription)
+            }
+            offset = kOrigin?.data.dim(2) ?? 0
+        }
+    }
+
+    public var metaState: [String] {
+        get { [String(offset), String(groupSize), String(bits), String(step)] }
+        set {
+            guard !newValue.isEmpty else { return }
+            offset = Int(newValue[0]) ?? 0
+            if newValue.count > 3 {
+                step = Int(newValue[3]) ?? step
+            }
+        }
+    }
+
+    public var isTrimmable: Bool { true }
+
+    @discardableResult
+    public func trim(_ n: Int) -> Int {
+        let trimmed = min(offset, n)
+        offset -= trimmed
+        return trimmed
+    }
+
+    public func makeMask(
+        n: Int,
+        windowSize: Int?,
+        returnArray: Bool
+    ) -> MLXFast.ScaledDotProductAttentionMaskMode {
+        if n == 1 { return .none }
+        if returnArray || (windowSize != nil && n > windowSize!) {
+            return .array(createCausalMask(n: n, offset: offset, windowSize: windowSize))
+        }
+        return .causal
+    }
+
+    public var debugDescription: String {
+        "MotifGroupedQuantizedKVCache(offset: \(offset), groupSize: \(groupSize), bits: \(bits))"
     }
 }
 
@@ -517,11 +894,11 @@ public enum MotifGroupedDifferentialAttentionReference {
         scale: Float,
         mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
     ) -> MLXArray {
-        let values = concatenated([value1, value2], axis: -1)
-        return MLXFast.scaledDotProductAttention(
+        MotifSDPADualV.apply(
             queries: queries,
             keys: keys,
-            values: values,
+            value1: value1,
+            value2: value2,
             scale: scale,
             mask: mask
         )
@@ -536,14 +913,15 @@ public enum MotifGroupedDifferentialAttentionReference {
         groupedRatio: Int,
         eps: Float = 1e-5
     ) -> MLXArray {
-        let noise = repeatHeadsIfNeeded(attnNoise, count: groupedRatio)
-        let differential = attnOrigin - lambda.asType(attnOrigin.dtype) * noise
-        let normalized = MLXFast.rmsNorm(
-            differential,
-            weight: sublnWeight.asType(differential.dtype),
+        MotifGDAPostSplit.apply(
+            attnOrigin: attnOrigin,
+            attnNoise: attnNoise,
+            sublnWeight: sublnWeight,
+            lambda: lambda,
+            lambdaInit: lambdaInit,
+            groupedRatio: groupedRatio,
             eps: eps
         )
-        return normalized * Float(1.0 - lambdaInit)
     }
 
     private static func repeatHeadsIfNeeded(_ x: MLXArray, count: Int) -> MLXArray {

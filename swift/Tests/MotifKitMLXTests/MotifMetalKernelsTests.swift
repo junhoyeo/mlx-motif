@@ -10,7 +10,10 @@ final class MotifMetalKernelsTests: XCTestCase {
         XCTAssertEqual(descriptors.map(\.name), MotifMetalKernelName.allCases)
         XCTAssertTrue(descriptors.allSatisfy { !$0.defaultEnabled })
         XCTAssertEqual(MotifMetalKernels.descriptor(for: .polynorm).status, .wrapperScaffolded)
-        XCTAssertEqual(MotifMetalKernels.descriptor(for: .gdaPost).status, .parityPending)
+        XCTAssertEqual(MotifMetalKernels.descriptor(for: .gdaPost).status, .referenceReady)
+        XCTAssertEqual(MotifMetalKernels.descriptor(for: .gdaPostSplit).status, .referenceReady)
+        XCTAssertEqual(MotifMetalKernels.descriptor(for: .sdpaDualV).status, .referenceReady)
+        XCTAssertEqual(MotifMetalKernels.descriptor(for: .sdpaDualVQ4).status, .wrapperScaffolded)
         XCTAssertEqual(MotifMetalKernels.descriptor(for: .gdaPost).pythonSymbol, "gda_post")
     }
 

@@ -43,10 +43,9 @@ MotifChat.app
 
 4. **Performance parity**
    - Port `polynorm` Metal kernel.
-   - Port `gda_post_split` kernel.
-   - Port `sdpa_dual_v` decode kernel.
-   - Port `MotifGroupedKVCache` and `MotifGroupedQuantizedKVCache`.
-   - Port `sdpa_dual_v_q4` after quantized cache correctness tests pass.
+   - Keep `gda_post_split` and `sdpa_dual_v` callable through Swift reference wrappers until Python golden fixtures approve direct Metal dispatch.
+   - Use `MotifGroupedKVCache` and `MotifGroupedQuantizedKVCache` behind `MLX_MOTIF_4SLOT_CACHE=1|q4|q8`.
+   - Keep `sdpa_dual_v_q4` on the packed-cache dequant bridge until the direct packed Metal kernel has Swift fixture coverage.
 
 5. **Benchmarks**
    - Match Python prompts: short, long, xlong.
@@ -69,3 +68,15 @@ Use OSS chat apps as interaction references, not copied assets:
 - First generated tokens match Python reference for deterministic greedy prompts.
 - `sdpa_dual_v` and `gda_post_split` pass fixture tests against Python outputs.
 - Long prompt decode speed is within 10% of Python `mlx-motif` custom-kernel path on the same machine, or the delta is explained by a measured MLX Swift API/runtime gap.
+
+## Follow-up PR status after PR #7
+
+The follow-up branch advances the next vertical slice:
+
+- `MotifMLXModel` now conforms to `LLMModel` and runs a correctness-first decoder path through MLX Swift reference ops.
+- `MotifMLXNativeRuntime` loads converted MLX checkpoint directories, tokenizer/chat template metadata, EOS IDs, and quantization metadata.
+- `MotifMLXBackend(modelDirectory:)` streams native generation events when a real converted model directory is provided.
+- `MotifNativeGenerate`, `MotifNativeEvaluate`, `MotifNativeServe`, and `scripts/bench_swift_native.py` provide generation, perplexity, local OpenAI-compatible serving, and benchmark entry points for same-machine parity runs.
+- `MLX_MOTIF_4SLOT_CACHE=1|q4|q8` selects grouped fp/q4/q8 cache implementations in Swift. q4/q8 currently use a dequant bridge; direct packed-Metal speed parity is still a measured-performance gate.
+
+Remaining gates for true Python parity are tracked in [`swift-full-parity-followup.md`](swift-full-parity-followup.md): direct custom Metal runtime enablement, packed `sdpa_dual_v_q4`, speculative decoding, checked-in perplexity/long-context evidence, and measured performance parity.

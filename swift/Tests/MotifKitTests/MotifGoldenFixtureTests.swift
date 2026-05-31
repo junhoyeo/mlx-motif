@@ -120,6 +120,29 @@ final class MotifGoldenFixtureTests: XCTestCase {
         }
     }
 
+    func testRuntimeFeatureFlagsParsePythonCompatibleEnvironment() {
+        let q4 = MotifRuntimeFeatureFlags.fromEnvironment([
+            "MLX_MOTIF_4SLOT_CACHE": "q4",
+            "MLX_MOTIF_DUAL_V": "1",
+            "MLX_MOTIF_QUANT_SDPA": "1",
+        ])
+        XCTAssertEqual(q4.fourSlotCacheMode, .q4)
+        XCTAssertEqual(q4.fourSlotCacheMode.cacheKind, .groupedQuantized4Bit)
+        XCTAssertTrue(q4.dualVAttention)
+        XCTAssertTrue(q4.quantizedSDPA)
+
+        let disabled = MotifRuntimeFeatureFlags.fromEnvironment([
+            "MLX_MOTIF_4SLOT_CACHE": "0",
+            "MLX_MOTIF_DUAL_V": "false",
+            "MLX_MOTIF_QUANT_SDPA": "off",
+            "MLX_MOTIF_DISABLE_KERNELS": "1",
+        ])
+        XCTAssertEqual(disabled.fourSlotCacheMode, .disabled)
+        XCTAssertFalse(disabled.dualVAttention)
+        XCTAssertFalse(disabled.quantizedSDPA)
+        XCTAssertTrue(disabled.disableCustomKernels)
+    }
+
     func testPolyNormReferenceMatchesGoldenFixture() throws {
         let fixture = try loadGoldenFixture()
         let coefficients = MotifPolyNormCoefficients(

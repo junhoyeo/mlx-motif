@@ -42,14 +42,14 @@ public struct OpenAICompatibleMotifBackend: MotifChatBackend {
                         guard line.hasPrefix("data:") else { continue }
                         let payload = line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
                         if payload == "[DONE]" {
-                            continuation.yield(.completed)
+                            continuation.yield(.completed(usage: nil))
                             continuation.finish()
                             return
                         }
                         try emit(payload: payload, continuation: continuation)
                     }
 
-                    continuation.yield(.completed)
+                    continuation.yield(.completed(usage: nil))
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish()
@@ -105,7 +105,7 @@ public struct OpenAICompatibleMotifBackend: MotifChatBackend {
         if let finishReason = firstChoice["finish_reason"] as? String,
            !finishReason.isEmpty,
            finishReason != "null" {
-            continuation.yield(.completed)
+            continuation.yield(.completed(usage: nil))
         }
     }
 }

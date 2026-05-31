@@ -238,7 +238,7 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                             if !visible.isEmpty {
                                 continuation.yield(.text(visible))
                             }
-                        case .info:
+                        case .info(let completion):
                             let tail = thinkFilter.finish()
                             if !tail.isEmpty {
                                 continuation.yield(.text(tail))
@@ -246,7 +246,14 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                             if parameters.thinkMode == .captured, !thinkFilter.capturedReasoning.isEmpty {
                                 continuation.yield(.reasoning(thinkFilter.capturedReasoning))
                             }
-                            continuation.yield(.completed)
+                            // Surface the real token counts from MLX's terminal
+                            // completion info so HTTP servers (MotifNativeServe)
+                            // can populate `usage` instead of reporting zeros.
+                            let usage = MotifGenerationUsage(
+                                promptTokens: completion.promptTokenCount,
+                                completionTokens: completion.generationTokenCount
+                            )
+                            continuation.yield(.completed(usage: usage))
                         case .toolCall:
                             break
                         }

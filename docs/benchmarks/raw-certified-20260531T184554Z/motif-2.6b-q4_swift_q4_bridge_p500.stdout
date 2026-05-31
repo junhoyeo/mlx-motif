@@ -1,0 +1,101 @@
+{
+  "elapsedSeconds" : 4.357801079750061,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 3.5774730443954468,
+    "generationTokenCount" : 64,
+    "promptTime" : 0.7090580463409424,
+    "promptTokenCount" : 462,
+    "promptTokensPerSecond" : 651.5686584252549,
+    "tokensPerSecond" : 17.889722495677194
+  },
+  "output" : "It seems like you've repeated the same statement multiple times. The message is clear: the development of large language models has been rapid, and new architectures are emerging that challenge conventional wisdom about attention mechanisms. These new approaches include differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels, which are offering",
+  "outputCharacters" : 399,
+  "promptCharacters" : 3199,
+  "promptTokens" : 462
+}
+
+{
+  "elapsedSeconds" : 4.291956901550293,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 3.512408971786499,
+    "generationTokenCount" : 64,
+    "promptTime" : 0.7145290374755859,
+    "promptTokenCount" : 462,
+    "promptTokensPerSecond" : 646.5797410168732,
+    "tokensPerSecond" : 18.221112778745695
+  },
+  "output" : "It seems like you've repeated the same statement multiple times. The message is clear: the development of large language models has been rapid, and new architectures are emerging that challenge conventional wisdom about attention mechanisms. These new approaches include differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels, which are offering",
+  "outputCharacters" : 399,
+  "promptCharacters" : 3199,
+  "promptTokens" : 462
+}
+
+{
+  "elapsedSeconds" : 4.25938093662262,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 3.4872299432754517,
+    "generationTokenCount" : 64,
+    "promptTime" : 0.7040059566497803,
+    "promptTokenCount" : 462,
+    "promptTokensPerSecond" : 656.2444474171257,
+    "tokensPerSecond" : 18.35267563110183
+  },
+  "output" : "It seems like you've repeated the same statement multiple times. The message is clear: the development of large language models has been rapid, and new architectures are emerging that challenge conventional wisdom about attention mechanisms. These new approaches include differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels, which are offering",
+  "outputCharacters" : 399,
+  "promptCharacters" : 3199,
+  "promptTokens" : 462
+}
+
+{
+  "elapsedSeconds" : 4.23861300945282,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 3.4696840047836304,
+    "generationTokenCount" : 64,
+    "promptTime" : 0.7031240463256836,
+    "promptTokenCount" : 462,
+    "promptTokensPerSecond" : 657.0675578715792,
+    "tokensPerSecond" : 18.44548377078824
+  },
+  "output" : "It seems like you've repeated the same statement multiple times. The message is clear: the development of large language models has been rapid, and new architectures are emerging that challenge conventional wisdom about attention mechanisms. These new approaches include differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels, which are offering",
+  "outputCharacters" : 399,
+  "promptCharacters" : 3199,
+  "promptTokens" : 462
+}
+
+{
+  "elapsedSeconds" : 4.338909029960632,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 3.5751240253448486,
+    "generationTokenCount" : 64,
+    "promptTime" : 0.6992878913879395,
+    "promptTokenCount" : 462,
+    "promptTokensPerSecond" : 660.6721004177938,
+    "tokensPerSecond" : 17.90147685682784
+  },
+  "output" : "It seems like you've repeated the same statement multiple times. The message is clear: the development of large language models has been rapid, and new architectures are emerging that challenge conventional wisdom about attention mechanisms. These new approaches include differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels, which are offering",
+  "outputCharacters" : 399,
+  "promptCharacters" : 3199,
+  "promptTokens" : 462
+}
+
+{
+  "elapsedSeconds" : 4.461423993110657,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 3.6919829845428467,
+    "generationTokenCount" : 64,
+    "promptTime" : 0.7020829916000366,
+    "promptTokenCount" : 462,
+    "promptTokensPerSecond" : 658.0418633231791,
+    "tokensPerSecond" : 17.33485778995937
+  },
+  "output" : "It seems like you've repeated the same statement multiple times. The message is clear: the development of large language models has been rapid, and new architectures are emerging that challenge conventional wisdom about attention mechanisms. These new approaches include differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels, which are offering",
+  "outputCharacters" : 399,
+  "promptCharacters" : 3199,
+  "promptTokens" : 462
+}

@@ -21,7 +21,7 @@ MOTIFKIT_ENABLE_MLX=1 scripts/smoke_swift_chat_app.py \
 The smoke script now starts the real Swift `MotifNativeServe` process, waits for
 `GET /v1/models`, sends a non-streaming `/v1/chat/completions` request, and then
 terminates the server. The latest checked-in native-server smoke evidence is
-[`benchmarks/swift-app-smoke-native-server-20260527T102500Z.json`](benchmarks/swift-app-smoke-native-server-20260527T102500Z.json).
+[`benchmarks/swift-app-smoke-native-server-20260531T184436Z.json`](benchmarks/swift-app-smoke-native-server-20260531T184436Z.json).
 
 ## Manual UI pass
 
@@ -74,5 +74,6 @@ NOTARYTOOL_PROFILE=motif-notary scripts/package_swift_chat_app.sh
 
 The packaging script ad-hoc signs by default and writes
 `MotifChatApp.metadata.json` with the git commit, Swift toolchain, bundle path,
-zip path, and SHA-256 checksums. Distribution builds should provide a Developer
+zip path, and SHA-256 checksums. The latest checked-in package verification
+evidence is [`benchmarks/swift-app-package-20260531T184436Z.json`](benchmarks/swift-app-package-20260531T184436Z.json). Distribution builds should provide a Developer
 ID identity and a notarytool keychain profile.

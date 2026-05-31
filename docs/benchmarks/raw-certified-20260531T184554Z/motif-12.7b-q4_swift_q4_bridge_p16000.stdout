@@ -1,0 +1,101 @@
+{
+  "elapsedSeconds" : 137.14786505699158,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 21.330499053001404,
+    "generationTokenCount" : 64,
+    "promptTime" : 113.82876193523407,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 127.6215233568606,
+    "tokensPerSecond" : 3.0003986236315736
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. They want me to act as an expert and analyze this text. Let me start by understanding the main points here.\n\nFirst, the text is a loop of similar sentences. It mentions that LLM development has accelerated,",
+  "outputCharacters" : 327,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}
+
+{
+  "elapsedSeconds" : 139.11937594413757,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 25.100221991539,
+    "generationTokenCount" : 64,
+    "promptTime" : 112.20534110069275,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 129.4679901820673,
+    "tokensPerSecond" : 2.549778245848729
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. They want me to act as an expert and analyze this text. Let me start by understanding the main points here.\n\nFirst, the text is a loop of similar sentences. It mentions that LLM development has accelerated,",
+  "outputCharacters" : 327,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}
+
+{
+  "elapsedSeconds" : 138.0336719751358,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 23.264292001724243,
+    "generationTokenCount" : 64,
+    "promptTime" : 112.84306597709656,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 128.73631068255895,
+    "tokensPerSecond" : 2.7509971072945874
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. They want me to act as an expert and analyze this text. Let me start by understanding the main points here.\n\nFirst, the text is a loop of similar sentences. It mentions that LLM development has accelerated,",
+  "outputCharacters" : 327,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}
+
+{
+  "elapsedSeconds" : 153.64462196826935,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 38.5847749710083,
+    "generationTokenCount" : 64,
+    "promptTime" : 113.20372903347015,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 128.32616137322563,
+    "tokensPerSecond" : 1.6586853246672582
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. They want me to act as an expert and analyze this text. Let me start by understanding the main points here.\n\nFirst, the text is a loop of similar sentences. It mentions that LLM development has accelerated,",
+  "outputCharacters" : 327,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}
+
+{
+  "elapsedSeconds" : 186.17053198814392,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 66.99312794208527,
+    "generationTokenCount" : 64,
+    "promptTime" : 114.0264800786972,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 127.40023185819608,
+    "tokensPerSecond" : 0.955321866077476
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. They want me to act as an expert and analyze this text. Let me start by understanding the main points here.\n\nFirst, the text is a loop of similar sentences. It mentions that LLM development has accelerated,",
+  "outputCharacters" : 327,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}
+
+{
+  "elapsedSeconds" : 149.1029440164566,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 29.00651502609253,
+    "generationTokenCount" : 64,
+    "promptTime" : 115.62144196033478,
+    "promptTokenCount" : 14527,
+    "promptTokensPerSecond" : 125.64278522822478,
+    "tokensPerSecond" : 2.2064008703709983
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. They want me to act as an expert and analyze this text. Let me start by understanding the main points here.\n\nFirst, the text is a loop of similar sentences. It mentions that LLM development has accelerated,",
+  "outputCharacters" : 327,
+  "promptCharacters" : 99711,
+  "promptTokens" : 14527
+}

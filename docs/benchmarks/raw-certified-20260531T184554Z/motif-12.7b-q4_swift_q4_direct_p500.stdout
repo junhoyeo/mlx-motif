@@ -1,0 +1,101 @@
+{
+  "elapsedSeconds" : 17.73932707309723,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 14.760624051094055,
+    "generationTokenCount" : 64,
+    "promptTime" : 2.902385950088501,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 161.59119016742036,
+    "tokensPerSecond" : 4.335860040772214
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're trying to ask something but the message got cut off at the end. Let me try to understand what they need.\n\nFirst, I notice the text repeats the same sentence over and over - \"The development of large",
+  "outputCharacters" : 323,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}
+
+{
+  "elapsedSeconds" : 12.683341026306152,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.705314993858337,
+    "generationTokenCount" : 64,
+    "promptTime" : 2.9021960496902466,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 161.60176361967575,
+    "tokensPerSecond" : 6.594324866374777
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're trying to ask something but the message got cut off at the end. Let me try to understand what they need.\n\nFirst, I notice the text repeats the same sentence over and over - \"The development of large",
+  "outputCharacters" : 323,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}
+
+{
+  "elapsedSeconds" : 12.153805017471313,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.187700986862183,
+    "generationTokenCount" : 64,
+    "promptTime" : 2.887764096260071,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 162.40938815168442,
+    "tokensPerSecond" : 6.965834009129798
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're trying to ask something but the message got cut off at the end. Let me try to understand what they need.\n\nFirst, I notice the text repeats the same sentence over and over - \"The development of large",
+  "outputCharacters" : 323,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}
+
+{
+  "elapsedSeconds" : 13.026914954185486,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 10.079957008361816,
+    "generationTokenCount" : 64,
+    "promptTime" : 2.8726489543914795,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 163.26394468876182,
+    "tokensPerSecond" : 6.349233428962929
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're trying to ask something but the message got cut off at the end. Let me try to understand what they need.\n\nFirst, I notice the text repeats the same sentence over and over - \"The development of large",
+  "outputCharacters" : 323,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}
+
+{
+  "elapsedSeconds" : 12.079012989997864,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.119756937026978,
+    "generationTokenCount" : 64,
+    "promptTime" : 2.8859490156173706,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 162.51153345467893,
+    "tokensPerSecond" : 7.017730893699001
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're trying to ask something but the message got cut off at the end. Let me try to understand what they need.\n\nFirst, I notice the text repeats the same sentence over and over - \"The development of large",
+  "outputCharacters" : 323,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}
+
+{
+  "elapsedSeconds" : 12.542351961135864,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.587599992752075,
+    "generationTokenCount" : 64,
+    "promptTime" : 2.87946093082428,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 162.87770915014403,
+    "tokensPerSecond" : 6.675288919894655
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're trying to ask something but the message got cut off at the end. Let me try to understand what they need.\n\nFirst, I notice the text repeats the same sentence over and over - \"The development of large",
+  "outputCharacters" : 323,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}

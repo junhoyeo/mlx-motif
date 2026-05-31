@@ -1,0 +1,101 @@
+{
+  "elapsedSeconds" : 25.480149030685425,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.023014068603516,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.88666296005249,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 172.1569851942628,
+    "tokensPerSecond" : 7.092973535605406
+  },
+  "output" : "Okay, the user provided a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle such redundancy. The main topic is the rapid development of LLMs and new attention alternatives like differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels.\n\nFirst",
+  "outputCharacters" : 364,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}
+
+{
+  "elapsedSeconds" : 24.842159032821655,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 8.754333019256592,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.724300980567932,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 173.9345999151192,
+    "tokensPerSecond" : 7.310665456662604
+  },
+  "output" : "Okay, the user provided a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle such redundancy. The main topic is the rapid development of LLMs and new attention alternatives like differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels.\n\nFirst",
+  "outputCharacters" : 364,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}
+
+{
+  "elapsedSeconds" : 25.018749952316284,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 8.94708001613617,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.716954946517944,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 174.01589616479325,
+    "tokensPerSecond" : 7.153171748165347
+  },
+  "output" : "Okay, the user provided a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle such redundancy. The main topic is the rapid development of LLMs and new attention alternatives like differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels.\n\nFirst",
+  "outputCharacters" : 364,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}
+
+{
+  "elapsedSeconds" : 24.99024796485901,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 8.890803933143616,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.738457918167114,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 173.77814359073597,
+    "tokensPerSecond" : 7.198449148273012
+  },
+  "output" : "Okay, the user provided a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle such redundancy. The main topic is the rapid development of LLMs and new attention alternatives like differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels.\n\nFirst",
+  "outputCharacters" : 364,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}
+
+{
+  "elapsedSeconds" : 24.664003014564514,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 8.67585802078247,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.6313978433609,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 174.96835711091776,
+    "tokensPerSecond" : 7.376791995292228
+  },
+  "output" : "Okay, the user provided a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle such redundancy. The main topic is the rapid development of LLMs and new attention alternatives like differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels.\n\nFirst",
+  "outputCharacters" : 364,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}
+
+{
+  "elapsedSeconds" : 24.739844918251038,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 8.727195978164673,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.65064799785614,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 174.75314762523865,
+    "tokensPerSecond" : 7.333397824470442
+  },
+  "output" : "Okay, the user provided a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle such redundancy. The main topic is the rapid development of LLMs and new attention alternatives like differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels.\n\nFirst",
+  "outputCharacters" : 364,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}

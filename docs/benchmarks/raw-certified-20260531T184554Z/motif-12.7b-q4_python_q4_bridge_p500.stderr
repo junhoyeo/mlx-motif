@@ -1,0 +1,10 @@
+[bench] 4slot=q4 quant_sdpa=0 disable_kernels=1 — loading .models/motif-12.7b-reasoning-q4
+[bench] model loaded
+[bench] p500: prompt tokens = 555
+[bench]   warmup 1: 19.15 tok/s
+[bench]   run 1: 19.03 tok/s
+[bench]   run 2: 19.03 tok/s
+[bench]   run 3: 19.06 tok/s
+[bench]   run 4: 19.02 tok/s
+[bench]   run 5: 18.76 tok/s
+[bench] p500 median: 19.03 tok/s

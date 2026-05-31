@@ -1,0 +1,101 @@
+{
+  "elapsedSeconds" : 30.485311031341553,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 14.628183007240295,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.493631958961487,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 176.52413631899145,
+    "tokensPerSecond" : 4.3751161691320695
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. It seems like they might be testing the system's ability to handle such inputs or perhaps there's a formatting error. The main topic is the advancements in attention mechanisms like differential attention, grouped differential attention, quantized key-value",
+  "outputCharacters" : 378,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}
+
+{
+  "elapsedSeconds" : 24.803622007369995,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 8.911044001579285,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.529869079589844,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 176.1122380351859,
+    "tokensPerSecond" : 7.182098976130902
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. It seems like they might be testing the system's ability to handle such inputs or perhaps there's a formatting error. The main topic is the advancements in attention mechanisms like differential attention, grouped differential attention, quantized key-value",
+  "outputCharacters" : 378,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}
+
+{
+  "elapsedSeconds" : 24.937143921852112,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.003278017044067,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.556067943572998,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 175.81563733976665,
+    "tokensPerSecond" : 7.108522015963727
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. It seems like they might be testing the system's ability to handle such inputs or perhaps there's a formatting error. The main topic is the advancements in attention mechanisms like differential attention, grouped differential attention, quantized key-value",
+  "outputCharacters" : 378,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}
+
+{
+  "elapsedSeconds" : 25.544724941253662,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.366747975349426,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.800695896148682,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 173.09364207602013,
+    "tokensPerSecond" : 6.832680901464362
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. It seems like they might be testing the system's ability to handle such inputs or perhaps there's a formatting error. The main topic is the advancements in attention mechanisms like differential attention, grouped differential attention, quantized key-value",
+  "outputCharacters" : 378,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}
+
+{
+  "elapsedSeconds" : 24.754341959953308,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 8.867745041847229,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.518069982528687,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 176.24614420989542,
+    "tokensPerSecond" : 7.21716735178803
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. It seems like they might be testing the system's ability to handle such inputs or perhaps there's a formatting error. The main topic is the advancements in attention mechanisms like differential attention, grouped differential attention, quantized key-value",
+  "outputCharacters" : 378,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}
+
+{
+  "elapsedSeconds" : 25.112457990646362,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.215386033058167,
+    "generationTokenCount" : 64,
+    "promptTime" : 15.511389017105103,
+    "promptTokenCount" : 2735,
+    "promptTokensPerSecond" : 176.32205581228047,
+    "tokensPerSecond" : 6.944907111911981
+  },
+  "output" : "Okay, the user provided a long, repetitive text about the development of large language models and attention mechanisms. It seems like they might be testing the system's ability to handle such inputs or perhaps there's a formatting error. The main topic is the advancements in attention mechanisms like differential attention, grouped differential attention, quantized key-value",
+  "outputCharacters" : 378,
+  "promptCharacters" : 18744,
+  "promptTokens" : 2735
+}

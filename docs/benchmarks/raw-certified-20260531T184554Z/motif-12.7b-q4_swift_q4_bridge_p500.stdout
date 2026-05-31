@@ -1,0 +1,101 @@
+{
+  "elapsedSeconds" : 12.823868989944458,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.819372057914734,
+    "generationTokenCount" : 64,
+    "promptTime" : 2.9226800203323364,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 160.4691573272774,
+    "tokensPerSecond" : 6.517728386553386
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this redundancy while still providing useful information. The text repeats the same sentence about differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels being alternatives to standard scaled",
+  "outputCharacters" : 394,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}
+
+{
+  "elapsedSeconds" : 12.439481019973755,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 9.342936992645264,
+    "generationTokenCount" : 64,
+    "promptTime" : 3.0094019174575806,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 155.84491964311073,
+    "tokensPerSecond" : 6.850094360090477
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this redundancy while still providing useful information. The text repeats the same sentence about differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels being alternatives to standard scaled",
+  "outputCharacters" : 394,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}
+
+{
+  "elapsedSeconds" : 11.635637998580933,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 8.65207302570343,
+    "generationTokenCount" : 64,
+    "promptTime" : 2.9079229831695557,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 161.28350121873,
+    "tokensPerSecond" : 7.397071177031203
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this redundancy while still providing useful information. The text repeats the same sentence about differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels being alternatives to standard scaled",
+  "outputCharacters" : 394,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}
+
+{
+  "elapsedSeconds" : 23.696745991706848,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 20.552139043807983,
+    "generationTokenCount" : 64,
+    "promptTime" : 3.057600975036621,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 153.38822947437828,
+    "tokensPerSecond" : 3.114031092509669
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this redundancy while still providing useful information. The text repeats the same sentence about differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels being alternatives to standard scaled",
+  "outputCharacters" : 394,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}
+
+{
+  "elapsedSeconds" : 11.543729901313782,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 8.569172024726868,
+    "generationTokenCount" : 64,
+    "promptTime" : 2.897133946418762,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 161.88412709731477,
+    "tokensPerSecond" : 7.468632887205917
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this redundancy while still providing useful information. The text repeats the same sentence about differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels being alternatives to standard scaled",
+  "outputCharacters" : 394,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}
+
+{
+  "elapsedSeconds" : 17.901803970336914,
+  "generatedTokens" : 64,
+  "generationInfo" : {
+    "generateTime" : 14.941421031951904,
+    "generationTokenCount" : 64,
+    "promptTime" : 2.8833290338516235,
+    "promptTokenCount" : 469,
+    "promptTokensPerSecond" : 162.65920208679688,
+    "tokensPerSecond" : 4.28339445512829
+  },
+  "output" : "Okay, the user has shared a very repetitive text about large language models and attention mechanisms. It seems like they're testing if I can handle this redundancy while still providing useful information. The text repeats the same sentence about differential attention, grouped differential attention, quantized key-value caches, and custom Metal kernels being alternatives to standard scaled",
+  "outputCharacters" : 394,
+  "promptCharacters" : 3206,
+  "promptTokens" : 469
+}

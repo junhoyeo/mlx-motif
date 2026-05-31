@@ -1,0 +1,10 @@
+[bench] 4slot=q4 quant_sdpa=0 disable_kernels=1 — loading .models/motif-2.6b-mlx-q4
+[bench] model loaded
+[bench] p3000: prompt tokens = 2727
+[bench]   warmup 1: 51.00 tok/s
+[bench]   run 1: 52.20 tok/s
+[bench]   run 2: 51.47 tok/s
+[bench]   run 3: 50.60 tok/s
+[bench]   run 4: 52.23 tok/s
+[bench]   run 5: 52.19 tok/s
+[bench] p3000 median: 52.19 tok/s

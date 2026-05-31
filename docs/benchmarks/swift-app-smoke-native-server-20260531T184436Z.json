@@ -1,0 +1,75 @@
+{
+  "model": ".models/motif-2.6b-mlx-q4",
+  "required": true,
+  "checks": {
+    "native_generate": {
+      "command": [
+        "swift",
+        "run",
+        "--package-path",
+        "swift",
+        "MotifNativeGenerate",
+        "--model",
+        ".models/motif-2.6b-mlx-q4",
+        "--prompt",
+        "Reply with one short sentence.",
+        "--max-tokens",
+        "4",
+        "--json"
+      ],
+      "returncode": 0,
+      "elapsed_seconds": 15.836599832999127,
+      "stdout": "Sure, here is\n",
+      "stderr": "[0/1] Planning build\nBuilding for debugging...\n[0/3] Write swift-version--58304C5D6DBC2206.txt\nBuild of product 'MotifNativeGenerate' complete! (1.03s)\n"
+    },
+    "cancel_generation": {
+      "returncode": -15,
+      "stdout": "",
+      "stderr": "Building for debugging...\n[0/3] Write swift-version--58304C5D6DBC2206.txt\nBuild of product 'MotifNativeGenerate' complete! (0.23s)\n",
+      "terminated": true
+    },
+    "server_ready": {
+      "status": "ready",
+      "models": {
+        "object": "list",
+        "data": [
+          {
+            "id": "motif",
+            "object": "model",
+            "created": 1780253100
+          }
+        ]
+      }
+    },
+    "server_fallback": {
+      "status": "ok",
+      "response": {
+        "created": 1780253100,
+        "id": "chatcmpl-518660D033284F7EB86D9EAE",
+        "object": "chat.completion",
+        "model": "motif",
+        "choices": [
+          {
+            "message": {
+              "role": "assistant",
+              "content": "Hello, world!"
+            },
+            "index": 0,
+            "finish_reason": "stop"
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 0,
+          "total_tokens": 0,
+          "completion_tokens": 0
+        }
+      }
+    },
+    "server_process": {
+      "returncode": 0,
+      "stdout": "",
+      "stderr": "Building for debugging...\n[0/3] Write swift-version--58304C5D6DBC2206.txt\nBuild of product 'MotifNativeServe' complete! (0.22s)\nLoading native Swift Motif runtime from /Users/junhoyeo/mlx-motif/.models/motif-2.6b-mlx-q4 \u2026\nServing motif on http://127.0.0.1:55493/v1\n",
+      "terminated": false
+    }
+  }
+}

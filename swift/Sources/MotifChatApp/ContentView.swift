@@ -1,5 +1,6 @@
 import MotifKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var store = ChatStore()
@@ -137,6 +138,7 @@ private struct MessageBubble: View {
 
 private struct RuntimeView: View {
     @ObservedObject var store: ChatStore
+    @State private var showingModelDirectoryImporter = false
 
     var body: some View {
         Form {
@@ -155,8 +157,13 @@ private struct RuntimeView: View {
                         .textFieldStyle(.roundedBorder)
 
                 case .nativeMLX:
-                    TextField("Converted MLX model directory", text: $store.nativeModelDirectory)
-                        .textFieldStyle(.roundedBorder)
+                    HStack {
+                        TextField("Converted MLX model directory", text: $store.nativeModelDirectory)
+                            .textFieldStyle(.roundedBorder)
+                        Button("Choose…") {
+                            showingModelDirectoryImporter = true
+                        }
+                    }
                     Text("Build with `MOTIFKIT_ENABLE_MLX=1` and point this at an HF→MLX converted Motif checkpoint directory.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -171,6 +178,7 @@ private struct RuntimeView: View {
 
             Section("App status") {
                 Label("Active chat path: \(store.backendMode.label)", systemImage: store.backendMode.systemImage)
+                Label("Runtime status: \(store.runtimeStatus)", systemImage: statusIcon)
                 Label(
                     store.nativeMLXCompiledIn
                         ? "Native in-process MLX generation is compiled into this build"
@@ -197,9 +205,45 @@ private struct RuntimeView: View {
                 Label("Remaining: speculative decoding", systemImage: "wrench.and.screwdriver")
                 Label("Evidence: docs/benchmarks/swift-python-hard-parity-20260526T091532Z.md", systemImage: "speedometer")
             }
+
+            Section("Settings") {
+                Button("Reset runtime settings", role: .destructive) {
+                    store.resetRuntimeSettings()
+                }
+            }
         }
         .formStyle(.grouped)
         .padding()
         .navigationTitle("Runtime")
+        .fileImporter(
+            isPresented: $showingModelDirectoryImporter,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                let isSecurityScoped = url.startAccessingSecurityScopedResource()
+                defer {
+                    if isSecurityScoped { url.stopAccessingSecurityScopedResource() }
+                }
+                store.selectNativeModelDirectory(url)
+            case .failure(let error):
+                store.lastError = error.localizedDescription
+            }
+        }
+    }
+
+    private var statusIcon: String {
+        switch store.runtimeStatus {
+        case "Idle":
+            "checkmark.circle"
+        case "Error":
+            "exclamationmark.triangle"
+        case "Cancelled":
+            "stop.circle"
+        default:
+            "hourglass"
+        }
     }
 }

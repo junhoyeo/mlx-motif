@@ -55,12 +55,6 @@ def run(
     }
 
 
-def open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
-
-
 def request_json(
     url: str, payload: dict[str, Any] | None = None, timeout: float = 30
 ) -> dict[str, Any]:
@@ -189,14 +183,23 @@ def main() -> int:
     )
     time.sleep(2)
     stdout, stderr = terminate_process_group(cancel_proc)
+    terminated = cancel_proc.returncode not in (0, None)
     report["checks"]["cancel_generation"] = {
         "returncode": cancel_proc.returncode,
         "stdout": stdout,
         "stderr": stderr,
-        "terminated": cancel_proc.returncode not in (0, None),
+        "terminated": terminated,
     }
+    if not terminated:
+        print(json.dumps(report, indent=2))
+        return 1
 
-    port = open_port()
+    # The native server runs as a separate process, so it must be handed a port
+    # up front; bind-and-release to claim a currently-free one. (A small TOCTOU
+    # window is unavoidable when the listener lives in another process.)
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
     print("smoke: native Swift OpenAI-compatible server", file=sys.stderr, flush=True)
     server_proc = subprocess.Popen(
         [

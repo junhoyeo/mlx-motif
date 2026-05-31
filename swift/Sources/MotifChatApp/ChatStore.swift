@@ -235,7 +235,7 @@ final class ChatStore: ObservableObject {
     }
 
     private static var defaultNativeModelDirectory: String {
-        ProcessInfo.processInfo.environment["MOTIF_MODEL_DIR"] ?? ".models/motif-2.6b-mlx-q4"
+        ProcessInfo.processInfo.environment["MOTIF_MODEL_DIR"] ?? "~/.models/motif-2.6b-mlx-q4"
     }
 
     private static func storedBackendMode() -> MotifChatBackendMode {

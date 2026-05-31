@@ -46,7 +46,11 @@ The current target sweep evidence is
 M1 Max at p500/p3000/p16000 with `n_runs=1`, `max_tokens=8`, `q4_bridge`, and
 `q4_direct`. It is a target-matrix smoke, not a final repeated thermal parity
 claim. The report shows Swift remains below Python for most q4-direct cells, so
-performance parity stays gated.
+performance parity stays gated. For the 12.7B reasoning model the Swift and
+Python cells render different prompt token counts at the same target bucket
+(the Swift template fallback drops the hardcoded reasoning preamble), so those
+`swift_vs_python` rows are flagged in the report and must not be read as a clean
+head-to-head.
 
 ## CI and artifact expectations
 

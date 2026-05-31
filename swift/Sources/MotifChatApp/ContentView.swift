@@ -223,6 +223,10 @@ private struct RuntimeView: View {
             switch result {
             case .success(let urls):
                 guard let url = urls.first else { return }
+                // Scoped access here covers only the synchronous bookmark *creation*
+                // inside `selectNativeModelDirectory`. The checkpoint *load* later
+                // re-acquires its own scoped access by resolving that bookmark, so it
+                // is intentionally not held open past this callback.
                 let isSecurityScoped = url.startAccessingSecurityScopedResource()
                 defer {
                     if isSecurityScoped { url.stopAccessingSecurityScopedResource() }

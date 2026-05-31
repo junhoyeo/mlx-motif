@@ -62,6 +62,7 @@ final class ChatStore: ObservableObject {
     @Published var capturedReasoning = ""
 
     private var generationTask: Task<Void, Never>?
+    private var nativeDirectoryAccess: NativeDirectoryAccess?
     private static let defaults = UserDefaults.standard
     private static let defaultSystemPrompt = "You are Motif accessed through the configured local runtime. Be concise and helpful."
 
@@ -159,6 +160,9 @@ final class ChatStore: ObservableObject {
             }
 
             await MainActor.run {
+                // Release scoped access only after every file read for this load is
+                // done — this block runs on all completion paths (success/error/cancel).
+                self.releaseNativeDirectoryAccess()
                 self.isGenerating = false
                 self.generationTask = nil
                 if self.lastError == nil, self.runtimeStatus != "Cancelled" {
@@ -170,9 +174,35 @@ final class ChatStore: ObservableObject {
 
     func selectNativeModelDirectory(_ url: URL) {
         nativeModelDirectory = url.path
+        persistSecurityScopedBookmark(for: url)
         backendMode = .nativeMLX
         runtimeStatus = "Native checkpoint selected"
         lastError = nil
+    }
+
+    /// Persists a security-scoped bookmark for the selected directory so the app
+    /// can re-acquire scoped access after relaunch and under App Sandbox. Failures
+    /// are non-fatal: the path-based fallback keeps non-sandboxed/dev use working.
+    private func persistSecurityScopedBookmark(for url: URL) {
+        #if os(macOS)
+        let options: URL.BookmarkCreationOptions = [.withSecurityScope]
+        #else
+        let options: URL.BookmarkCreationOptions = []
+        #endif
+        do {
+            let bookmark = try url.bookmarkData(
+                options: options,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            ChatStore.defaults.set(
+                bookmark.base64EncodedString(),
+                forKey: DefaultsKey.nativeModelDirectoryBookmark.rawValue
+            )
+        } catch {
+            // Drop any stale bookmark so resolution falls back to the path cleanly.
+            ChatStore.defaults.removeObject(forKey: DefaultsKey.nativeModelDirectoryBookmark.rawValue)
+        }
     }
 
     func resetRuntimeSettings() {
@@ -205,14 +235,86 @@ final class ChatStore: ObservableObject {
 
         case .nativeMLX:
             #if MOTIFKIT_ENABLE_MLX
-            return try MotifMLXBackend(modelDirectory: resolvedNativeModelDirectory())
+            // The access started here is released in `releaseNativeDirectoryAccess()`
+            // once generation finishes, so it spans the actual file reads that the
+            // backend performs lazily during streaming — not just backend init.
+            let access = try acquireNativeModelDirectoryAccess()
+            nativeDirectoryAccess = access
+            do {
+                return try MotifMLXBackend(modelDirectory: access.url)
+            } catch {
+                releaseNativeDirectoryAccess()
+                throw error
+            }
             #else
             throw MotifChatStoreError.nativeMLXNotCompiled
             #endif
         }
     }
 
-    private func resolvedNativeModelDirectory() throws -> URL {
+    /// Releases any active security-scoped access to the native model directory.
+    /// Safe to call when no access is held.
+    private func releaseNativeDirectoryAccess() {
+        nativeDirectoryAccess?.stop()
+        nativeDirectoryAccess = nil
+    }
+
+    /// Resolves the native model directory, preferring a security-scoped bookmark so
+    /// reads succeed under App Sandbox and after relaunch. Starts scoped access when a
+    /// bookmark is available; the returned token's `stop` must be invoked once the
+    /// checkpoint load completes. Falls back to the plain path when no bookmark exists.
+    private func acquireNativeModelDirectoryAccess() throws -> NativeDirectoryAccess {
+        if let access = try scopedAccessFromBookmark() {
+            return access
+        }
+        // No bookmark stored (non-sandboxed/dev use, or reset state): fall back to the
+        // path. No scoped access is needed when the app is unsandboxed.
+        return NativeDirectoryAccess(url: try resolvedNativeModelDirectoryFromPath(), stop: {})
+    }
+
+    private func scopedAccessFromBookmark() throws -> NativeDirectoryAccess? {
+        guard
+            let encoded = ChatStore.defaults.string(forKey: DefaultsKey.nativeModelDirectoryBookmark.rawValue),
+            let bookmark = Data(base64Encoded: encoded)
+        else {
+            return nil
+        }
+
+        #if os(macOS)
+        let options: URL.BookmarkResolutionOptions = [.withSecurityScope]
+        #else
+        let options: URL.BookmarkResolutionOptions = []
+        #endif
+
+        var isStale = false
+        let url: URL
+        do {
+            url = try URL(
+                resolvingBookmarkData: bookmark,
+                options: options,
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+        } catch {
+            throw MotifChatStoreError.unresolvableNativeModelDirectory(error.localizedDescription)
+        }
+
+        guard url.startAccessingSecurityScopedResource() else {
+            throw MotifChatStoreError.inaccessibleNativeModelDirectory
+        }
+
+        if isStale {
+            // Re-persist a fresh bookmark for the resolved URL; failure is non-fatal
+            // because the just-started access still covers this load.
+            persistSecurityScopedBookmark(for: url)
+        }
+
+        return NativeDirectoryAccess(url: url, stop: {
+            url.stopAccessingSecurityScopedResource()
+        })
+    }
+
+    private func resolvedNativeModelDirectoryFromPath() throws -> URL {
         let trimmed = nativeModelDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw MotifChatStoreError.emptyNativeModelDirectory }
 
@@ -276,15 +378,26 @@ private enum DefaultsKey: String, CaseIterable {
     case endpoint = "motif.chat.endpoint"
     case model = "motif.chat.model"
     case nativeModelDirectory = "motif.chat.nativeModelDirectory"
+    case nativeModelDirectoryBookmark = "motif.chat.nativeModelDirectoryBookmark"
     case thinkMode = "motif.chat.thinkMode"
     case maxTokens = "motif.chat.maxTokens"
     case temperature = "motif.chat.temperature"
+}
+
+/// Owns an active security-scoped access to the native model directory. The caller
+/// must invoke `stop` once every file read for the load has completed. `stop` is a
+/// no-op for the unsandboxed path-based fallback.
+private struct NativeDirectoryAccess {
+    let url: URL
+    let stop: () -> Void
 }
 
 private enum MotifChatStoreError: Error, LocalizedError {
     case invalidEndpoint
     case nativeMLXNotCompiled
     case emptyNativeModelDirectory
+    case unresolvableNativeModelDirectory(String)
+    case inaccessibleNativeModelDirectory
 
     var errorDescription: String? {
         switch self {
@@ -294,6 +407,10 @@ private enum MotifChatStoreError: Error, LocalizedError {
             "Native MLX chat is not compiled into this app build. Rebuild with MOTIFKIT_ENABLE_MLX=1."
         case .emptyNativeModelDirectory:
             "Native MLX model directory cannot be empty."
+        case .unresolvableNativeModelDirectory(let detail):
+            "Could not resolve the saved native model directory. Re-select it. (\(detail))"
+        case .inaccessibleNativeModelDirectory:
+            "Could not obtain access to the saved native model directory. Re-select it."
         }
     }
 }

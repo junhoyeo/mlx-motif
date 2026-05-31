@@ -1,0 +1,132 @@
+name: Benchmark sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_manifest:
+        description: Path to a model manifest available on the runner
+        required: false
+        default: docs/benchmarks/models.local.example.json
+      prompt_lens:
+        description: Space-separated prompt target lengths
+        required: false
+        default: "500 3000"
+      max_tokens:
+        description: Generated tokens per benchmark cell
+        required: false
+        default: "64"
+      n_runs:
+        description: Timed runs per benchmark cell
+        required: false
+        default: "3"
+      full_long_context:
+        description: Include a 16000-token prompt cell
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - scripts/bench_sweep.py
+      - scripts/bench_decode_e2e.py
+      - docs/benchmarks/**
+      - .github/workflows/benchmark-sweep.yml
+  push:
+    branches: [main]
+    paths:
+      - scripts/bench_sweep.py
+      - scripts/bench_decode_e2e.py
+      - docs/benchmarks/**
+      - .github/workflows/benchmark-sweep.yml
+
+jobs:
+  benchmark-dry-run:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install
+        run: uv sync --extra dev
+      - name: Validate sweep plumbing without model weights
+        run: |
+          uv run python scripts/bench_sweep.py \
+            --dry-run \
+            --backend python \
+            --backend swift \
+            --cache-cell q4_bridge:q4,quant_sdpa=0,disable_kernels=1 \
+            --cache-cell q4_direct:q4,quant_sdpa=1 \
+            --prompt-lens 500 \
+            --max-tokens 4 \
+            --n-runs 1 \
+            --output artifacts/benchmarks/dry-run.json \
+            --markdown artifacts/benchmarks/dry-run.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-dry-run
+          path: artifacts/benchmarks
+
+  benchmark-sweep:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.BENCHMARK_RUNNER || 'macos-14' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Cache SwiftPM checkouts
+        uses: actions/cache@v4
+        with:
+          path: |
+            swift/.build/repositories
+            swift/.build/checkouts
+            .build-motif
+          key: ${{ runner.os }}-swiftpm-${{ hashFiles('swift/Package.swift', 'swift/Package.resolved', 'scripts/build_mlx_swift_metallib.sh') }}
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install
+        run: uv sync --extra dev
+      - name: Select prompt lengths
+        id: prompts
+        shell: bash
+        run: |
+          set -euo pipefail
+          prompt_lens="${{ inputs.prompt_lens }}"
+          if [[ "${{ inputs.full_long_context }}" == "true" ]] && [[ "$prompt_lens" != *"16000"* ]]; then
+            prompt_lens="$prompt_lens 16000"
+          fi
+          echo "prompt_lens=$prompt_lens" >> "$GITHUB_OUTPUT"
+      - name: Run real benchmark sweep
+        env:
+          MOTIFKIT_ENABLE_MLX: "1"
+        run: |
+          uv run python scripts/bench_sweep.py \
+            --manifest "${{ inputs.model_manifest }}" \
+            --backend python \
+            --backend swift \
+            --cache-cell baseline:0 \
+            --cache-cell q4_bridge:q4,quant_sdpa=0,disable_kernels=1 \
+            --cache-cell q4_direct:q4,quant_sdpa=1 \
+            --prompt-lens ${{ steps.prompts.outputs.prompt_lens }} \
+            --max-tokens "${{ inputs.max_tokens }}" \
+            --n-runs "${{ inputs.n_runs }}" \
+            --warmup-runs 1 \
+            --output artifacts/benchmarks/benchmark-sweep.json \
+            --markdown artifacts/benchmarks/benchmark-sweep.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-sweep-json
+          path: artifacts/benchmarks/*.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-sweep-md
+          path: artifacts/benchmarks/*.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-raw-logs
+          path: artifacts/benchmarks/raw

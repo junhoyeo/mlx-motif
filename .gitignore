@@ -22,3 +22,6 @@ swift/Package.resolved
 
 # Local benchmark/metallib build outputs
 .build-motif/
+
+# Local benchmark artifacts
+artifacts/

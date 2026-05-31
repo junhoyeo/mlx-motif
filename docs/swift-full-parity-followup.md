@@ -22,7 +22,7 @@ surfaces** from **performance-proven custom-kernel parity**.
 | Speculative decoding | Implemented in Swift native path | `MotifMLXNativeRuntime.speculativeGenerate` and `MotifNativeGenerate --speculative --speculative-draft-model ...` run target/draft verification and emit acceptance metrics. |
 | Perplexity/e2e quality checks | Implemented with checked-in evidence harness | `MotifNativeEvaluate --mode perplexity|bench|logits`, `scripts/perplexity.py --json`, and `scripts/swift_python_hard_parity.py` emit raw same-machine JSON/markdown evidence. |
 | Long-context benchmarks | Implemented with evidence harness | `scripts/swift_python_hard_parity.py` runs Python decode and Swift q4 decode on generated long-context prompts and stores raw results under `docs/benchmarks/`. |
-| Performance parity against Python | Implemented/proven by same-machine harness for the local checkpoint | The hard-parity harness records Python decode, Swift q4 direct, Swift q4 bridge, logits, perplexity, speculative decoding, and long-context cells in one host report. Use the raw JSON for exact numbers. |
+| Performance parity against Python | Harnessed, not yet proven as a parity claim | The hard-parity report records Python and Swift cells on one host, but the checked-in local long-context result shows Swift slower than Python. Use `scripts/bench_sweep.py` and the manual benchmark workflow to prove or reject parity for each model/hardware matrix before making performance claims. |
 
 ## Runtime feature flags shared with Python
 
@@ -37,12 +37,19 @@ MLX_MOTIF_QUANT_SDPA=0       # keep q4/q8 cache on the dequant bridge path
 MLX_MOTIF_DISABLE_KERNELS=1  # force reference routing
 ```
 
-## Why not mark performance parity complete?
+## Why performance parity remains gated
 
 This hard-parity follow-up adds the direct Swift Metal implementations and a
-same-machine evidence harness. The raw reports under `docs/benchmarks/` are the
-source of truth for performance claims; if a future machine/checkpoint fails a
-cell, do not carry the parity claim forward without rerunning the harness.
+same-machine evidence harness, but the current local long-context report does
+not prove Swift equals Python throughput. The raw reports under
+`docs/benchmarks/` are the source of truth for performance claims; if a machine,
+checkpoint, prompt length, or thermal state changes, rerun the sweep before
+carrying any parity claim forward.
+
+For full sweeps across model sizes and hardware, use
+[`docs/benchmarks/README.md`](benchmarks/README.md) and the manual
+`Benchmark sweep` GitHub Actions workflow. Normal PR CI only validates dry-run
+plumbing because model weights are not vendored.
 
 
 Latest checked-in local evidence: [`docs/benchmarks/swift-python-hard-parity-20260526T091532Z.md`](docs/benchmarks/swift-python-hard-parity-20260526T091532Z.md) (raw JSON alongside it).

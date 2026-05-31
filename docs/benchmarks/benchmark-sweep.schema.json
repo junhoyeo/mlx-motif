@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/junhoyeo/mlx-motif/docs/benchmarks/benchmark-sweep.schema.json",
+  "title": "Motif Swift/Python benchmark sweep report",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "git", "host", "config", "models", "cells", "comparisons"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "generated_at": {"type": "string"},
+    "git": {
+      "type": "object",
+      "required": ["commit", "branch", "dirty"],
+      "properties": {
+        "commit": {"type": "string"},
+        "branch": {"type": "string"},
+        "dirty": {"type": "boolean"}
+      }
+    },
+    "host": {"type": "object"},
+    "config": {
+      "type": "object",
+      "required": ["prompt_lens", "max_tokens", "n_runs", "warmup_runs", "backends", "cache_cells", "dry_run"]
+    },
+    "models": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "path"],
+        "properties": {
+          "id": {"type": "string"},
+          "path": {"type": "string"},
+          "quantization": {"type": ["string", "null"]},
+          "params_b": {"type": ["number", "null"]}
+        }
+      }
+    },
+    "cells": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["cell_id", "status", "model_id", "backend", "cache_cell", "prompt_target_tokens", "max_tokens", "env", "runs", "summary", "artifacts", "returncode"],
+        "properties": {
+          "cell_id": {"type": "string"},
+          "status": {"enum": ["pass", "fail"]},
+          "backend": {"enum": ["python", "swift"]},
+          "prompt_target_tokens": {"type": "integer"},
+          "prompt_actual_tokens": {"type": ["integer", "null"]},
+          "runs": {"type": "array"},
+          "summary": {
+            "type": "object",
+            "required": ["median_tokens_per_second", "mean_tokens_per_second", "stdev_tokens_per_second", "min_tokens_per_second", "max_tokens_per_second"]
+          }
+        }
+      }
+    },
+    "comparisons": {"type": "array"}
+  }
+}

@@ -1,0 +1,5 @@
+[bench] 4slot=q4 quant_sdpa=1 disable_kernels=0 — loading .models/motif-2.6b-mlx-q4
+[bench] model loaded
+[bench] p500: prompt tokens = 462
+[bench]   run 1: 98.94 tok/s
+[bench] p500 median: 98.94 tok/s

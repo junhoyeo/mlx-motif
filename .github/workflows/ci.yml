@@ -69,6 +69,14 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Cache SwiftPM checkouts
+        uses: actions/cache@v4
+        with:
+          path: |
+            swift/.build/repositories
+            swift/.build/checkouts
+            .build-motif
+          key: ${{ runner.os }}-swiftpm-${{ hashFiles('swift/Package.swift', 'swift/Package.resolved', 'scripts/build_mlx_swift_metallib.sh') }}
       - name: Select Swift 6 toolchain
         run: |
           set -euo pipefail
@@ -95,3 +103,12 @@ jobs:
           exit 1
       - name: Verify default Swift package
         run: scripts/verify_swift.sh
+      - name: Upload Swift build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swift-build-logs
+          path: |
+            swift/.build/**/*.log
+            .build-motif/**/*.log
+          if-no-files-found: ignore

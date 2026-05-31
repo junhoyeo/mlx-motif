@@ -175,6 +175,78 @@ public struct MotifMetalKernelBenchmarkResult: Sendable, Equatable {
     }
 }
 
+/// Thread-safe, process-wide counter that records how many times a custom Metal
+/// kernel wrapper fell back to its pure-MLX reference implementation.
+///
+/// The kernels intentionally fall back when an input is outside their decode
+/// contract (wrong rank, non-affine quant, mismatched head packing, …). That
+/// fallback is silent by design — it keeps numerics correct — but it also hides
+/// regressions where the direct Metal path stops being selected. This telemetry
+/// makes the fallback observable without changing any kernel behavior:
+///
+/// - Counts are bucketed by `MotifMetalKernelName` and are purely additive.
+/// - Reads/writes are guarded by an `NSLock`, so concurrent kernel calls on
+///   different threads cannot race. The lock is held only around small integer
+///   mutations, so it does not change the async-ness of any call site.
+/// - Set `MLX_MOTIF_LOG_FALLBACKS=1` to emit a one-line diagnostic to stderr on
+///   each fallback. With the variable unset there is no output at all.
+public enum MotifKernelFallbackTelemetry {
+    public static let logEnvironmentVariable = "MLX_MOTIF_LOG_FALLBACKS"
+
+    private static let lock = NSLock()
+    private static var counts: [MotifMetalKernelName: Int] = [:]
+
+    /// Records a single fallback for `kernel` and, when logging is enabled,
+    /// writes a diagnostic line to standard error.
+    public static func recordFallback(_ kernel: MotifMetalKernelName) {
+        let updated: Int = {
+            lock.lock()
+            defer { lock.unlock() }
+            let next = (counts[kernel] ?? 0) + 1
+            counts[kernel] = next
+            return next
+        }()
+        logIfEnabled(kernel: kernel, total: updated)
+    }
+
+    /// Current fallback count for a single kernel.
+    public static func fallbackCount(for kernel: MotifMetalKernelName) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts[kernel] ?? 0
+    }
+
+    /// Snapshot of every recorded kernel's fallback count.
+    public static func snapshot() -> [MotifMetalKernelName: Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts
+    }
+
+    /// Clears all counters. Intended for test isolation.
+    public static func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        counts.removeAll(keepingCapacity: true)
+    }
+
+    private static var loggingEnabled: Bool {
+        let value = ProcessInfo.processInfo.environment[logEnvironmentVariable]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard let value else { return false }
+        return ["1", "true", "yes", "on"].contains(value)
+    }
+
+    private static func logIfEnabled(kernel: MotifMetalKernelName, total: Int) {
+        guard loggingEnabled else { return }
+        let line = "[mlx-motif] kernel fallback: \(kernel.rawValue) (total=\(total))\n"
+        if let data = line.data(using: .utf8) {
+            FileHandle.standardError.write(data)
+        }
+    }
+}
+
 public enum MotifMetalKernels {
     public static let disableEnvironmentVariable = "MLX_MOTIF_DISABLE_KERNELS"
     public static let legacyDisableEnvironmentVariable = "MOTIFKIT_DISABLE_CUSTOM_METAL_KERNELS"
@@ -468,6 +540,7 @@ public enum MotifSDPADualV {
               queries.dim(1) % keys.dim(1) == 0,
               value1.shape == value2.shape
         else {
+            MotifKernelFallbackTelemetry.recordFallback(.sdpaDualV)
             return reference(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale, mask: mask)
         }
         return metal(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale)
@@ -486,6 +559,7 @@ public enum MotifSDPADualV {
         let kvSequenceLength = keys.dim(2)
         let headDim = queries.dim(3)
         guard keyHeads > 0, kvSequenceLength > 0 else {
+            MotifKernelFallbackTelemetry.recordFallback(.sdpaDualV)
             return reference(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale)
         }
         let gqaFactor = queryHeads / keyHeads
@@ -594,6 +668,7 @@ public enum MotifSDPADualVQ4 {
               quantizedKeys.data.dim(1) > 0,
               queries.dim(1) % quantizedKeys.data.dim(1) == 0
         else {
+            MotifKernelFallbackTelemetry.recordFallback(.sdpaDualVQ4)
             return reference(
                 queries: queries,
                 quantizedKeys: quantizedKeys,
@@ -633,6 +708,7 @@ public enum MotifSDPADualVQ4 {
         let headDim = queries.dim(3)
         let elementsPerInt = 32 / bits
         guard keyHeads > 0, kvSequenceLength > 0, quantizedKeys.data.dim(3) * elementsPerInt == headDim else {
+            MotifKernelFallbackTelemetry.recordFallback(.sdpaDualVQ4)
             return reference(
                 queries: queries,
                 quantizedKeys: (quantizedKeys.data, quantizedKeys.scales, quantizedKeys.biases),
@@ -719,6 +795,7 @@ public enum MotifGDAPostSplit {
               groupedRatio > 0,
               attnOrigin.dim(1) == attnNoise.dim(1) * groupedRatio
         else {
+            MotifKernelFallbackTelemetry.recordFallback(.gdaPostSplit)
             return reference(
                 attnOrigin: attnOrigin,
                 attnNoise: attnNoise,
@@ -829,6 +906,7 @@ public enum MotifGDAPost {
               groupedRatio > 0,
               merged.dim(1) == queryGroups * groupedRatio + queryGroups
         else {
+            MotifKernelFallbackTelemetry.recordFallback(.gdaPost)
             return reference(
                 merged: merged,
                 sublnWeight: sublnWeight,
@@ -928,6 +1006,7 @@ public enum MotifPolynorm {
         executionMode: MotifMetalKernelExecutionMode = .metalPreferred
     ) -> MLXArray {
         guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode) else {
+            MotifKernelFallbackTelemetry.recordFallback(.polynorm)
             return reference(x, weight: weight, bias: bias, eps: eps)
         }
         return metal(x, weight: weight, bias: bias, eps: eps)

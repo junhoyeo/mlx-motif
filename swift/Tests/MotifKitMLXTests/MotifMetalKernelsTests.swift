@@ -160,6 +160,47 @@ final class MotifMetalKernelsTests: XCTestCase {
         XCTAssertGreaterThan(result.candidateSpeedup, 0)
     }
 
+    /// Proves the telemetry counter stays at zero for a known-good q4 decode,
+    /// i.e. the direct Metal kernel actually ran and did NOT silently fall back
+    /// to the dequant reference bridge. Runtime-gated: it early-returns (skips)
+    /// when `MOTIFKIT_RUN_MLX_RUNTIME_TESTS != 1`, so it is a no-op in build-only
+    /// CI and sandboxes that lack the Metal runtime.
+    func testPackedQ4DualVDecodeRunsMetalWithoutFallback() throws {
+        try requireMLXRuntime()
+        MotifKernelFallbackTelemetry.reset()
+        XCTAssertEqual(MotifKernelFallbackTelemetry.fallbackCount(for: .sdpaDualVQ4), 0)
+
+        let q = MotifMetalKernelHarness.deterministicInput(shape: [1, 4, 1, 32])
+        let cache = MotifGroupedQuantizedKVCache(groupSize: 32, bits: 4)
+        let packed = cache.updateAndFetch4Quantized(
+            kOrigin: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 32]),
+            kNoise: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 32]) * -0.5,
+            value1: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 32]) * 0.25,
+            value2: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 32]) * -0.125
+        )
+
+        let candidate = MotifSDPADualVQ4.apply(
+            queries: q,
+            quantizedKeys: packed.kOrigin,
+            quantizedValue1: packed.value1,
+            quantizedValue2: packed.value2,
+            scale: 0.17677669,
+            groupSize: cache.groupSize,
+            bits: cache.bits,
+            mode: cache.mode,
+            dtype: q.dtype,
+            executionMode: .metalPreferred
+        )
+        // Force evaluation so the kernel (or its fallback) actually executes.
+        eval(candidate)
+
+        XCTAssertEqual(
+            MotifKernelFallbackTelemetry.fallbackCount(for: .sdpaDualVQ4),
+            0,
+            "q4 decode fixture fell back to the reference bridge instead of running the Metal kernel"
+        )
+    }
+
     private func requireMLXRuntime(file: StaticString = #filePath, line: UInt = #line) throws {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["MOTIFKIT_RUN_MLX_RUNTIME_TESTS"] == "1",

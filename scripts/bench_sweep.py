@@ -516,6 +516,7 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
             "",
             "- Normal PR CI should validate this schema and dry-run plumbing only; real model sweeps require local or self-hosted Apple Silicon with cached checkpoints.",
             "- Treat performance parity as unproven unless this report shows Swift candidate cells meeting the Python baseline for the exact model, host, branch, and thermal conditions.",
+            "- `swift_vs_python` ratios mix measurement regions: the Python cell reports steady-state decode tok/s (the first decode step is discarded as warm-up), while the Swift cell's tok/s covers every generated token including the compile-heavy first step. At low `max_tokens` the Swift first-step/compile cost dominates, so these ratios understate Swift steady-state throughput and must not be read as a steady-state speedup. Use a high `max_tokens` (and `warmup_runs >= 1`) before drawing any throughput conclusion.",
         ]
     )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

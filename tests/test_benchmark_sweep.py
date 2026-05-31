@@ -111,3 +111,53 @@ def test_failed_cell_is_preserved(tmp_path: Path) -> None:
     assert cell["returncode"] == 42
     assert "boom" in cell["error"]
     assert Path(cell["artifacts"]["stderr"]).read_text() == "boom"
+
+
+def test_command_timeout_is_preserved_as_failed_cell() -> None:
+    bench_sweep = _load_bench_sweep()
+    result = bench_sweep.run_command(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        cwd=Path.cwd(),
+        env={},
+        timeout=0.1,
+    )
+    assert result.returncode == 124
+    assert "timed out" in result.stderr
+
+
+def _cell(cell_id: str, backend: str, cache: str, target: int, actual: int, tps: float) -> dict:
+    return {
+        "cell_id": cell_id,
+        "model_id": "m",
+        "backend": backend,
+        "cache_cell": cache,
+        "prompt_target_tokens": target,
+        "prompt_actual_tokens": actual,
+        "status": "pass",
+        "summary": {"median_tokens_per_second": tps},
+        "runs": [{}],
+    }
+
+
+def test_comparison_flags_prompt_token_mismatch() -> None:
+    bench_sweep = _load_bench_sweep()
+    cells = [
+        _cell("m/python/q4_direct/p500", "python", "q4_direct", 500, 555, 30.0),
+        _cell("m/swift/q4_direct/p500", "swift", "q4_direct", 500, 469, 10.0),
+    ]
+    comps = bench_sweep.build_comparisons(cells)
+    swift = next(c for c in comps if c["comparison"] == "swift_vs_python")
+    assert swift["candidate_prompt_tokens"] == 469
+    assert swift["baseline_prompt_tokens"] == 555
+    assert swift["prompt_tokens_match"] is False
+
+
+def test_comparison_marks_matching_prompt_tokens() -> None:
+    bench_sweep = _load_bench_sweep()
+    cells = [
+        _cell("m/python/q4_direct/p500", "python", "q4_direct", 500, 462, 30.0),
+        _cell("m/swift/q4_direct/p500", "swift", "q4_direct", 500, 462, 10.0),
+    ]
+    comps = bench_sweep.build_comparisons(cells)
+    swift = next(c for c in comps if c["comparison"] == "swift_vs_python")
+    assert swift["prompt_tokens_match"] is True

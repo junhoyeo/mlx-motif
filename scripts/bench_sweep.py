@@ -77,15 +77,32 @@ def run_command(
     timeout: float | None = None,
 ) -> CommandResult:
     started = time.perf_counter()
-    proc = subprocess.run(
-        cmd,
-        cwd=cwd,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        elapsed = time.perf_counter() - started
+        stdout = error.stdout or ""
+        stderr = error.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        return CommandResult(
+            command=cmd,
+            returncode=124,
+            elapsed_seconds=elapsed,
+            stdout=stdout,
+            stderr=stderr + f"\nbenchmark cell timed out after {timeout}s",
+            json=parse_json_output(stdout),
+        )
     elapsed = time.perf_counter() - started
     return CommandResult(
         command=cmd,
@@ -453,6 +470,8 @@ def build_comparisons(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
             cand_tps = cell["summary"].get("median_tokens_per_second")
             if not base_tps or not cand_tps:
                 continue
+            cand_prompt = cell.get("prompt_actual_tokens")
+            base_prompt = baseline.get("prompt_actual_tokens")
             comparisons.append(
                 {
                     "model_id": model_id,
@@ -460,6 +479,9 @@ def build_comparisons(cells: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     "comparison": label,
                     "baseline_cell": baseline["cell_id"],
                     "candidate_cell": cell["cell_id"],
+                    "candidate_prompt_tokens": cand_prompt,
+                    "baseline_prompt_tokens": base_prompt,
+                    "prompt_tokens_match": cand_prompt == base_prompt,
                     "speedup": cand_tps / base_tps,
                 }
             )
@@ -500,14 +522,31 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
                 "",
                 "## Comparisons",
                 "",
-                "| Comparison | Candidate | Baseline | Speedup |",
-                "| --- | --- | --- | ---: |",
+                "| Comparison | Candidate | Baseline | Prompt tokens (cand/base) | Speedup |",
+                "| --- | --- | --- | ---: | ---: |",
             ]
         )
+        any_mismatch = False
         for comp in report["comparisons"]:
+            cand_prompt = comp.get("candidate_prompt_tokens")
+            base_prompt = comp.get("baseline_prompt_tokens")
+            mismatch = comp.get("prompt_tokens_match") is False
+            any_mismatch = any_mismatch or mismatch
+            flag = " ⚠️" if mismatch else ""
+            prompt_text = f"{cand_prompt if cand_prompt is not None else 'n/a'}/{base_prompt if base_prompt is not None else 'n/a'}{flag}"
             lines.append(
                 f"| {comp['comparison']} | `{comp['candidate_cell']}` | `{comp['baseline_cell']}` | "
-                f"{comp['speedup']:.3f}x |"
+                f"{prompt_text} | {comp['speedup']:.3f}x |"
+            )
+        if any_mismatch:
+            lines.extend(
+                [
+                    "",
+                    "> ⚠️ Rows marked with a warning compare candidate and baseline cells whose"
+                    " actual prompt token counts differ (same target bucket, different rendered"
+                    " prompt). Decode tok/s depends on prompt length, so those speedups are not a"
+                    " clean head-to-head and must not be read as parity evidence.",
+                ]
             )
     lines.extend(
         [

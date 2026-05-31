@@ -1,0 +1,112 @@
+{
+  "schema_version": 1,
+  "configs": [
+    {
+      "name": "motif_2_6b_tiny",
+      "python": {
+        "model_type": "motif",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "intermediate_size": 128,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 4,
+        "vocab_size": 128,
+        "rms_norm_eps": 0.000001,
+        "rope_theta": 10000.0,
+        "max_position_embeddings": 64,
+        "head_dim": 16,
+        "num_noise_heads": null,
+        "k_ratio": 1,
+        "attn_rms_norm_eps": 0.00001,
+        "tie_word_embeddings": true,
+        "hidden_act": "poly_norm",
+        "use_bias": false,
+        "fused_rope": false
+      },
+      "expectations": {
+        "is_grouped": false,
+        "effective_head_dim": 16
+      }
+    },
+    {
+      "name": "motif_12_7b_grouped_tiny",
+      "python": {
+        "model_type": "motif",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "intermediate_size": 128,
+        "num_attention_heads": 10,
+        "num_key_value_heads": 4,
+        "num_noise_heads": 2,
+        "k_ratio": 1,
+        "vocab_size": 128,
+        "rms_norm_eps": 0.000001,
+        "rope_theta": 10000.0,
+        "max_position_embeddings": 64,
+        "head_dim": 16,
+        "attn_rms_norm_eps": 0.00001,
+        "tie_word_embeddings": false,
+        "hidden_act": "poly_norm",
+        "use_bias": false,
+        "fused_rope": false
+      },
+      "expectations": {
+        "is_grouped": true,
+        "effective_head_dim": 16,
+        "origin_heads_per_noise_head": 5,
+        "kv_heads_per_group": 2
+      }
+    }
+  ],
+  "think_filter_cases": [
+    {
+      "name": "visible_passthrough",
+      "mode": "visible",
+      "start_in_think": false,
+      "chunks": ["The ", "<think>", "trace</think>", " answer"],
+      "expected_emitted": "The <think>trace</think> answer",
+      "expected_captured": ""
+    },
+    {
+      "name": "hidden_split_tags",
+      "mode": "hidden",
+      "start_in_think": false,
+      "chunks": ["Hello <thi", "nk>secret", "</thi", "nk> world"],
+      "expected_emitted": "Hello  world",
+      "expected_captured": ""
+    },
+    {
+      "name": "captured_multiple_blocks",
+      "mode": "captured",
+      "start_in_think": false,
+      "chunks": ["a<think>x</think>b", "<think>y</think>c"],
+      "expected_emitted": "abc",
+      "expected_captured": "xy"
+    },
+    {
+      "name": "prompt_started_inside_think",
+      "mode": "captured",
+      "start_in_think": true,
+      "chunks": ["reasoning</thi", "nk>answer"],
+      "expected_emitted": "answer",
+      "expected_captured": "reasoning"
+    }
+  ],
+  "component_checks": [
+    {
+      "name": "polynorm_reference_2x3",
+      "kind": "polynorm",
+      "eps": 0.000001,
+      "weight": [0.2, 0.3, 0.5],
+      "bias": [0.125],
+      "input": [
+        [-1.5, -0.5, 0.0],
+        [0.5, 1.0, 2.0]
+      ],
+      "expected": [
+        [-0.5263191243230241, -0.10430044066400287, 0.125],
+        [0.3508009408581749, 0.6717202624593248, 1.7277992321668438]
+      ]
+    }
+  ]
+}

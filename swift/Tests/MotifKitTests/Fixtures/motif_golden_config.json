@@ -1,0 +1,93 @@
+{
+  "model_configs": {
+    "vanilla_26b": {
+      "model_type": "motif",
+      "hidden_size": 2048,
+      "num_hidden_layers": 24,
+      "intermediate_size": 8192,
+      "num_attention_heads": 16,
+      "num_key_value_heads": 4,
+      "vocab_size": 128000,
+      "rms_norm_eps": 0.000001,
+      "rope_theta": 10000.0,
+      "max_position_embeddings": 8192,
+      "hidden_act": "poly_norm",
+      "use_bias": false,
+      "tie_word_embeddings": false
+    },
+    "grouped_127b": {
+      "model_type": "motif",
+      "hidden_size": 4096,
+      "num_hidden_layers": 40,
+      "intermediate_size": 16384,
+      "num_attention_heads": 40,
+      "num_key_value_heads": 16,
+      "vocab_size": 128000,
+      "rms_norm_eps": 0.000001,
+      "rope_theta": 10000.0,
+      "max_position_embeddings": 8192,
+      "head_dim": 128,
+      "num_noise_heads": 8,
+      "k_ratio": 1,
+      "attn_rms_norm_eps": 0.00001,
+      "hidden_act": "poly_norm",
+      "use_bias": false,
+      "tie_word_embeddings": false,
+      "fused_rope": false
+    }
+  },
+  "attention_path_cases": [
+    {
+      "name": "quantized q4 single-token decode",
+      "cache_kind": "grouped_q4",
+      "sequence_length": 1,
+      "key_value_repeat": 1,
+      "key_ratio": 1,
+      "fused_rope": false,
+      "dual_v_attention": true,
+      "quantized_sdpa": true,
+      "expected": "sdpa_dual_v_q4"
+    },
+    {
+      "name": "fp16 four-slot single-token decode",
+      "cache_kind": "grouped_4slot",
+      "sequence_length": 1,
+      "key_value_repeat": 1,
+      "key_ratio": 1,
+      "fused_rope": false,
+      "dual_v_attention": true,
+      "quantized_sdpa": true,
+      "expected": "sdpa_dual_v"
+    },
+    {
+      "name": "prefill falls back to stacked sdpa",
+      "cache_kind": "grouped_4slot",
+      "sequence_length": 4,
+      "key_value_repeat": 1,
+      "key_ratio": 1,
+      "fused_rope": false,
+      "dual_v_attention": true,
+      "quantized_sdpa": true,
+      "expected": "stacked_sdpa"
+    },
+    {
+      "name": "fused rope disables custom decode kernels",
+      "cache_kind": "grouped_q4",
+      "sequence_length": 1,
+      "key_value_repeat": 1,
+      "key_ratio": 1,
+      "fused_rope": true,
+      "dual_v_attention": true,
+      "quantized_sdpa": true,
+      "expected": "stacked_sdpa"
+    }
+  ],
+  "polynorm": {
+    "input": [1.0, -2.0, 0.5, -0.25],
+    "weight": [0.4, 0.3, 0.3],
+    "bias": 0.05,
+    "epsilon": 0.000001,
+    "expected": [0.554770091995, -0.683406429142, 0.228869676585, -0.007551984844]
+  },
+  "required_kernels": ["polynorm", "gda_post", "gda_post_split", "sdpa_dual_v", "sdpa_dual_v_q4"]
+}

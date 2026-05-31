@@ -35,32 +35,34 @@ Host: `Apple M1 Max` / `macOS-26.2-arm64-arm-64bit`
 
 ## Comparisons
 
-| Comparison | Candidate | Baseline | Speedup |
-| --- | --- | --- | ---: |
-| direct_vs_bridge | `motif-2.6b-q4/python/q4_direct/p500` | `motif-2.6b-q4/python/q4_bridge/p500` | 1.295x |
-| direct_vs_bridge | `motif-2.6b-q4/python/q4_direct/p3000` | `motif-2.6b-q4/python/q4_bridge/p3000` | 1.077x |
-| direct_vs_bridge | `motif-2.6b-q4/python/q4_direct/p16000` | `motif-2.6b-q4/python/q4_bridge/p16000` | 1.084x |
-| swift_vs_python | `motif-2.6b-q4/swift/q4_bridge/p500` | `motif-2.6b-q4/python/q4_bridge/p500` | 0.264x |
-| swift_vs_python | `motif-2.6b-q4/swift/q4_bridge/p3000` | `motif-2.6b-q4/python/q4_bridge/p3000` | 0.380x |
-| swift_vs_python | `motif-2.6b-q4/swift/q4_bridge/p16000` | `motif-2.6b-q4/python/q4_bridge/p16000` | 0.862x |
-| direct_vs_bridge | `motif-2.6b-q4/swift/q4_direct/p500` | `motif-2.6b-q4/swift/q4_bridge/p500` | 0.981x |
-| swift_vs_python | `motif-2.6b-q4/swift/q4_direct/p500` | `motif-2.6b-q4/python/q4_direct/p500` | 0.200x |
-| direct_vs_bridge | `motif-2.6b-q4/swift/q4_direct/p3000` | `motif-2.6b-q4/swift/q4_bridge/p3000` | 1.002x |
-| swift_vs_python | `motif-2.6b-q4/swift/q4_direct/p3000` | `motif-2.6b-q4/python/q4_direct/p3000` | 0.354x |
-| direct_vs_bridge | `motif-2.6b-q4/swift/q4_direct/p16000` | `motif-2.6b-q4/swift/q4_bridge/p16000` | 0.865x |
-| swift_vs_python | `motif-2.6b-q4/swift/q4_direct/p16000` | `motif-2.6b-q4/python/q4_direct/p16000` | 0.687x |
-| direct_vs_bridge | `motif-12.7b-q4/python/q4_direct/p500` | `motif-12.7b-q4/python/q4_bridge/p500` | 1.717x |
-| direct_vs_bridge | `motif-12.7b-q4/python/q4_direct/p3000` | `motif-12.7b-q4/python/q4_bridge/p3000` | 2.794x |
-| direct_vs_bridge | `motif-12.7b-q4/python/q4_direct/p16000` | `motif-12.7b-q4/python/q4_bridge/p16000` | 5.822x |
-| swift_vs_python | `motif-12.7b-q4/swift/q4_bridge/p500` | `motif-12.7b-q4/python/q4_bridge/p500` | 0.469x |
-| swift_vs_python | `motif-12.7b-q4/swift/q4_bridge/p3000` | `motif-12.7b-q4/python/q4_bridge/p3000` | 0.933x |
-| swift_vs_python | `motif-12.7b-q4/swift/q4_bridge/p16000` | `motif-12.7b-q4/python/q4_bridge/p16000` | 1.290x |
-| direct_vs_bridge | `motif-12.7b-q4/swift/q4_direct/p500` | `motif-12.7b-q4/swift/q4_bridge/p500` | 0.924x |
-| swift_vs_python | `motif-12.7b-q4/swift/q4_direct/p500` | `motif-12.7b-q4/python/q4_direct/p500` | 0.253x |
-| direct_vs_bridge | `motif-12.7b-q4/swift/q4_direct/p3000` | `motif-12.7b-q4/swift/q4_bridge/p3000` | 1.005x |
-| swift_vs_python | `motif-12.7b-q4/swift/q4_direct/p3000` | `motif-12.7b-q4/python/q4_direct/p3000` | 0.335x |
-| direct_vs_bridge | `motif-12.7b-q4/swift/q4_direct/p16000` | `motif-12.7b-q4/swift/q4_bridge/p16000` | 1.486x |
-| swift_vs_python | `motif-12.7b-q4/swift/q4_direct/p16000` | `motif-12.7b-q4/python/q4_direct/p16000` | 0.329x |
+| Comparison | Candidate | Baseline | Prompt tokens (cand/base) | Speedup |
+| --- | --- | --- | ---: | ---: |
+| direct_vs_bridge | `motif-2.6b-q4/python/q4_direct/p500` | `motif-2.6b-q4/python/q4_bridge/p500` | 462/462 | 1.295x |
+| direct_vs_bridge | `motif-2.6b-q4/python/q4_direct/p3000` | `motif-2.6b-q4/python/q4_bridge/p3000` | 2727/2727 | 1.077x |
+| direct_vs_bridge | `motif-2.6b-q4/python/q4_direct/p16000` | `motif-2.6b-q4/python/q4_bridge/p16000` | 14519/14519 | 1.084x |
+| swift_vs_python | `motif-2.6b-q4/swift/q4_bridge/p500` | `motif-2.6b-q4/python/q4_bridge/p500` | 462/462 | 0.264x |
+| swift_vs_python | `motif-2.6b-q4/swift/q4_bridge/p3000` | `motif-2.6b-q4/python/q4_bridge/p3000` | 2727/2727 | 0.380x |
+| swift_vs_python | `motif-2.6b-q4/swift/q4_bridge/p16000` | `motif-2.6b-q4/python/q4_bridge/p16000` | 14519/14519 | 0.862x |
+| direct_vs_bridge | `motif-2.6b-q4/swift/q4_direct/p500` | `motif-2.6b-q4/swift/q4_bridge/p500` | 462/462 | 0.981x |
+| swift_vs_python | `motif-2.6b-q4/swift/q4_direct/p500` | `motif-2.6b-q4/python/q4_direct/p500` | 462/462 | 0.200x |
+| direct_vs_bridge | `motif-2.6b-q4/swift/q4_direct/p3000` | `motif-2.6b-q4/swift/q4_bridge/p3000` | 2727/2727 | 1.002x |
+| swift_vs_python | `motif-2.6b-q4/swift/q4_direct/p3000` | `motif-2.6b-q4/python/q4_direct/p3000` | 2727/2727 | 0.354x |
+| direct_vs_bridge | `motif-2.6b-q4/swift/q4_direct/p16000` | `motif-2.6b-q4/swift/q4_bridge/p16000` | 14519/14519 | 0.865x |
+| swift_vs_python | `motif-2.6b-q4/swift/q4_direct/p16000` | `motif-2.6b-q4/python/q4_direct/p16000` | 14519/14519 | 0.687x |
+| direct_vs_bridge | `motif-12.7b-q4/python/q4_direct/p500` | `motif-12.7b-q4/python/q4_bridge/p500` | 555/555 | 1.717x |
+| direct_vs_bridge | `motif-12.7b-q4/python/q4_direct/p3000` | `motif-12.7b-q4/python/q4_bridge/p3000` | 2821/2821 | 2.794x |
+| direct_vs_bridge | `motif-12.7b-q4/python/q4_direct/p16000` | `motif-12.7b-q4/python/q4_bridge/p16000` | 14613/14613 | 5.822x |
+| swift_vs_python | `motif-12.7b-q4/swift/q4_bridge/p500` | `motif-12.7b-q4/python/q4_bridge/p500` | 469/555 ⚠️ | 0.469x |
+| swift_vs_python | `motif-12.7b-q4/swift/q4_bridge/p3000` | `motif-12.7b-q4/python/q4_bridge/p3000` | 2735/2821 ⚠️ | 0.933x |
+| swift_vs_python | `motif-12.7b-q4/swift/q4_bridge/p16000` | `motif-12.7b-q4/python/q4_bridge/p16000` | 14527/14613 ⚠️ | 1.290x |
+| direct_vs_bridge | `motif-12.7b-q4/swift/q4_direct/p500` | `motif-12.7b-q4/swift/q4_bridge/p500` | 469/469 | 0.924x |
+| swift_vs_python | `motif-12.7b-q4/swift/q4_direct/p500` | `motif-12.7b-q4/python/q4_direct/p500` | 469/555 ⚠️ | 0.253x |
+| direct_vs_bridge | `motif-12.7b-q4/swift/q4_direct/p3000` | `motif-12.7b-q4/swift/q4_bridge/p3000` | 2735/2735 | 1.005x |
+| swift_vs_python | `motif-12.7b-q4/swift/q4_direct/p3000` | `motif-12.7b-q4/python/q4_direct/p3000` | 2735/2821 ⚠️ | 0.335x |
+| direct_vs_bridge | `motif-12.7b-q4/swift/q4_direct/p16000` | `motif-12.7b-q4/swift/q4_bridge/p16000` | 14527/14527 | 1.486x |
+| swift_vs_python | `motif-12.7b-q4/swift/q4_direct/p16000` | `motif-12.7b-q4/python/q4_direct/p16000` | 14527/14613 ⚠️ | 0.329x |
+
+> ⚠️ Rows marked with a warning compare candidate and baseline cells whose actual prompt token counts differ (same target bucket, different rendered prompt). Decode tok/s depends on prompt length, so those speedups are not a clean head-to-head and must not be read as parity evidence.
 
 ## Notes
 

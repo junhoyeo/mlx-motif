@@ -12,8 +12,9 @@ MOTIFKIT_ENABLE_MLX=1 uv run python scripts/bench_sweep.py \
   --cache-cell q4_bridge:q4,quant_sdpa=0,disable_kernels=1 \
   --cache-cell q4_direct:q4,quant_sdpa=1 \
   --prompt-lens 500 1600 \
-  --max-tokens 32 \
+  --max-tokens 128 \
   --n-runs 1 \
+  --warmup-runs 1 \
   --output artifacts/benchmarks/smoke.json \
   --markdown artifacts/benchmarks/smoke.md
 ```
@@ -46,7 +47,11 @@ The current target sweep evidence is
 M1 Max at p500/p3000/p16000 with `n_runs=1`, `max_tokens=8`, `q4_bridge`, and
 `q4_direct`. It is a target-matrix smoke, not a final repeated thermal parity
 claim. The report shows Swift remains below Python for most q4-direct cells, so
-performance parity stays gated.
+performance parity stays gated. For the 12.7B reasoning model the Swift and
+Python cells render different prompt token counts at the same target bucket
+(the Swift template fallback drops the hardcoded reasoning preamble), so those
+`swift_vs_python` rows are flagged in the report and must not be read as a clean
+head-to-head.
 
 ## Checked-in QKV fusion probe
 
@@ -68,3 +73,5 @@ The workflow uploads:
 - `benchmark-raw-logs`
 
 Do not update parity documentation from a dry-run report. Use a real report with `config.dry_run == false` and compare Swift `q4_direct` cells against Python cells for the same model and prompt length.
+
+The `swift_vs_python` speedup column is not a steady-state throughput ratio: the Python cell discards its first decode step (steady-state decode tok/s) while the Swift cell's tok/s includes the compile-heavy first generated token. At low `--max-tokens` this dominates and makes Swift look artificially slow. Only draw throughput conclusions from a report run with a high `--max-tokens` and `--warmup-runs 1`, and treat the ratio as approximate even then.

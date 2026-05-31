@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import plistlib
 import sys
 import zipfile
@@ -48,12 +49,18 @@ def validate(metadata_path: Path) -> dict[str, Any]:
     if plist.get("CFBundleIdentifier") != bundle_id:
         fail("Info.plist CFBundleIdentifier does not match metadata")
 
+    if not os.access(binary, os.X_OK):
+        fail(f"binary is not executable: {binary}")
+
     if sha256(binary) != metadata.get("binary_sha256"):
         fail("binary sha256 mismatch")
     if sha256(zip_path) != metadata.get("zip_sha256"):
         fail("zip sha256 mismatch")
 
     with zipfile.ZipFile(zip_path) as zf:
+        bad = zf.testzip()
+        if bad is not None:
+            fail(f"zip CRC/data error on entry: {bad}")
         names = set(zf.namelist())
     expected_binary = f"{app_name}.app/Contents/MacOS/{app_name}"
     expected_plist = f"{app_name}.app/Contents/Info.plist"

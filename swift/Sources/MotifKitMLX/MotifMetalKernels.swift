@@ -221,7 +221,7 @@ public enum MotifMetalKernels {
             name: .sdpaDualVQ4,
             pythonSymbol: "sdpa_dual_v_q4",
             pythonSource: "src/mlx_motif/kernels/attention.py",
-            swiftWrapper: "MotifSDPADualVQ4.apply",
+            swiftWrapper: "MotifSDPADualVQ4.reference",
             status: .wrapperScaffolded,
             defaultEnabled: false,
             parityFixture: "packed uint32/scales/biases fixture shared with Python sdpa_dual_v_q4_reference",

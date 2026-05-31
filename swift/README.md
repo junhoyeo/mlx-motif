@@ -55,7 +55,7 @@ To run the SwiftUI chat app directly against a converted checkpoint instead of a
 MOTIFKIT_ENABLE_MLX=1 swift run --package-path swift MotifChatApp
 ```
 
-Then choose **Native MLX checkpoint** in the Runtime panel and set the converted checkpoint directory, for example `.models/motif-2.6b-mlx-q4`.
+Then choose **Native MLX checkpoint** in the Runtime panel and set the converted checkpoint directory, for example `~/.models/motif-2.6b-mlx-q4` (the app's default, overridable via `MOTIF_MODEL_DIR`).
 
 ## Enable MLX overlay work
 

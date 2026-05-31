@@ -1,0 +1,19 @@
+{
+  "app_dir": "dist/MotifChatApp.app",
+  "app_name": "MotifChatApp",
+  "app_size_kb": 1028,
+  "binary_sha256": "f3fb249514b975ee257a576b0138268105366b531ebcedc70592bce533515af2",
+  "bundle_id": "io.junho.motif.chat",
+  "configuration": "release",
+  "git": {
+    "commit": "4b5132a9aaa6822e842129e01f9746ff5a939540",
+    "dirty": false
+  },
+  "schema_version": 1,
+  "target_triple": "arm64-apple-macosx",
+  "toolchain": {
+    "swift": "Apple Swift version 6.0.3 (swiftlang-6.0.3.1.10 clang-1600.0.30.1)"
+  },
+  "zip_path": "dist/MotifChatApp.zip",
+  "zip_sha256": "5bfbe3b51ec3c0b3053442890d3873b599c58fba391775187b8f67f974f1c60e"
+}

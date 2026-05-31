@@ -62,6 +62,14 @@ Swift q4-direct cell by 1.05x at p500 and 1.20x at p3000, but it is still a
 single-run probe and does not close the Python-vs-Swift gap from the target
 sweep.
 
+
+## Swift app readiness evidence
+
+- Native backend smoke: [`swift-app-smoke-native-server-20260531T184436Z.json`](swift-app-smoke-native-server-20260531T184436Z.json)
+- Package verification: [`swift-app-package-20260531T184436Z.json`](swift-app-package-20260531T184436Z.json)
+
+These artifacts were produced on local Apple Silicon from `main` after PRs #18-#24 were squash-merged. They verify native generation, cancellation, native OpenAI-compatible server fallback, and ad-hoc package integrity. They are not a substitute for the interactive SwiftUI checklist in [`../swift-app-smoke.md`](../swift-app-smoke.md).
+
 ## CI and artifact expectations
 
 Normal PR CI runs a dry sweep only because Motif weights are not vendored. The manual `Benchmark sweep` workflow is for local/self-hosted Apple Silicon runners with checkpoint directories already present or restored from trusted infrastructure.

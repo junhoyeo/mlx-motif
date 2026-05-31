@@ -62,7 +62,7 @@ final class ChatStore: ObservableObject {
     @Published var capturedReasoning = ""
 
     private var generationTask: Task<Void, Never>?
-    private var nativeDirectoryAccess: NativeDirectoryAccess?
+    private var nativeDirectoryAccess: NativeDirectoryAccessGrant?
     private static let defaults = UserDefaults.standard
     private static let defaultSystemPrompt = "You are Motif accessed through the configured local runtime. Be concise and helpful."
 
@@ -263,60 +263,47 @@ final class ChatStore: ObservableObject {
     /// reads succeed under App Sandbox and after relaunch. Starts scoped access when a
     /// bookmark is available; the returned token's `stop` must be invoked once the
     /// checkpoint load completes. Falls back to the plain path when no bookmark exists.
-    private func acquireNativeModelDirectoryAccess() throws -> NativeDirectoryAccess {
-        if let access = try scopedAccessFromBookmark() {
-            return access
-        }
-        // No bookmark stored (non-sandboxed/dev use, or reset state): fall back to the
-        // path. No scoped access is needed when the app is unsandboxed.
-        return NativeDirectoryAccess(url: try resolvedNativeModelDirectoryFromPath(), stop: {})
-    }
-
-    private func scopedAccessFromBookmark() throws -> NativeDirectoryAccess? {
-        guard
-            let encoded = ChatStore.defaults.string(forKey: DefaultsKey.nativeModelDirectoryBookmark.rawValue),
-            let bookmark = Data(base64Encoded: encoded)
-        else {
-            return nil
-        }
-
-        #if os(macOS)
-        let options: URL.BookmarkResolutionOptions = [.withSecurityScope]
-        #else
-        let options: URL.BookmarkResolutionOptions = []
-        #endif
-
-        var isStale = false
-        let url: URL
-        do {
-            url = try URL(
-                resolvingBookmarkData: bookmark,
-                options: options,
-                relativeTo: nil,
-                bookmarkDataIsStale: &isStale
-            )
-        } catch {
-            throw MotifChatStoreError.unresolvableNativeModelDirectory(error.localizedDescription)
-        }
-
-        guard url.startAccessingSecurityScopedResource() else {
-            throw MotifChatStoreError.inaccessibleNativeModelDirectory
-        }
-
-        if isStale {
-            // Re-persist a fresh bookmark for the resolved URL; failure is non-fatal
-            // because the just-started access still covers this load.
-            persistSecurityScopedBookmark(for: url)
-        }
-
-        return NativeDirectoryAccess(url: url, stop: {
-            url.stopAccessingSecurityScopedResource()
-        })
+    ///
+    /// The decision/fallback logic lives in `NativeModelDirectoryResolver` (in
+    /// MotifKit) so it is unit-testable headless; this method only wires the real
+    /// Foundation bookmark / `UserDefaults` operations into that resolver.
+    private func acquireNativeModelDirectoryAccess() throws -> NativeDirectoryAccessGrant {
+        let resolver = NativeModelDirectoryResolver(
+            loadBookmark: {
+                guard
+                    let encoded = ChatStore.defaults.string(
+                        forKey: DefaultsKey.nativeModelDirectoryBookmark.rawValue
+                    ),
+                    let bookmark = Data(base64Encoded: encoded)
+                else {
+                    return nil
+                }
+                return bookmark
+            },
+            resolveBookmark: { bookmark, isStale in
+                #if os(macOS)
+                let options: URL.BookmarkResolutionOptions = [.withSecurityScope]
+                #else
+                let options: URL.BookmarkResolutionOptions = []
+                #endif
+                return try URL(
+                    resolvingBookmarkData: bookmark,
+                    options: options,
+                    relativeTo: nil,
+                    bookmarkDataIsStale: &isStale
+                )
+            },
+            startAccess: { $0.startAccessingSecurityScopedResource() },
+            stopAccess: { $0.stopAccessingSecurityScopedResource() },
+            persistBookmark: { [weak self] url in self?.persistSecurityScopedBookmark(for: url) },
+            resolvePath: { try self.resolvedNativeModelDirectoryFromPath() }
+        )
+        return try resolver.acquire()
     }
 
     private func resolvedNativeModelDirectoryFromPath() throws -> URL {
         let trimmed = nativeModelDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw MotifChatStoreError.emptyNativeModelDirectory }
+        guard !trimmed.isEmpty else { throw NativeModelDirectoryError.emptyPath }
 
         let expanded: String
         if trimmed == "~" {
@@ -384,20 +371,9 @@ private enum DefaultsKey: String, CaseIterable {
     case temperature = "motif.chat.temperature"
 }
 
-/// Owns an active security-scoped access to the native model directory. The caller
-/// must invoke `stop` once every file read for the load has completed. `stop` is a
-/// no-op for the unsandboxed path-based fallback.
-private struct NativeDirectoryAccess {
-    let url: URL
-    let stop: () -> Void
-}
-
 private enum MotifChatStoreError: Error, LocalizedError {
     case invalidEndpoint
     case nativeMLXNotCompiled
-    case emptyNativeModelDirectory
-    case unresolvableNativeModelDirectory(String)
-    case inaccessibleNativeModelDirectory
 
     var errorDescription: String? {
         switch self {
@@ -405,12 +381,6 @@ private enum MotifChatStoreError: Error, LocalizedError {
             "Endpoint must be a valid URL."
         case .nativeMLXNotCompiled:
             "Native MLX chat is not compiled into this app build. Rebuild with MOTIFKIT_ENABLE_MLX=1."
-        case .emptyNativeModelDirectory:
-            "Native MLX model directory cannot be empty."
-        case .unresolvableNativeModelDirectory(let detail):
-            "Could not resolve the saved native model directory. Re-select it. (\(detail))"
-        case .inaccessibleNativeModelDirectory:
-            "Could not obtain access to the saved native model directory. Re-select it."
         }
     }
 }

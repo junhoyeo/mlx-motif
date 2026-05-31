@@ -80,8 +80,16 @@ struct MotifNativeGenerateCommand {
                 fflush(stdout)
             case .reasoning(let reasoning):
                 FileHandle.standardError.write(Data("\n[reasoning]\n\(reasoning)\n".utf8))
-            case .completed:
+            case .completed(let usage):
                 print("")
+                // Surface the authoritative terminal token counts to stderr so
+                // the CLI matches the Python generate path's usage reporting;
+                // stdout stays reserved for streamed generation text.
+                if let usage {
+                    FileHandle.standardError.write(Data(
+                        "[usage] prompt_tokens=\(usage.promptTokens) generation_tokens=\(usage.completionTokens) total_tokens=\(usage.totalTokens)\n".utf8
+                    ))
+                }
             }
         }
     }

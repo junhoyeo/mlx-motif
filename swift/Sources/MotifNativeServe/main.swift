@@ -190,6 +190,13 @@ private final class NativeOpenAIServer: @unchecked Sendable {
                 try await sendSSE(connection, payload: payload)
             case .reasoning(let reasoning):
                 capturedReasoning = reasoning
+            // Parity with the Python server: the streaming path emits NO `usage`
+            // on the terminal chunk (Python does not implement `stream_options:
+            // {include_usage: true}`). The token counts are now available on the
+            // `.completed` payload, but we deliberately omit them here to keep
+            // the streaming wire contract identical to Python. The non-streaming
+            // path (`completeChat`) reports the real counts. See
+            // docs/server-parity.md.
             case .completed:
                 var final: [String: Any] = [
                     "id": String(requestID), "object": "chat.completion.chunk", "created": created, "model": modelID,
@@ -207,32 +214,33 @@ private final class NativeOpenAIServer: @unchecked Sendable {
     private func completeChat(_ chat: ChatCompletionRequest, connection: NWConnection) async throws {
         var content = ""
         var reasoning: String?
+        var usage: MotifGenerationUsage?
         let stream = runtime.streamResponse(messages: chat.motifMessages, parameters: chat.parameters(defaultThinkMode: defaultThinkMode))
         for try await event in stream {
             switch event {
             case .text(let text): content += text
             case .reasoning(let text): reasoning = text
-            case .completed: break
+            // Parity with the Python server: `usage` is populated from the
+            // terminal generation result. The native MLX runtime surfaces the
+            // real prompt/generation token counts on the `.completed` event
+            // (sourced from MLX's `generate(...)` `.info` completion). Match the
+            // Python `usage` shape exactly (prompt_tokens / completion_tokens /
+            // total_tokens). See docs/server-parity.md.
+            case .completed(let completedUsage): usage = completedUsage
             }
         }
+        let resolvedUsage = usage ?? MotifGenerationUsage(promptTokens: 0, completionTokens: 0)
         var payload: [String: Any] = [
             "id": "chatcmpl-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24),
             "object": "chat.completion",
             "created": Int(Date().timeIntervalSince1970),
             "model": modelID,
             "choices": [["index": 0, "message": ["role": "assistant", "content": content], "finish_reason": "stop"]],
-            // TODO(parity): emit real token counts. The Python server populates
-            // `usage` from `stream_generate`'s final result (`prompt_tokens`,
-            // `generation_tokens`). Here the counts are NOT reachable: the
-            // `MotifGenerationEvent` enum (`.text`/`.reasoning`/`.completed`)
-            // carries no token stats — the underlying `generate(...)` `.info`
-            // case that holds them is consumed inside MotifMLXNativeRuntime and
-            // never surfaced. Reporting real numbers requires threading a usage
-            // payload through `MotifGenerationEvent` (e.g. `.completed(usage:)`),
-            // which is a cross-module change deferred to a follow-up. We emit
-            // zeros (a structurally valid `usage` object) rather than fake
-            // counts. See docs/server-parity.md.
-            "usage": ["prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0],
+            "usage": [
+                "prompt_tokens": resolvedUsage.promptTokens,
+                "completion_tokens": resolvedUsage.completionTokens,
+                "total_tokens": resolvedUsage.totalTokens,
+            ],
         ]
         if let reasoning { payload["reasoning"] = reasoning }
         try await sendJSON(connection, status: 200, payload: payload)

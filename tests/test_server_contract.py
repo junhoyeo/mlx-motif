@@ -194,11 +194,20 @@ def test_non_streaming_usage_has_integer_fields(monkeypatch):
     for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
         assert field in usage, f"usage missing {field}"
         assert isinstance(usage[field], int), f"usage.{field} must be int"
+        # Real, non-zero counts must be forwarded. A regression back to a
+        # hardcoded zero `usage` object (the prior Swift behaviour, now fixed on
+        # both servers) would fail here.
+        assert usage[field] > 0, f"usage.{field} must be a real (non-zero) count"
     # The stub reports prompt=7, generation=2 on the final step; the Python
-    # server forwards these real counts (Swift currently emits zeros — tracked
-    # as a known gap in docs/server-parity.md).
+    # server forwards these real counts. The Swift `MotifNativeServe` server now
+    # matches: it surfaces MLX's terminal token counts on the `.completed` event
+    # (carried as `MotifGenerationUsage`) and populates the same `usage` shape.
+    # See docs/server-parity.md.
     assert usage["prompt_tokens"] == 7
     assert usage["completion_tokens"] == 2
+    # total_tokens == prompt_tokens + completion_tokens (the shape both servers
+    # share; Swift computes it as `MotifGenerationUsage.totalTokens`).
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
     assert usage["total_tokens"] == 9
     # No `role` echoed in a non-streaming `message` beyond assistant content.
     assert payload["choices"][0]["message"]["content"] == "Hello world"

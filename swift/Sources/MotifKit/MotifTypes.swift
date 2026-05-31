@@ -54,10 +54,34 @@ public struct MotifGenerationParameters: Equatable, Sendable {
     }
 }
 
+/// Token-usage accounting surfaced on the terminal generation event.
+///
+/// Mirrors the OpenAI `usage` object (`prompt_tokens` / `completion_tokens` /
+/// `total_tokens`) so HTTP servers built on `MotifGenerationEvent` can report
+/// real counts instead of zeros. The underlying MLX `generate(...)` `.info`
+/// completion carries these figures; this struct threads them out of the
+/// runtime to consumers (e.g. `MotifNativeServe`).
+public struct MotifGenerationUsage: Equatable, Sendable {
+    public var promptTokens: Int
+    public var completionTokens: Int
+
+    public var totalTokens: Int { promptTokens + completionTokens }
+
+    public init(promptTokens: Int, completionTokens: Int) {
+        self.promptTokens = promptTokens
+        self.completionTokens = completionTokens
+    }
+}
+
 public enum MotifGenerationEvent: Equatable, Sendable {
     case text(String)
     case reasoning(String)
-    case completed
+    /// Terminal event. Carries token-usage accounting when the backend can
+    /// surface it (the native MLX runtime does); `nil` for backends that do
+    /// not report counts (e.g. the remote OpenAI-compatible SSE client, whose
+    /// upstream stream omits `usage`). Existing `case .completed:` patterns
+    /// continue to match and may ignore the payload.
+    case completed(usage: MotifGenerationUsage?)
 }
 
 public protocol MotifChatBackend: Sendable {

@@ -140,7 +140,17 @@ private final class NativeOpenAIServer: @unchecked Sendable {
                 connection.cancel()
                 return
             }
-            let chat = try JSONDecoder().decode(ChatCompletionRequest.self, from: request.body)
+            // Parity with the Python server: a malformed JSON body is a client
+            // error (400 `bad json: …`), NOT a 500. Catch the decode failure
+            // specifically so genuine runtime faults below still surface as 500.
+            let chat: ChatCompletionRequest
+            do {
+                chat = try JSONDecoder().decode(ChatCompletionRequest.self, from: request.body)
+            } catch {
+                try await sendJSON(connection, status: 400, payload: ["error": ["message": "bad json: \(error)"]])
+                connection.cancel()
+                return
+            }
             guard !chat.messages.isEmpty else {
                 try await sendJSON(connection, status: 400, payload: ["error": ["message": "messages required"]])
                 connection.cancel()
@@ -163,6 +173,13 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         let requestID = "chatcmpl-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
         let created = Int(Date().timeIntervalSince1970)
         let stream = runtime.streamResponse(messages: chat.motifMessages, parameters: chat.parameters(defaultThinkMode: defaultThinkMode))
+        // Parity with the Python server: captured reasoning is attached to the
+        // terminal stop chunk rather than emitted as a separate intermediate
+        // SSE event. We buffer it here and merge it into the `.completed` chunk.
+        // The Swift SSE client (`OpenAICompatibleMotifBackend.emit`) reads the
+        // top-level `reasoning` field off whatever chunk carries it, so the
+        // client-visible event order is unchanged by this move.
+        var capturedReasoning: String?
         for try await event in stream {
             switch event {
             case .text(let text):
@@ -172,12 +189,15 @@ private final class NativeOpenAIServer: @unchecked Sendable {
                 ]
                 try await sendSSE(connection, payload: payload)
             case .reasoning(let reasoning):
-                try await sendSSE(connection, payload: ["id": String(requestID), "reasoning": reasoning])
+                capturedReasoning = reasoning
             case .completed:
-                let final: [String: Any] = [
+                var final: [String: Any] = [
                     "id": String(requestID), "object": "chat.completion.chunk", "created": created, "model": modelID,
                     "choices": [["index": 0, "delta": [:], "finish_reason": "stop"]],
                 ]
+                if let capturedReasoning, !capturedReasoning.isEmpty {
+                    final["reasoning"] = capturedReasoning
+                }
                 try await sendSSE(connection, payload: final)
             }
         }
@@ -201,6 +221,17 @@ private final class NativeOpenAIServer: @unchecked Sendable {
             "created": Int(Date().timeIntervalSince1970),
             "model": modelID,
             "choices": [["index": 0, "message": ["role": "assistant", "content": content], "finish_reason": "stop"]],
+            // TODO(parity): emit real token counts. The Python server populates
+            // `usage` from `stream_generate`'s final result (`prompt_tokens`,
+            // `generation_tokens`). Here the counts are NOT reachable: the
+            // `MotifGenerationEvent` enum (`.text`/`.reasoning`/`.completed`)
+            // carries no token stats — the underlying `generate(...)` `.info`
+            // case that holds them is consumed inside MotifMLXNativeRuntime and
+            // never surfaced. Reporting real numbers requires threading a usage
+            // payload through `MotifGenerationEvent` (e.g. `.completed(usage:)`),
+            // which is a cross-module change deferred to a follow-up. We emit
+            // zeros (a structurally valid `usage` object) rather than fake
+            // counts. See docs/server-parity.md.
             "usage": ["prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0],
         ]
         if let reasoning { payload["reasoning"] = reasoning }
@@ -271,8 +302,23 @@ private struct ChatCompletionRequest: Decodable {
     }
 }
 
+/// Map an HTTP status code to its standard reason phrase.
+///
+/// The previous implementation hardcoded `"ERROR"` for every non-200 status,
+/// producing wire lines like `HTTP/1.1 404 ERROR`. That diverges from the
+/// Python server (and from RFC 7231), which emit proper reason phrases.
+private func reasonPhrase(for status: Int) -> String {
+    switch status {
+    case 200: return "OK"
+    case 400: return "Bad Request"
+    case 404: return "Not Found"
+    case 500: return "Internal Server Error"
+    default: return "OK"
+    }
+}
+
 private func sendHeader(_ connection: NWConnection, status: Int, contentType: String, extraHeaders: [String: String] = [:]) async throws {
-    var header = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "ERROR")\r\nContent-Type: \(contentType)\r\nConnection: close\r\n"
+    var header = "HTTP/1.1 \(status) \(reasonPhrase(for: status))\r\nContent-Type: \(contentType)\r\nConnection: close\r\n"
     for (key, value) in extraHeaders { header += "\(key): \(value)\r\n" }
     header += "\r\n"
     try await sendRaw(connection, Data(header.utf8))
@@ -280,7 +326,7 @@ private func sendHeader(_ connection: NWConnection, status: Int, contentType: St
 
 private func sendJSON(_ connection: NWConnection, status: Int, payload: [String: Any]) async throws {
     let body = try JSONSerialization.data(withJSONObject: payload)
-    let header = "HTTP/1.1 \(status) \(status == 200 ? "OK" : "ERROR")\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+    let header = "HTTP/1.1 \(status) \(reasonPhrase(for: status))\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
     var data = Data(header.utf8)
     data.append(body)
     try await sendRaw(connection, data)

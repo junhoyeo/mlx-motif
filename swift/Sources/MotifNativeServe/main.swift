@@ -180,6 +180,10 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         // top-level `reasoning` field off whatever chunk carries it, so the
         // client-visible event order is unchanged by this move.
         var capturedReasoning: String?
+        // Authoritative token usage carried by the terminal `.completed` event.
+        // Used only when the client explicitly requests OpenAI's trailing
+        // streaming usage chunk (`stream_options.include_usage`).
+        var terminalUsage: MotifGenerationUsage?
         for try await event in stream {
             switch event {
             case .text(let text):
@@ -190,14 +194,8 @@ private final class NativeOpenAIServer: @unchecked Sendable {
                 try await sendSSE(connection, payload: payload)
             case .reasoning(let reasoning):
                 capturedReasoning = reasoning
-            // Parity with the Python server: the streaming path emits NO `usage`
-            // on the terminal chunk (Python does not implement `stream_options:
-            // {include_usage: true}`). The token counts are now available on the
-            // `.completed` payload, but we deliberately omit them here to keep
-            // the streaming wire contract identical to Python. The non-streaming
-            // path (`completeChat`) reports the real counts. See
-            // docs/server-parity.md.
-            case .completed:
+            case .completed(let usage):
+                terminalUsage = usage
                 var final: [String: Any] = [
                     "id": String(requestID), "object": "chat.completion.chunk", "created": created, "model": modelID,
                     "choices": [["index": 0, "delta": [:], "finish_reason": "stop"]],
@@ -207,6 +205,24 @@ private final class NativeOpenAIServer: @unchecked Sendable {
                 }
                 try await sendSSE(connection, payload: final)
             }
+        }
+        // OpenAI-compatible `stream_options: {include_usage: true}`: after the
+        // terminal stop chunk and before `[DONE]`, emit one extra chunk with
+        // empty `choices` and a `usage` object. All fields come from the
+        // authoritative terminal `MotifGenerationUsage` surfaced by the runtime
+        // — the same source used by the non-streaming response. If a backend
+        // cannot report usage, omit the chunk instead of emitting wrong counts.
+        if chat.includeUsage, let usage = terminalUsage {
+            let usageChunk: [String: Any] = [
+                "id": String(requestID), "object": "chat.completion.chunk", "created": created, "model": modelID,
+                "choices": [],
+                "usage": [
+                    "prompt_tokens": usage.promptTokens,
+                    "completion_tokens": usage.completionTokens,
+                    "total_tokens": usage.totalTokens,
+                ],
+            ]
+            try await sendSSE(connection, payload: usageChunk)
         }
         try await sendRaw(connection, Data("data: [DONE]\n\n".utf8))
     }
@@ -283,11 +299,24 @@ private struct ChatCompletionRequest: Decodable {
     var maxTokens: Int?
     var temperature: Double?
     var thinkMode: MotifThinkMode?
+    var streamOptions: StreamOptions?
+
+    /// Whether to emit OpenAI's trailing streaming usage chunk.
+    var includeUsage: Bool { streamOptions?.includeUsage == true }
 
     enum CodingKeys: String, CodingKey {
         case messages, stream, temperature
         case maxTokens = "max_tokens"
         case thinkMode = "think_mode"
+        case streamOptions = "stream_options"
+    }
+
+    struct StreamOptions: Decodable {
+        var includeUsage: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case includeUsage = "include_usage"
+        }
     }
 
     struct Message: Decodable {

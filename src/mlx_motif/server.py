@@ -198,6 +198,8 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
             max_tokens = int(body.get("max_tokens") or 256)
             temperature = float(body.get("temperature", 0.0))
             think_mode = body.get("think_mode") or default_think_mode
+            stream_options = body.get("stream_options") or {}
+            include_usage = bool(stream_options.get("include_usage", False))
 
             if not messages:
                 return self._send_json(400, {"error": {"message": "messages required"}})
@@ -220,7 +222,9 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
             if stream:
                 self._send_sse()
                 try:
+                    last = None
                     for r in stream_generate(model, tokenizer, prompt, **kwargs):
+                        last = r
                         out = filt.feed(r.text)
                         if out:
                             chunk = {
@@ -245,6 +249,29 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
                     if think_mode == "captured" and filt.captured:
                         final["reasoning"] = filt.captured
                     self.wfile.write(f"data: {json.dumps(final)}\n\n".encode())
+                    # OpenAI-compatible `stream_options: {include_usage: true}`:
+                    # after the terminal stop chunk and before `[DONE]`, emit
+                    # one extra chunk with empty `choices` whose `usage` carries
+                    # authoritative counts from the final generation result. The
+                    # total is always prompt + completion tokens, never a count
+                    # of emitted SSE chunks. If no result exists, omit the
+                    # usage chunk rather than inventing counts.
+                    if include_usage and last is not None:
+                        prompt_tokens = getattr(last, "prompt_tokens", 0)
+                        completion_tokens = getattr(last, "generation_tokens", 0)
+                        usage_chunk = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens,
+                            },
+                        }
+                        self.wfile.write(f"data: {json.dumps(usage_chunk)}\n\n".encode())
                     self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):

@@ -25,24 +25,77 @@ struct MarkdownMessageView: View {
   }
 }
 
-/// Markdown prose, parsed inline so paragraphs/lists/bold/inline-code survive,
-/// with a plain-text fallback if parsing throws.
+/// Markdown prose. SwiftUI's `Text(AttributedString)` only renders *inline*
+/// markdown (bold/italic/code) — it flattens block constructs, so a `- item`
+/// list shows as literal text. To get real bullet/numbered lists we split the
+/// prose into block-level lines here and render list items as proper rows,
+/// applying inline markdown within each line.
 private struct ProseView: View {
   let text: String
 
-  var body: some View {
-    if let attributed = try? AttributedString(
-      markdown: text,
-      options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-    ) {
-      Text(attributed)
-        .textSelection(.enabled)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    } else {
-      Text(text)
-        .textSelection(.enabled)
-        .frame(maxWidth: .infinity, alignment: .leading)
+  private struct Block: Identifiable {
+    let id = UUID()
+    let kind: Kind
+    let text: String
+    enum Kind { case paragraph, bullet, numbered(String) }
+  }
+
+  private var blocks: [Block] {
+    var result: [Block] = []
+    for rawLine in text.components(separatedBy: "\n") {
+      let line = rawLine
+      let trimmed = line.trimmingCharacters(in: .whitespaces)
+      if trimmed.isEmpty { continue }
+
+      // Bullet: -, *, or • followed by a space.
+      if let marker = ["- ", "* ", "• "].first(where: { trimmed.hasPrefix($0) }) {
+        result.append(.init(kind: .bullet, text: String(trimmed.dropFirst(marker.count))))
+        continue
+      }
+      // Numbered: "1. ", "2) " etc.
+      if let dotRange = trimmed.range(of: #"^\d+[.)]\s+"#, options: .regularExpression) {
+        let number = trimmed[trimmed.startIndex..<dotRange.upperBound]
+          .trimmingCharacters(in: CharacterSet(charactersIn: ".) "))
+        result.append(.init(kind: .numbered(number), text: String(trimmed[dotRange.upperBound...])))
+        continue
+      }
+      result.append(.init(kind: .paragraph, text: trimmed))
     }
+    return result
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 4) {
+      ForEach(blocks) { block in
+        switch block.kind {
+        case .paragraph:
+          inlineText(block.text)
+        case .bullet:
+          HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("•").foregroundStyle(.secondary)
+            inlineText(block.text)
+          }
+        case .numbered(let n):
+          HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("\(n).").foregroundStyle(.secondary).monospacedDigit()
+            inlineText(block.text)
+          }
+        }
+      }
+    }
+    .frame(maxWidth: .infinity, alignment: .leading)
+  }
+
+  /// One line with inline markdown (bold/italic/inline-code) applied.
+  @ViewBuilder
+  private func inlineText(_ line: String) -> some View {
+    let attributed = (try? AttributedString(
+      markdown: line,
+      options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+    )) ?? AttributedString(line)
+    Text(attributed)
+      .textSelection(.enabled)
+      .frame(maxWidth: .infinity, alignment: .leading)
   }
 }
 

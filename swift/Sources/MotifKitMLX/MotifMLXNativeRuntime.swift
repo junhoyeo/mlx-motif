@@ -155,10 +155,17 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
         }
 
         let model = try MotifMLXModel(configuration: bundle.configuration, runtimeFeatures: featureFlags)
-        let baseConfiguration = try JSONDecoder().decode(
-            BaseConfiguration.self,
-            from: Data(contentsOf: modelDirectory.appendingPathComponent(MotifModelBundle.configFileName))
-        )
+        let baseConfiguration: BaseConfiguration
+        do {
+            baseConfiguration = try JSONDecoder().decode(
+                BaseConfiguration.self,
+                from: Data(contentsOf: modelDirectory.appendingPathComponent(MotifModelBundle.configFileName))
+            )
+        } catch {
+            throw MotifMLXNativeRuntimeError.modelDirectoryNotLoadable(
+                "BaseConfiguration decode failed: \(String(reflecting: error))"
+            )
+        }
         try loadWeights(
             modelDirectory: modelDirectory,
             model: model,
@@ -177,7 +184,14 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
             defaultPrompt: "Hello",
             eosTokenIds: eosTokenIDs
         )
-        let tokenizer = try await loadTokenizer(configuration: modelConfiguration, hub: defaultHubApi)
+        let tokenizer: any Tokenizer
+        do {
+            tokenizer = try await loadTokenizer(configuration: modelConfiguration, hub: defaultHubApi)
+        } catch {
+            throw MotifMLXNativeRuntimeError.modelDirectoryNotLoadable(
+                "loadTokenizer failed: \(String(reflecting: error))"
+            )
+        }
         let inputProcessor = MotifMLXChatInputProcessor(
             tokenizer: tokenizer,
             messageGenerator: model.messageGenerator(tokenizer: tokenizer),

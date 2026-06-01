@@ -25,3 +25,4 @@ swift/Package.resolved
 
 # Local benchmark artifacts
 artifacts/
+dist-mlx/

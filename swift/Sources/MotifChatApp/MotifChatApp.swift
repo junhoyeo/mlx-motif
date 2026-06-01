@@ -7,7 +7,9 @@ struct MotifChatApp: App {
         WindowGroup {
             ContentView()
         }
-        .windowStyle(.titleBar)
+        // Hidden title bar + behind-window vibrancy (set in ContentView) make the
+        // window translucent so the desktop shows through and the glass refracts it.
+        .windowStyle(.hiddenTitleBar)
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("New Chat") {

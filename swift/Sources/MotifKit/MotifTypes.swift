@@ -555,8 +555,9 @@ public struct MotifRuntimeFeatureFlags: Equatable, Sendable {
             // QKV fusion defaults ON for the grouped q4 decode path: the
             // synthetic decode micro-benchmark (MotifDecodeBench, q4 gs=64, B=1,
             // S=1) shows ~12-20% lower median ms/step at the 12.7B per-layer
-            // shape with fusion enabled, with parity preserved by the MLX
-            // runtime tests. Opt out with MLX_MOTIF_FUSE_QKV=0.
+            // shape with fusion enabled. Fused == unfused numerical equivalence
+            // (incl. the q4 path) is gated by MotifQKVFusionParityTests under
+            // MOTIFKIT_RUN_MLX_RUNTIME_TESTS=1. Opt out with MLX_MOTIF_FUSE_QKV=0.
             fuseQueryKeyValue: !isFalsy(environment["MLX_MOTIF_FUSE_QKV"], defaultValue: true)
         )
     }

@@ -128,11 +128,13 @@ final class MotifGroupedAttentionReferenceTests: XCTestCase {
 
     func testQuantizedGroupedKVCacheProvidesPackedAndDequantizedPaths() throws {
         try requireMLXRuntime()
-        let cache = MotifGroupedQuantizedKVCache(groupSize: 4, bits: 4)
-        let k1 = MLXArray.ones([1, 2, 1, 4])
-        let k2 = MLXArray.ones([1, 2, 1, 4]) * 2
-        let v1 = MLXArray.ones([1, 2, 1, 4]) * 3
-        let v2 = MLXArray.ones([1, 2, 1, 4]) * 4
+        // group size must be one of MLX's supported sizes (32/64/128) and divide
+        // the quantized (head) dimension; mirror the production default (64).
+        let cache = MotifGroupedQuantizedKVCache(groupSize: 32, bits: 4)
+        let k1 = MLXArray.ones([1, 2, 1, 32])
+        let k2 = MLXArray.ones([1, 2, 1, 32]) * 2
+        let v1 = MLXArray.ones([1, 2, 1, 32]) * 3
+        let v2 = MLXArray.ones([1, 2, 1, 32]) * 4
 
         let packed = cache.updateAndFetch4Quantized(kOrigin: k1, kNoise: k2, value1: v1, value2: v2)
         XCTAssertEqual(cache.offset, 1)
@@ -141,7 +143,7 @@ final class MotifGroupedAttentionReferenceTests: XCTestCase {
 
         let dequantized = cache.updateAndFetch4(kOrigin: k1, kNoise: k2, value1: v1, value2: v2)
         XCTAssertEqual(cache.offset, 2)
-        XCTAssertEqual(dequantized.value2.shape, [1, 2, 2, 4])
+        XCTAssertEqual(dequantized.value2.shape, [1, 2, 2, 32])
     }
 
     func testInvalidPlanInputsThrowDeterministicErrors() throws {

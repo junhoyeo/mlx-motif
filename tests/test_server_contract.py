@@ -256,6 +256,82 @@ def test_streaming_contract(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# streaming + stream_options.include_usage: a trailing usage chunk carries the  #
+# authoritative token counts (not a per-chunk counter).                         #
+# --------------------------------------------------------------------------- #
+def test_streaming_include_usage_reports_authoritative_counts(monkeypatch):
+    with _running_server(monkeypatch) as (host, port):
+        status, headers, data = _request(
+            host,
+            port,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+    assert status == 200
+    assert headers.get("Content-Type") == "text/event-stream"
+    text = data.decode("utf-8")
+    assert text.endswith("data: [DONE]\n\n")
+
+    events = [
+        json.loads(seg.strip()[len("data: ") :])
+        for seg in text.split("\n\n")
+        if seg.strip().startswith("data: ") and seg.strip()[len("data: ") :] != "[DONE]"
+    ]
+    assert events, "expected at least one streamed chunk"
+
+    usage_events = [ev for ev in events if "usage" in ev]
+    assert len(usage_events) == 1, "expected exactly one usage chunk"
+    usage_chunk = usage_events[0]
+    assert usage_chunk is events[-1], "usage chunk must be last before [DONE]"
+    assert usage_chunk["object"] == "chat.completion.chunk"
+    assert usage_chunk["choices"] == []
+
+    usage = usage_chunk["usage"]
+    assert usage["prompt_tokens"] == 7
+    assert usage["completion_tokens"] == 2
+    assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+    assert usage["total_tokens"] == 9
+    assert usage["prompt_tokens"] > 0
+    assert usage["completion_tokens"] > 0
+    assert usage["total_tokens"] > 0
+
+    stop_chunk = events[-2]
+    assert stop_chunk["choices"][0]["finish_reason"] == "stop"
+
+    streamed = "".join(
+        ev["choices"][0]["delta"].get("content", "") for ev in events if ev["choices"]
+    )
+    assert streamed == "Hello world"
+
+
+# --------------------------------------------------------------------------- #
+# streaming WITHOUT include_usage: no usage chunk is emitted by default.        #
+# --------------------------------------------------------------------------- #
+def test_streaming_without_include_usage_omits_usage_chunk(monkeypatch):
+    with _running_server(monkeypatch) as (host, port):
+        status, _headers, data = _request(
+            host,
+            port,
+            "POST",
+            "/v1/chat/completions",
+            body={"messages": [{"role": "user", "content": "hi"}], "stream": True},
+        )
+    assert status == 200
+    text = data.decode("utf-8")
+    events = [
+        json.loads(seg.strip()[len("data: ") :])
+        for seg in text.split("\n\n")
+        if seg.strip().startswith("data: ") and seg.strip()[len("data: ") :] != "[DONE]"
+    ]
+    assert all("usage" not in ev for ev in events), "no usage chunk without include_usage"
+
+
+# --------------------------------------------------------------------------- #
 # captured think_mode: reasoning rides on the FINAL/stop chunk (Python), the    #
 # behaviour the Swift fix in part A now matches.                                #
 # --------------------------------------------------------------------------- #

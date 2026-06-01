@@ -37,7 +37,7 @@ Swift 6.0.3; see the verification note below.
 | `role` in streaming delta                | absent                          | absent                           | aligned |
 | Non-streaming `object`                   | `chat.completion`               | same                             | aligned |
 | Non-streaming `usage` (real counts)      | `prompt`/`completion`/`total` from `stream_generate` final result | same — surfaced from MLX `.info` via `MotifGenerationUsage` | aligned (fixed this PR) |
-| Streaming `usage`                        | omitted (no `stream_options`)   | omitted (parity)                 | aligned |
+| Streaming `stream_options.include_usage` | trailing usage chunk with real counts when requested; omitted by default | same | aligned (fixed this PR) |
 
 ## Bugs fixed in this PR (Swift side)
 
@@ -50,6 +50,7 @@ correctly; the fixes below bring `main.swift` into line.
 | 2 | Non-200 reason phrase hardcoded to `"ERROR"` (e.g. `HTTP/1.1 404 ERROR`). | Added `reasonPhrase(for:)` -> `400 Bad Request`, `404 Not Found`, `500 Internal Server Error`, `200 OK`; used in both `sendHeader` and `sendJSON`. | fixed |
 | 3 | Non-streaming `usage` was always `{prompt_tokens:0, completion_tokens:0, total_tokens:0}` in Swift; Python forwards the real counts from `stream_generate`'s final result. | **Fixed end-to-end (cross-module).** See the "Usage token counts" implementation note below. | fixed (aligned to Python) |
 | 4 | Captured `reasoning` emitted as a **separate** intermediate SSE chunk *before* the stop chunk; Python attaches it to the **final/stop** chunk. | Reasoning is buffered and merged onto the terminal `.completed` chunk (`final["reasoning"] = …`). Verified safe: the Swift SSE client `OpenAICompatibleMotifBackend.emit` reads the top-level `reasoning` field off whatever chunk carries it, so the client-visible event order is unchanged. | fixed (aligned to Python) |
+| 5 | `stream_options: {"include_usage": true}` was ignored, so streaming clients could not request authoritative token counts. | Both servers now emit one extra `chat.completion.chunk` after the terminal stop chunk and before `[DONE]`, with empty `choices` and a `usage` object sourced from the final generation result. The chunk is omitted when usage is unavailable or not requested. | fixed (aligned to Python) |
 
 ## Usage token counts — fixed end-to-end
 
@@ -70,10 +71,10 @@ implemented across three modules, without breaking any existing
 - **`MotifNativeServe/main.swift`** — `completeChat` populates the non-streaming
   `usage` object (`prompt_tokens` / `completion_tokens` / `total_tokens`) from
   the surfaced counts, matching the Python `usage` shape exactly. The streaming
-  path deliberately still omits `usage` to stay byte-identical to the Python
-  reference server, which does not implement
-  `stream_options: {include_usage: true}`; the counts are nonetheless available
-  on the `.completed` payload if Python later adds it.
+  path supports `stream_options: {include_usage: true}` by sending one trailing
+  usage chunk with empty `choices`, after the stop chunk and before `[DONE]`.
+  All fields are sourced from terminal generation counts; `total_tokens` is
+  never derived from an SSE-chunk counter.
 
 The `MotifNativeGenerate` CLI also prints the terminal counts to stderr
 (`[usage] prompt_tokens=… generation_tokens=… total_tokens=…`), keeping stdout

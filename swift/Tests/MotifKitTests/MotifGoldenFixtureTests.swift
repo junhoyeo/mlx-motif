@@ -141,8 +141,13 @@ final class MotifGoldenFixtureTests: XCTestCase {
         XCTAssertFalse(disabled.dualVAttention)
         XCTAssertFalse(disabled.quantizedSDPA)
         XCTAssertTrue(disabled.disableCustomKernels)
-        XCTAssertFalse(MotifRuntimeFeatureFlags.fromEnvironment([:]).fuseQueryKeyValue)
+        // QKV fusion now defaults ON for the grouped q4 decode path (measured
+        // ~12-20% lower median ms/step at the 12.7B per-layer shape in the
+        // synthetic decode micro-benchmark). It remains explicitly opt-out.
+        XCTAssertTrue(MotifRuntimeFeatureFlags.fromEnvironment([:]).fuseQueryKeyValue)
         XCTAssertTrue(MotifRuntimeFeatureFlags.fromEnvironment(["MLX_MOTIF_FUSE_QKV": "1"]).fuseQueryKeyValue)
+        XCTAssertFalse(MotifRuntimeFeatureFlags.fromEnvironment(["MLX_MOTIF_FUSE_QKV": "0"]).fuseQueryKeyValue)
+        XCTAssertFalse(MotifRuntimeFeatureFlags.fromEnvironment(["MLX_MOTIF_FUSE_QKV": "off"]).fuseQueryKeyValue)
     }
 
     func testPolyNormReferenceMatchesGoldenFixture() throws {

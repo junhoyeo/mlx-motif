@@ -552,7 +552,12 @@ public struct MotifRuntimeFeatureFlags: Equatable, Sendable {
             fourSlotCache: environment["MLX_MOTIF_4SLOT_CACHE"],
             quantizedSDPA: !isFalsy(environment["MLX_MOTIF_QUANT_SDPA"], defaultValue: true),
             disableCustomKernels: !isFalsy(environment["MLX_MOTIF_DISABLE_KERNELS"], defaultValue: false),
-            fuseQueryKeyValue: !isFalsy(environment["MLX_MOTIF_FUSE_QKV"], defaultValue: false)
+            // QKV fusion defaults ON for the grouped q4 decode path: the
+            // synthetic decode micro-benchmark (MotifDecodeBench, q4 gs=64, B=1,
+            // S=1) shows ~12-20% lower median ms/step at the 12.7B per-layer
+            // shape with fusion enabled, with parity preserved by the MLX
+            // runtime tests. Opt out with MLX_MOTIF_FUSE_QKV=0.
+            fuseQueryKeyValue: !isFalsy(environment["MLX_MOTIF_FUSE_QKV"], defaultValue: true)
         )
     }
 

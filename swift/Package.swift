@@ -75,6 +75,16 @@ if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {
             dependencies: ["MotifKit", "MotifKitMLX"],
             path: "Sources/MotifNativeServe"
         ),
+        .executableTarget(
+            name: "MotifDecodeBench",
+            dependencies: [
+                "MotifKit",
+                "MotifKitMLX",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXNN", package: "mlx-swift"),
+            ],
+            path: "Sources/MotifDecodeBench"
+        ),
     ])
     targets.append(
         .testTarget(
@@ -106,4 +116,5 @@ if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {
     package.products.append(.executable(name: "MotifNativeGenerate", targets: ["MotifNativeGenerate"]))
     package.products.append(.executable(name: "MotifNativeEvaluate", targets: ["MotifNativeEvaluate"]))
     package.products.append(.executable(name: "MotifNativeServe", targets: ["MotifNativeServe"]))
+    package.products.append(.executable(name: "MotifDecodeBench", targets: ["MotifDecodeBench"]))
 }

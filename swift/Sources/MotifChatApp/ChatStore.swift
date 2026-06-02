@@ -29,6 +29,22 @@ enum MotifChatBackendMode: String, CaseIterable, Identifiable {
     }
 }
 
+/// Strategy for keeping a conversation within the model context window. Only
+/// `.slidingWindow` is implemented today; `.summarize` is reserved so the UI and
+/// persistence can grow into it without another migration.
+enum MotifCompactionMode: String, CaseIterable, Identifiable {
+    case slidingWindow
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .slidingWindow:
+            "Sliding window (drop oldest)"
+        }
+    }
+}
+
 @MainActor
 final class ChatStore: ObservableObject {
     @Published var backendMode: MotifChatBackendMode = ChatStore.storedBackendMode() {
@@ -52,17 +68,30 @@ final class ChatStore: ObservableObject {
     @Published var temperature = ChatStore.storedDouble(.temperature, defaultValue: 0.6) {
         didSet { ChatStore.defaults.set(temperature, forKey: DefaultsKey.temperature.rawValue) }
     }
+    @Published var contextTokenBudget = ChatStore.storedInt(.contextTokenBudget, defaultValue: 12000) {
+        didSet { ChatStore.defaults.set(contextTokenBudget, forKey: DefaultsKey.contextTokenBudget.rawValue) }
+    }
+    @Published var compactionMode: MotifCompactionMode = .slidingWindow
     @Published var prompt = ""
     @Published var messages: [MotifChatMessage] = [
         .system(ChatStore.defaultSystemPrompt)
-    ]
+    ] {
+        didSet { syncActiveConversation() }
+    }
     @Published var isGenerating = false
     @Published var lastError: String?
     @Published var runtimeStatus = "Idle"
     @Published var capturedReasoning = ""
+    /// Non-error note surfaced when the context guard trims earlier messages.
+    @Published var contextNotice: String?
+    @Published var conversations: [MotifConversation] = []
+    @Published var activeConversationID: UUID?
 
     private var generationTask: Task<Void, Never>?
     private var nativeDirectoryAccess: NativeDirectoryAccessGrant?
+    /// Suppresses conversation auto-save while we are loading messages into the
+    /// view (selecting/restoring), so a load doesn't bump `updatedAt` or reorder.
+    private var isLoadingConversation = false
     private static let defaults = UserDefaults.standard
     private static let defaultSystemPrompt = "You are Motif accessed through the configured local runtime. Be concise and helpful."
 
@@ -74,15 +103,110 @@ final class ChatStore: ObservableObject {
         #endif
     }
 
+    init() {
+        conversations = Self.loadConversations()
+        // Open the most recently updated conversation if one exists, otherwise
+        // start a fresh chat so the active conversation is always tracked.
+        if let mostRecent = conversations.max(by: { $0.updatedAt < $1.updatedAt }) {
+            loadConversation(mostRecent)
+        } else {
+            startFreshConversation()
+        }
+    }
+
     func newChat() {
         cancel()
         prompt = ""
         capturedReasoning = ""
+        contextNotice = nil
         lastError = nil
         runtimeStatus = "Idle"
-        messages = [
-            .system(Self.defaultSystemPrompt)
-        ]
+        startFreshConversation()
+    }
+
+    /// Creates a brand-new conversation, registers it, and makes it active.
+    private func startFreshConversation() {
+        let conversation = MotifConversation(
+            title: MotifConversation.untitledTitle,
+            messages: [.system(Self.defaultSystemPrompt)]
+        )
+        conversations.insert(conversation, at: 0)
+        activeConversationID = conversation.id
+        isLoadingConversation = true
+        messages = conversation.messages
+        isLoadingConversation = false
+        saveConversations()
+    }
+
+    func selectConversation(_ id: UUID) {
+        guard id != activeConversationID,
+              let conversation = conversations.first(where: { $0.id == id }) else { return }
+        cancel()
+        prompt = ""
+        capturedReasoning = ""
+        contextNotice = nil
+        lastError = nil
+        runtimeStatus = "Idle"
+        loadConversation(conversation)
+    }
+
+    func deleteConversation(_ id: UUID) {
+        conversations.removeAll { $0.id == id }
+        if activeConversationID == id {
+            if let next = conversations.max(by: { $0.updatedAt < $1.updatedAt }) {
+                loadConversation(next)
+            } else {
+                startFreshConversation()
+            }
+        }
+        saveConversations()
+    }
+
+    private func loadConversation(_ conversation: MotifConversation) {
+        activeConversationID = conversation.id
+        isLoadingConversation = true
+        messages = conversation.messages
+        isLoadingConversation = false
+    }
+
+    /// Mirrors the live `messages` back into the active conversation and persists.
+    /// Called from `messages.didSet`; skipped while loading a conversation.
+    private func syncActiveConversation() {
+        guard !isLoadingConversation, let id = activeConversationID,
+              let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+        conversations[index].messages = messages
+        conversations[index].title = MotifConversation.deriveTitle(from: messages)
+        conversations[index].updatedAt = Date()
+        saveConversations()
+    }
+
+    private func saveConversations() {
+        guard let data = try? JSONEncoder().encode(conversations) else { return }
+        ChatStore.defaults.set(data, forKey: DefaultsKey.conversations.rawValue)
+    }
+
+    private static func loadConversations() -> [MotifConversation] {
+        guard let data = defaults.data(forKey: DefaultsKey.conversations.rawValue),
+              let decoded = try? JSONDecoder().decode([MotifConversation].self, from: data) else {
+            return []
+        }
+        return decoded
+    }
+
+    /// Builds the request transcript, applying the context-budget guard so long
+    /// conversations don't overflow the model window. Sets `contextNotice` when
+    /// earlier messages were trimmed (a non-error status note).
+    func messagesWithinBudget() -> [MotifChatMessage] {
+        switch compactionMode {
+        case .slidingWindow:
+            let result = motifTrimMessagesToBudget(messages, budgetTokens: contextTokenBudget)
+            if result.dropped > 0 {
+                contextNotice = "Trimmed \(result.dropped) earlier message\(result.dropped == 1 ? "" : "s") to fit context"
+            } else {
+                contextNotice = nil
+            }
+            return result.kept
+        }
     }
 
     func cancel() {
@@ -112,6 +236,9 @@ final class ChatStore: ObservableObject {
         capturedReasoning = ""
         prompt = ""
         messages.append(.user(trimmed))
+        // Build the request transcript before adding the streaming placeholder,
+        // applying the context-budget guard so long chats don't overflow.
+        let requestMessages = messagesWithinBudget()
         messages.append(.assistant(""))
         let assistantID = messages[messages.count - 1].id
         isGenerating = true
@@ -122,7 +249,6 @@ final class ChatStore: ObservableObject {
             temperature: temperature,
             thinkMode: thinkMode
         )
-        let requestMessages = messages.dropLast()
 
         generationTask = Task { [weak self] in
             guard let self else { return }
@@ -206,7 +332,9 @@ final class ChatStore: ObservableObject {
     }
 
     func resetRuntimeSettings() {
-        for key in DefaultsKey.allCases {
+        // Reset runtime/generation settings but preserve saved conversation
+        // history (its own delete affordance handles that).
+        for key in DefaultsKey.allCases where key != .conversations {
             ChatStore.defaults.removeObject(forKey: key.rawValue)
         }
         backendMode = .openAICompatible
@@ -216,6 +344,7 @@ final class ChatStore: ObservableObject {
         thinkMode = .hidden
         maxTokens = 512
         temperature = 0.6
+        contextTokenBudget = 12000
         runtimeStatus = "Settings reset"
         lastError = nil
     }
@@ -369,6 +498,8 @@ private enum DefaultsKey: String, CaseIterable {
     case thinkMode = "motif.chat.thinkMode"
     case maxTokens = "motif.chat.maxTokens"
     case temperature = "motif.chat.temperature"
+    case contextTokenBudget = "motif.chat.contextTokenBudget"
+    case conversations = "motif.chat.conversations"
 }
 
 private enum MotifChatStoreError: Error, LocalizedError {

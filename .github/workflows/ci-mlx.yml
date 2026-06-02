@@ -1,0 +1,130 @@
+name: CI (MLX / Apple Silicon)
+
+# This workflow runs on a self-hosted Apple Silicon runner (macOS 26 / Xcode 26
+# / Swift 6.2+). It covers the surfaces that the GitHub-hosted "swift" job in
+# ci.yml CANNOT reach:
+#
+#   • MOTIFKIT_ENABLE_MLX=1 — the MotifKitMLX overlay and all MLX-gated targets
+#   • MotifDecodeBench — the native decode-throughput benchmark binary
+#   • MOTIFKIT_RUN_MLX_RUNTIME_TESTS=1 — MotifMetalKernelsTests (needs a GPU +
+#     mlx.metallib, which the hosted runner does not have)
+#   • #if compiler(>=6.2) — the Liquid Glass GlassStyle.swift branch which
+#     requires Swift 6.2 / Xcode 26 SDK and is dead code on Swift 6.0.x
+#
+# Runner requirements (see docs/ci.md for full registration guide):
+#   • Apple Silicon Mac (M-series) running macOS 26
+#   • Xcode 26 (or a Swift 6.2+ toolchain) installed and selected via
+#     `sudo xcode-select -s /Applications/Xcode_26.app/Contents/Developer`
+#   • Runner labels: self-hosted, macOS, ARM64
+#   • The runner user must be able to call `xcrun metal` (no extra setup needed
+#     if Xcode Command Line Tools are installed alongside Xcode 26)
+#
+# Non-blocking contract: this workflow is intentionally a SEPARATE file so it
+# never becomes a required status check on the default hosted lane. PRs proceed
+# normally if no self-hosted runner is online; the job simply stays "queued".
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'swift/**'
+      - 'scripts/verify_swift_mlx.sh'
+      - 'scripts/build_mlx_swift_metallib.sh'
+      - '.github/workflows/ci-mlx.yml'
+  pull_request:
+    paths:
+      - 'swift/**'
+      - 'scripts/verify_swift_mlx.sh'
+      - 'scripts/build_mlx_swift_metallib.sh'
+      - '.github/workflows/ci-mlx.yml'
+  workflow_dispatch:
+
+jobs:
+  swift-mlx:
+    # Runs only when a runner with all three labels is online.
+    # If none is registered the job queues silently; it is NOT a required check.
+    runs-on: [self-hosted, macOS, ARM64]
+
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Cache SwiftPM checkouts + MLX metallib
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            swift/.build/repositories
+            swift/.build/checkouts
+            .build-motif
+          key: ${{ runner.os }}-${{ runner.arch }}-swiftpm-mlx-${{ hashFiles('swift/Package.swift', 'swift/Package.resolved', 'scripts/build_mlx_swift_metallib.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-swiftpm-mlx-
+
+      - name: Select Swift 6.2+ toolchain (Xcode 26)
+        run: |
+          set -euo pipefail
+          for xcode in /Applications/Xcode_26*.app /Applications/Xcode.app; do
+            if [ ! -d "$xcode" ]; then
+              continue
+            fi
+            swift_bin="$xcode/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift"
+            if [ ! -x "$swift_bin" ]; then
+              continue
+            fi
+            version="$("$swift_bin" --version | head -n 1)"
+            echo "$xcode: $version"
+            # Accept Swift 6.2 or later (needed for #if compiler(>=6.2) branch)
+            if "$swift_bin" --version | grep -qE 'version 6\.[2-9]|version [7-9]\.'; then
+              sudo xcode-select -s "$xcode/Contents/Developer"
+              swift --version
+              exit 0
+            fi
+          done
+          echo "Swift 6.2+ toolchain not found; register an Xcode 26 runner (see docs/ci.md)" >&2
+          exit 1
+
+      - name: Build MLX overlay
+        # Resolves mlx-swift / mlx-swift-lm / swift-transformers dependencies
+        # and compiles MotifKit + MotifKitMLX + all MLX-gated targets.
+        env:
+          MOTIFKIT_ENABLE_MLX: "1"
+        run: |
+          swift build --package-path swift
+
+      - name: Build MotifDecodeBench
+        env:
+          MOTIFKIT_ENABLE_MLX: "1"
+        run: |
+          swift build --package-path swift --product MotifDecodeBench
+
+      - name: Build MLX Metal library
+        # mlx-swift's C++ runtime loader looks for mlx.metallib next to the
+        # running binary / .xctest bundle. build_mlx_swift_metallib.sh compiles
+        # all .metal sources from the checked-out mlx-swift source tree (which
+        # was materialised by the `swift build` step above) and copies the
+        # resulting mlx.metallib into swift/.build/arm64-apple-macosx/debug/ and
+        # every *.xctest bundle under that directory.
+        #
+        # This MUST run before `swift test` with MOTIFKIT_RUN_MLX_RUNTIME_TESTS=1,
+        # otherwise MotifMetalKernelsTests will fail with a missing-metallib error.
+        run: |
+          scripts/build_mlx_swift_metallib.sh
+
+      - name: Run MLX tests (including runtime GPU tests)
+        # MOTIFKIT_RUN_MLX_RUNTIME_TESTS=1 opts in to MotifMetalKernelsTests which
+        # dispatch real Metal compute passes. They are skipped on hosts without a
+        # GPU or without mlx.metallib, so the guard above is essential.
+        env:
+          MOTIFKIT_ENABLE_MLX: "1"
+          MOTIFKIT_RUN_MLX_RUNTIME_TESTS: "1"
+        run: |
+          swift test --package-path swift
+
+      - name: Upload Swift build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: swift-mlx-build-logs
+          path: |
+            swift/.build/**/*.log
+            .build-motif/**/*.log
+          if-no-files-found: ignore

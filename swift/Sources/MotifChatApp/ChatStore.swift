@@ -222,6 +222,38 @@ final class ChatStore: ObservableObject {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isGenerating else { return }
 
+        capturedReasoning = ""
+        prompt = ""
+        messages.append(.user(trimmed))
+        startGeneration()
+    }
+
+    /// Drops the trailing assistant reply (if any) and re-runs the latest user
+    /// turn through the same streaming path as `send()`. No-op while generating
+    /// or when there is no user message to replay.
+    func regenerateLast() {
+        guard !isGenerating else { return }
+        // Remove a trailing assistant message so the latest turn is the user's.
+        if let last = messages.last, last.role == .assistant {
+            messages.removeLast()
+        }
+        guard messages.last?.role == .user else { return }
+        capturedReasoning = ""
+        startGeneration()
+    }
+
+    /// Removes a single message by id. Disabled mid-stream so a delete can't race
+    /// the streaming placeholder it is appending into.
+    func deleteMessage(_ id: UUID) {
+        guard !isGenerating else { return }
+        messages.removeAll { $0.id == id }
+    }
+
+    /// Shared streaming machinery for `send()`/`regenerateLast()`. Assumes the
+    /// latest user turn is already the last message; builds the budgeted request
+    /// transcript, appends a streaming assistant placeholder, and drives the
+    /// backend stream into it.
+    private func startGeneration() {
         let backend: any MotifChatBackend
         do {
             backend = try makeBackend()
@@ -233,9 +265,6 @@ final class ChatStore: ObservableObject {
 
         lastError = nil
         runtimeStatus = backendMode == .nativeMLX ? "Loading native checkpoint…" : "Connecting to endpoint…"
-        capturedReasoning = ""
-        prompt = ""
-        messages.append(.user(trimmed))
         // Build the request transcript before adding the streaming placeholder,
         // applying the context-budget guard so long chats don't overflow.
         let requestMessages = messagesWithinBudget()

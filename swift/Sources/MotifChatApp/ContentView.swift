@@ -15,6 +15,10 @@ struct ContentView: View {
                         Label("New Chat", systemImage: "square.and.pencil")
                     }
                 }
+                // Make the toolbar chrome read as a distinct glass/material
+                // surface over the translucent window (on macOS 26 the toolbar
+                // adopts Liquid Glass; older OSes get a bar material).
+                .toolbarBackground(.visible, for: .windowToolbar)
         } detail: {
             switch selectedPanel {
             case .runtime:
@@ -100,6 +104,13 @@ private struct SidebarView: View {
                 }
             }
         }
+        // Let the glass chrome behind the list show through (the List's own
+        // opaque background would otherwise hide it).
+        .scrollContentBackground(.hidden)
+        // Sidebar is structural chrome, not message content, so glass is allowed
+        // here (Apple's rule). Grouped so it blends with the toolbar glass above.
+        .background(EmptyView().motifGlassChrome().ignoresSafeArea())
+        .motifGlassGroup()
     }
 
     private var sortedConversations: [MotifConversation] {
@@ -144,10 +155,12 @@ private struct ChatView: View {
                         LazyVStack(alignment: .leading, spacing: 16) {
                             ForEach(visibleMessages) { message in
                                 MessageBubble(
+                                    store: store,
                                     message: message,
                                     isStreaming: store.isGenerating
                                         && message.id == visibleMessages.last?.id
-                                        && message.role == .assistant
+                                        && message.role == .assistant,
+                                    isLast: message.id == visibleMessages.last?.id
                                 )
                                 .id(message.id)
                             }
@@ -228,10 +241,26 @@ private struct InputBar: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
+            if store.isGenerating {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Generating…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityIdentifier("motif.chat.generating")
+            }
             if let notice = store.contextNotice {
-                Label(notice, systemImage: "scissors")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Label(notice, systemImage: "scissors")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("Budget \(store.contextTokenBudget) tok")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
             }
             if let lastError = store.lastError {
                 Text(lastError)
@@ -281,13 +310,16 @@ private struct InputBar: View {
 // MARK: - Message bubble (Part 1)
 
 private struct MessageBubble: View {
+    @ObservedObject var store: ChatStore
     let message: MotifChatMessage
     let isStreaming: Bool
+    let isLast: Bool
 
     @State private var isHovering = false
     @State private var didCopy = false
 
     private var isUser: Bool { message.role == .user }
+    private var isAssistant: Bool { message.role == .assistant }
 
     var body: some View {
         HStack(alignment: .top) {
@@ -323,6 +355,16 @@ private struct MessageBubble: View {
                         MarkdownMessageView(content: message.content)
                     }
                 }
+
+                // Per-message actions on assistant turns. Revealed on hover (kept
+                // mounted but hidden so layout doesn't jump) and never while the
+                // message is mid-stream. Materials/plain controls only — no glass
+                // on message content.
+                if isAssistant && !isStreaming {
+                    actionsRow
+                        .opacity(isHovering ? 1 : 0)
+                        .allowsHitTesting(isHovering)
+                }
             }
             .padding(12)
             .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
@@ -332,6 +374,45 @@ private struct MessageBubble: View {
         }
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
         .onHover { isHovering = $0 }
+    }
+
+    private var actionsRow: some View {
+        HStack(spacing: 12) {
+            Button {
+                copyToPasteboard(message.content)
+                didCopy = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { didCopy = false }
+            } label: {
+                Label(didCopy ? "Copied" : "Copy", systemImage: didCopy ? "checkmark" : "doc.on.doc")
+                    .font(.caption2)
+            }
+            .help("Copy message")
+
+            // Regenerate only applies to the latest assistant turn — re-running an
+            // older turn would discard everything after it.
+            if isLast {
+                Button {
+                    store.regenerateLast()
+                } label: {
+                    Label("Regenerate", systemImage: "arrow.clockwise")
+                        .font(.caption2)
+                }
+                .help("Re-run the last prompt")
+            }
+
+            Button(role: .destructive) {
+                store.deleteMessage(message.id)
+            } label: {
+                Label("Delete", systemImage: "trash")
+                    .font(.caption2)
+            }
+            .help("Delete this message")
+        }
+        .buttonStyle(.borderless)
+        .labelStyle(.titleAndIcon)
+        .foregroundStyle(.secondary)
+        // Actions are disabled mid-generation to match ChatStore's guards.
+        .disabled(store.isGenerating)
     }
 
     private var bubbleBackground: AnyShapeStyle {

@@ -101,3 +101,56 @@ The workflow uploads:
 Do not update parity documentation from a dry-run report. Use a real report with `config.dry_run == false` and compare Swift `q4_direct` cells against Python cells for the same model and prompt length.
 
 The `swift_vs_python` speedup column is not a steady-state throughput ratio: the Python cell discards its first decode step (steady-state decode tok/s) while the Swift cell's tok/s includes the compile-heavy first generated token. At low `--max-tokens` this dominates and makes Swift look artificially slow. Only draw throughput conclusions from a report run with a high `--max-tokens` and `--warmup-runs 1`, and treat the ratio as approximate even then.
+
+## End-to-end smoke eval (`eval_smoke.py`)
+
+`scripts/eval_smoke.py` is a one-command harness that loads a converted MLX
+checkpoint, runs a short generation pass, computes perplexity on a fixed text
+corpus, and writes a grounded JSON report. It is the fastest way to sanity-check
+a freshly converted checkpoint locally.
+
+**Important:** every report produced by this script is explicitly labelled as a
+*local smoke* (n=1, one machine, one thermal state). The numbers are **not**
+certified performance claims and must not be cited as representative throughput
+without a full certified sweep (see above).
+
+### Quickstart
+
+```bash
+# Uses $MOTIF_MODEL_DIR or ~/.models/motif-2.6b-mlx-q4 by default.
+uv run python scripts/eval_smoke.py
+
+# Explicit model path + explicit output location.
+uv run python scripts/eval_smoke.py \
+  --model ~/.models/motif-2.6b-mlx-q4 \
+  --output docs/benchmarks/eval-smoke-$(date +%Y%m%dT%H%M%SZ).json
+
+# Force non-zero exit when the model directory is absent (useful for local gates).
+uv run python scripts/eval_smoke.py --require-model
+```
+
+### CI behaviour
+
+When the model directory is absent and `--require-model` is **not** set the
+script prints a notice and exits 0, so it can be wired into CI as a no-op on
+machines without downloaded weights.
+
+### Report schema (`eval-smoke-v1`)
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `schema` | string | Always `"eval-smoke-v1"` |
+| `disclaimer` | string | Honesty label — present on every report |
+| `model` | string | Resolved absolute path of checkpoint |
+| `timestamp` | string | ISO-8601 UTC |
+| `host` | object | `hostname`, `chip`, `os`, `machine`, `memory_bytes`, `python` |
+| `generations` | array | Per-prompt: `prompt`, `output`, `tokens`, `elapsed_s`, `tok_per_sec` |
+| `tok_per_sec_summary` | object | `mean`, `min`, `max` across generation runs |
+| `perplexity` | number | On the bundled ~2 k-token encyclopedic corpus |
+| `peak_memory_gb` | number | MLX peak memory at end of generation pass |
+
+### Unit tests
+
+Pure-logic helpers (`aggregate_tok_per_sec`, `assemble_report`) are covered by
+`tests/test_eval_smoke.py`. These tests require no model or MLX installation and
+run as part of the normal `pytest` suite.

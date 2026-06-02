@@ -54,6 +54,25 @@ extension View {
     #endif
   }
 
+  /// Glass background for structural chrome that spans an edge — the sidebar
+  /// and toolbar. Unlike `motifGlassSurface` (a floating inset bar using the
+  /// high-transparency `.clear` glass), this uses the `.regular` glass so the
+  /// large surface stays legible behind list/toolbar content. Falls back to a
+  /// `.bar` material on toolchains/OSes without Liquid Glass. Edge-to-edge, so
+  /// no corner radius — it reads as a panel, not a floating pill.
+  @ViewBuilder
+  func motifGlassChrome() -> some View {
+    #if compiler(>=6.2)
+    if #available(macOS 26.0, *) {
+      self.glassEffect(.regular, in: .rect(cornerRadius: 0))
+    } else {
+      self.background(.bar)
+    }
+    #else
+    self.background(.bar)
+    #endif
+  }
+
   /// Wraps grouped glass chrome in a `GlassEffectContainer` so nearby glass
   /// elements blend/refract consistently (Apple requires glass to share a
   /// container to sample correctly). No-op fallback otherwise.

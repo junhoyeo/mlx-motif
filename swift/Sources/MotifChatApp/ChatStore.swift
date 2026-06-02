@@ -89,6 +89,12 @@ final class ChatStore: ObservableObject {
 
     private var generationTask: Task<Void, Never>?
     private var nativeDirectoryAccess: NativeDirectoryAccessGrant?
+    /// Backend reused across turns so the native runtime (and its KV-cache) is
+    /// not rebuilt every message — that reuse is what lets the runtime skip
+    /// re-prefilling the shared conversation prefix. Keyed on the backend config
+    /// signature; rebuilt when the config changes or after a backend error.
+    private var cachedBackend: (any MotifChatBackend)?
+    private var cachedBackendSignature: String?
     /// Suppresses conversation auto-save while we are loading messages into the
     /// view (selecting/restoring), so a load doesn't bump `updatedAt` or reorder.
     private var isLoadingConversation = false
@@ -311,6 +317,9 @@ final class ChatStore: ObservableObject {
                     self.runtimeStatus = "Error"
                     self.lastError = error.localizedDescription
                     self.append("\n\n[Error: \(error.localizedDescription)]", toAssistantMessage: assistantID)
+                    // Drop the (possibly half-loaded) backend so the next turn
+                    // rebuilds cleanly and the KV-cache starts fresh.
+                    self.invalidateBackend()
                 }
             }
 
@@ -383,7 +392,39 @@ final class ChatStore: ObservableObject {
         messages[index].content += text
     }
 
+    /// Config signature: when this is unchanged across turns we can safely reuse
+    /// the same backend instance (and its loaded runtime + KV-cache).
+    private var backendSignature: String {
+        switch backendMode {
+        case .openAICompatible:
+            return "openai:\(endpoint):\(model)"
+        case .nativeMLX:
+            return "native:\(nativeModelDirectory)"
+        }
+    }
+
+    /// Discards the cached backend so the next turn rebuilds it (and resets the
+    /// native KV-cache). Call when the backend config changes or after an error.
+    private func invalidateBackend() {
+        cachedBackend = nil
+        cachedBackendSignature = nil
+    }
+
     private func makeBackend() throws -> any MotifChatBackend {
+        // Reuse the backend across turns while its config is unchanged, so the
+        // native runtime's KV-cache survives between messages.
+        if let cachedBackend, cachedBackendSignature == backendSignature {
+            return cachedBackend
+        }
+        invalidateBackend()
+
+        let backend = try buildBackend()
+        cachedBackend = backend
+        cachedBackendSignature = backendSignature
+        return backend
+    }
+
+    private func buildBackend() throws -> any MotifChatBackend {
         switch backendMode {
         case .openAICompatible:
             guard let baseURL = URL(string: endpoint) else {

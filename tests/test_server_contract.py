@@ -370,5 +370,143 @@ def test_streaming_captured_reasoning_on_final_chunk(monkeypatch):
     assert visible == "answer"
 
 
+# --------------------------------------------------------------------------- #
+# Prompt-based tool calling (mlx_motif.tool_calls): when `tools` are supplied   #
+# and the (stubbed) model emits a tool-call JSON object, the non-streaming      #
+# response shapes it as OpenAI `tool_calls` with finish_reason "tool_calls".    #
+# --------------------------------------------------------------------------- #
+_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather for a city",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+
+def _stub_tool_call_output(model, tokenizer, prompt, **kwargs):
+    # The small model loops; emit the tool-call JSON twice to prove the parser
+    # extracts only the first.
+    one = '{"tool_call": {"name": "get_weather", "arguments": {"city": "Tokyo"}}}'
+    yield _StubResult(text=one, prompt_tokens=11, generation_tokens=1, finish_reason=None)
+    yield _StubResult(text="\n" + one, prompt_tokens=11, generation_tokens=2, finish_reason="stop")
+
+
+def test_non_streaming_tool_call_shape(monkeypatch):
+    with _running_server(monkeypatch, stream_generate=_stub_tool_call_output) as (host, port):
+        status, headers, data = _request(
+            host,
+            port,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "messages": [{"role": "user", "content": "weather in Tokyo?"}],
+                "stream": False,
+                "tools": _TOOLS,
+            },
+        )
+    assert status == 200
+    assert headers.get("Content-Type") == "application/json"
+    payload = json.loads(data)
+    assert payload["object"] == "chat.completion"
+    choice = payload["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    message = choice["message"]
+    assert message["role"] == "assistant"
+    assert message["content"] is None
+    tool_calls = message["tool_calls"]
+    assert len(tool_calls) == 1
+    call = tool_calls[0]
+    assert call["type"] == "function"
+    assert isinstance(call["id"], str) and call["id"]
+    assert call["function"]["name"] == "get_weather"
+    # `arguments` is a STRINGIFIED JSON object, matching OpenAI's wire shape.
+    assert json.loads(call["function"]["arguments"]) == {"city": "Tokyo"}
+    # usage still forwards real terminal counts.
+    assert payload["usage"]["total_tokens"] == 11 + 2
+
+
+def test_non_streaming_without_tools_is_unchanged(monkeypatch):
+    # Same stubbed tool-call output, but no `tools` in the request: the server
+    # must NOT parse it and must return it verbatim as content (no regression).
+    with _running_server(monkeypatch, stream_generate=_stub_tool_call_output) as (host, port):
+        status, _headers, data = _request(
+            host,
+            port,
+            "POST",
+            "/v1/chat/completions",
+            body={"messages": [{"role": "user", "content": "hi"}], "stream": False},
+        )
+    assert status == 200
+    payload = json.loads(data)
+    choice = payload["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert "tool_calls" not in choice["message"]
+    assert choice["message"]["content"].startswith('{"tool_call": {"name": "get_weather"')
+
+
+def test_streaming_tool_call_shape(monkeypatch):
+    with _running_server(monkeypatch, stream_generate=_stub_tool_call_output) as (host, port):
+        status, headers, data = _request(
+            host,
+            port,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "messages": [{"role": "user", "content": "weather in Tokyo?"}],
+                "stream": True,
+                "tools": _TOOLS,
+            },
+        )
+    assert status == 200
+    assert headers.get("Content-Type") == "text/event-stream"
+    text = data.decode("utf-8")
+    assert text.endswith("data: [DONE]\n\n")
+    events = [
+        json.loads(seg.strip()[len("data: ") :])
+        for seg in text.split("\n\n")
+        if seg.strip().startswith("data: ") and seg.strip()[len("data: ") :] != "[DONE]"
+    ]
+    # Exactly one chunk carries tool_calls in its delta.
+    tool_chunks = [
+        ev for ev in events if ev["choices"] and "tool_calls" in ev["choices"][0]["delta"]
+    ]
+    assert len(tool_chunks) == 1
+    call = tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]
+    assert call["type"] == "function"
+    assert call["function"]["name"] == "get_weather"
+    assert json.loads(call["function"]["arguments"]) == {"city": "Tokyo"}
+    # The terminal chunk reports finish_reason "tool_calls".
+    assert events[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_tool_choice_none_disables_tools(monkeypatch):
+    # tool_choice "none" suppresses tool parsing: output returns as content.
+    with _running_server(monkeypatch, stream_generate=_stub_tool_call_output) as (host, port):
+        status, _headers, data = _request(
+            host,
+            port,
+            "POST",
+            "/v1/chat/completions",
+            body={
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+                "tools": _TOOLS,
+                "tool_choice": "none",
+            },
+        )
+    assert status == 200
+    choice = json.loads(data)["choices"][0]
+    assert choice["finish_reason"] == "stop"
+    assert "tool_calls" not in choice["message"]
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

@@ -139,6 +139,44 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
     public let generationContext: ModelContext
     public let inputProcessor: MotifMLXChatInputProcessor
 
+    /// Persistent KV-cache carried across turns of a single conversation.
+    ///
+    /// `streamResponse` re-prefilled the entire conversation on every turn,
+    /// which is O(n²) as the chat grows. When the new prompt is an exact
+    /// token-prefix extension of what this cache already holds, we feed only
+    /// the new suffix and reuse the cached prefix instead of re-prefilling it.
+    /// `nil` means "no reusable cache" — the next turn starts fresh.
+    ///
+    /// Reuse is mathematically lossless: it feeds the exact KV the model already
+    /// computed. On the quantized (q4) checkpoint the resulting greedy output is
+    /// a valid decode but is not guaranteed byte-identical to the legacy
+    /// "re-prefill everything" path, because a single-token decode forward
+    /// (`[1, 1]`) and a batched prefill forward (`[1, n]`) over the same tokens
+    /// round slightly differently in the quantized matmul kernels. Reuse carries
+    /// the KV built incrementally during generation; the legacy path rebuilds
+    /// that region with a batched prefill, so the two can diverge by a few
+    /// tokens. This is a model/kernel property, not a reuse bug — see the
+    /// `MotifMLXNativeRuntimeCacheReuseTests` correctness gate.
+    private var reuseCache: [KVCache]?
+
+    /// Token IDs whose attention state is currently captured in `reuseCache`
+    /// (prompt + generated tokens of the previous turn). Used to compute the
+    /// longest common prefix against the next turn's prompt.
+    private var cachedTokenIDs: [Int]?
+
+    /// Test/diagnostic escape hatch: when true the runtime always resets the
+    /// cache (behaving exactly like the original, cache-less implementation).
+    /// Used by the correctness gate to produce the no-reuse baseline.
+    private var reuseDisabled = false
+
+    /// Token IDs generated during the most recent `streamResponse` turn.
+    /// Exposed for the cross-turn correctness gate (reuse-vs-no-reuse parity).
+    public private(set) var lastGeneratedTokenIDs: [Int] = []
+
+    /// Whether the most recent `streamResponse` turn reused the carried cache
+    /// (true) or prefilled the full prompt (false). Diagnostic only.
+    public private(set) var lastTurnReusedCache = false
+
     public static func load(
         modelDirectory: URL,
         featureFlags: MotifRuntimeFeatureFlags = .fromEnvironment()
@@ -223,6 +261,33 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
         self.inputProcessor = inputProcessor
     }
 
+    /// Drop the carried KV-cache so the next `streamResponse` prefills the full
+    /// prompt from scratch. Call when a new conversation begins or whenever
+    /// cross-turn reuse must not apply.
+    public func resetCache() {
+        reuseCache = nil
+        cachedTokenIDs = nil
+    }
+
+    /// Force the always-reset path (no cross-turn reuse). Intended for the
+    /// correctness gate to compare reuse output against a cache-less baseline.
+    public func setReuseEnabled(_ enabled: Bool) {
+        reuseDisabled = !enabled
+        if reuseDisabled {
+            resetCache()
+        }
+    }
+
+    /// Length of the longest common prefix of two token-ID sequences.
+    private static func commonPrefixLength(_ lhs: [Int], _ rhs: [Int]) -> Int {
+        var length = 0
+        let limit = min(lhs.count, rhs.count)
+        while length < limit, lhs[length] == rhs[length] {
+            length += 1
+        }
+        return length
+    }
+
     public func streamResponse(
         messages: [MotifChatMessage],
         parameters: MotifGenerationParameters
@@ -240,17 +305,63 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                         maxTokens: parameters.maxTokens,
                         temperature: Float(parameters.temperature)
                     )
-                    let stream = try generate(
-                        input: lmInput,
+
+                    // Full prompt token IDs for this turn (used for prefix
+                    // matching and to report the authoritative prompt-token
+                    // count regardless of how many tokens we actually prefill).
+                    let promptTokens = lmInput.text.tokens.asArray(Int.self)
+
+                    // Decide whether the carried cache can be reused. Reuse is
+                    // only valid when the cache holds a clean prefix of the new
+                    // prompt — i.e. the previous turn's tokens are a strict
+                    // prefix of this turn's tokens. Any divergence (user edited /
+                    // deleted / regenerated) forces a full fresh prefill, which
+                    // is byte-for-byte the original cache-less behavior.
+                    let cache: [KVCache]
+                    let prefillInput: LMInput
+                    var reusedCache = false
+                    if !reuseDisabled,
+                        let existingCache = reuseCache,
+                        let existingTokens = cachedTokenIDs {
+                        let prefix = Self.commonPrefixLength(existingTokens, promptTokens)
+                        if prefix == existingTokens.count, prefix > 0, prefix < promptTokens.count {
+                            // Cache holds an exact prefix; prefill only the new
+                            // suffix. The KVCache appends at its current offset,
+                            // reusing the exact KV already computed for the
+                            // prefix. (On q4 this is a valid greedy decode but
+                            // may differ by a few tokens from a full re-prefill;
+                            // see reuseCache doc and the correctness gate.)
+                            cache = existingCache
+                            prefillInput = LMInput(tokens: MLXArray(Array(promptTokens[prefix...])))
+                            reusedCache = true
+                        } else {
+                            cache = generationContext.model.newCache(parameters: generationParameters)
+                            prefillInput = lmInput
+                        }
+                    } else {
+                        cache = generationContext.model.newCache(parameters: generationParameters)
+                        prefillInput = lmInput
+                    }
+                    lastTurnReusedCache = reusedCache
+
+                    var generatedTokenIDs: [Int] = []
+                    var detokenizer = NaiveStreamingDetokenizer(tokenizer: generationContext.tokenizer)
+                    let stream = try generateTokens(
+                        input: prefillInput,
+                        cache: cache,
                         parameters: generationParameters,
                         context: generationContext
                     )
                     for await generation in stream {
                         switch generation {
-                        case .chunk(let text):
-                            let visible = thinkFilter.feed(text)
-                            if !visible.isEmpty {
-                                continuation.yield(.text(visible))
+                        case .token(let token):
+                            generatedTokenIDs.append(token)
+                            detokenizer.append(token: token)
+                            if let chunk = detokenizer.next() {
+                                let visible = thinkFilter.feed(chunk)
+                                if !visible.isEmpty {
+                                    continuation.yield(.text(visible))
+                                }
                             }
                         case .info(let completion):
                             let tail = thinkFilter.finish()
@@ -260,20 +371,34 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                             if parameters.thinkMode == .captured, !thinkFilter.capturedReasoning.isEmpty {
                                 continuation.yield(.reasoning(thinkFilter.capturedReasoning))
                             }
-                            // Surface the real token counts from MLX's terminal
-                            // completion info so HTTP servers (MotifNativeServe)
-                            // can populate `usage` instead of reporting zeros.
+                            // Carry the cache forward for the next turn. The
+                            // cache now holds the full prompt plus everything we
+                            // generated this turn.
+                            lastGeneratedTokenIDs = generatedTokenIDs
+                            if reuseDisabled {
+                                resetCache()
+                            } else {
+                                reuseCache = cache
+                                cachedTokenIDs = promptTokens + generatedTokenIDs
+                            }
+                            // Report the authoritative prompt-token count (the
+                            // FULL prompt, not just the suffix we prefilled) so
+                            // the usage contract is identical whether or not the
+                            // cache was reused.
                             let usage = MotifGenerationUsage(
-                                promptTokens: completion.promptTokenCount,
+                                promptTokens: promptTokens.count,
                                 completionTokens: completion.generationTokenCount
                             )
                             continuation.yield(.completed(usage: usage))
-                        case .toolCall:
-                            break
                         }
                     }
                     continuation.finish()
                 } catch {
+                    // Generation aborted before producing terminal info; the
+                    // in-place cache may be partially advanced and no longer
+                    // matches `cachedTokenIDs`, so drop it to force a clean
+                    // prefill next turn.
+                    resetCache()
                     continuation.finish(throwing: error)
                 }
             }

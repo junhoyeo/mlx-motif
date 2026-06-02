@@ -97,6 +97,31 @@ def _load_hf_weights(hf_dir: Path, target_dtype: mx.Dtype) -> dict[str, mx.array
     return weights
 
 
+def _apply_quantization_config(
+    cfg: dict,
+    q_group_size: int,
+    q_bits: int,
+    quant_meta: dict,
+) -> dict:
+    """Write quantization metadata into a Motif config dict.
+
+    The ``quantization`` block holds ONLY scalar ``group_size``/``bits`` — the
+    fields mlx-lm reads. mlx-swift-lm's ``BaseConfiguration`` decodes every
+    *other* key under ``quantization`` as a per-layer override dict, so a scalar
+    such as ``preset: "uniform"`` (or ``q_bits``/``mlp_bits`` from the mixed /
+    mlp_lowbit presets) makes the Swift loader fail with a ``typeMismatch``.
+    Preset metadata therefore lives in ``quantization_config`` instead, which our
+    own loader reads and mlx-swift-lm ignores.
+    """
+    cfg["quantization"] = {"group_size": q_group_size, "bits": q_bits}
+    cfg["quantization_config"] = {
+        "group_size": q_group_size,
+        "bits": q_bits,
+        **quant_meta,
+    }
+    return cfg
+
+
 def convert(
     hf_path: str,
     out_path: str,
@@ -137,12 +162,7 @@ def convert(
     cfg = json.loads((src / "config.json").read_text())
     cfg["model_type"] = "motif"
     if quantize:
-        # mlx-lm reads the legacy `group_size` / `bits` fields from `quantization`.
-        cfg["quantization"] = {
-            "group_size": q_group_size,
-            "bits": q_bits,
-            **quant_meta,
-        }
+        _apply_quantization_config(cfg, q_group_size, q_bits, quant_meta)
     save_config(cfg, out / "config.json")
 
     for fname in _TOKENIZER_FILES:

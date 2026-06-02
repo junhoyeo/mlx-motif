@@ -40,6 +40,8 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+from mlx_motif.tool_calls import build_tools_preamble, parse_tool_call
+
 _THINK_OPEN = "<think>"
 _THINK_CLOSE = "</think>"
 
@@ -200,9 +202,23 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
             think_mode = body.get("think_mode") or default_think_mode
             stream_options = body.get("stream_options") or {}
             include_usage = bool(stream_options.get("include_usage", False))
+            # OpenAI-style prompt-based tool calling (see mlx_motif.tool_calls):
+            # `tools` is injected as a system preamble; `tool_choice` is accepted
+            # for schema compatibility but only used to suppress tools when set
+            # to "none" (auto/required behave like the default prompt).
+            tools = body.get("tools") or []
+            tool_choice = body.get("tool_choice", "auto")
+            if not isinstance(tools, list):
+                tools = []
+            if tool_choice == "none":
+                tools = []
 
             if not messages:
                 return self._send_json(400, {"error": {"message": "messages required"}})
+
+            if tools:
+                preamble = build_tools_preamble(tools)
+                messages = [{"role": "system", "content": preamble}, *messages]
 
             prompt = _make_messages_text(messages, tokenizer)
             filt = ThinkFilter(
@@ -223,28 +239,88 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
                 self._send_sse()
                 try:
                     last = None
+                    # Prompt-based tool calling needs the full output to extract
+                    # the first JSON tool-call (the small model loops), so when
+                    # tools are declared we buffer instead of streaming content
+                    # deltas, then emit a single tool_calls chunk at the end.
+                    buffered = "" if tools else None
+                    tool_call = None
                     for r in stream_generate(model, tokenizer, prompt, **kwargs):
                         last = r
                         out = filt.feed(r.text)
-                        if out:
-                            chunk = {
-                                "id": req_id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model_id,
-                                "choices": [
-                                    {"index": 0, "delta": {"content": out}, "finish_reason": None}
-                                ],
-                            }
-                            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-                            self.wfile.flush()
+                        if not out:
+                            continue
+                        if buffered is not None:
+                            buffered += out
+                            continue
+                        chunk = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [
+                                {"index": 0, "delta": {"content": out}, "finish_reason": None}
+                            ],
+                        }
+                        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                        self.wfile.flush()
+                    tool_call = parse_tool_call(buffered, tools) if buffered else None
+                    if tool_call is not None:
+                        tool_chunk = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "delta": {
+                                        "tool_calls": [
+                                            {
+                                                "index": 0,
+                                                "id": f"call_{uuid.uuid4().hex[:24]}",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": tool_call["name"],
+                                                    "arguments": json.dumps(tool_call["arguments"]),
+                                                },
+                                            }
+                                        ]
+                                    },
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                        self.wfile.write(f"data: {json.dumps(tool_chunk)}\n\n".encode())
+                        self.wfile.flush()
+                    elif buffered:
+                        # tools declared but no tool call -> flush buffered text.
+                        chunk = {
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_id,
+                            "choices": [
+                                {"index": 0, "delta": {"content": buffered}, "finish_reason": None}
+                            ],
+                        }
+                        self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                        self.wfile.flush()
                     # final chunk with optional captured reasoning
                     final = {
                         "id": req_id,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": model_id,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {},
+                                "finish_reason": (
+                                    "tool_calls" if tool_call is not None else "stop"
+                                ),
+                            }
+                        ],
                     }
                     if think_mode == "captured" and filt.captured:
                         final["reasoning"] = filt.captured
@@ -282,6 +358,30 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
                 for r in stream_generate(model, tokenizer, prompt, **kwargs):
                     full += filt.feed(r.text)
                     last = r
+                # Prompt-based tool calling: when tools were declared, try to
+                # extract the first JSON tool-call from the (possibly looping)
+                # output and shape it as OpenAI `tool_calls`. Falls back to a
+                # normal content response when no tool call is found.
+                tool_call = parse_tool_call(full, tools) if tools else None
+                if tool_call is not None:
+                    message = {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": f"call_{uuid.uuid4().hex[:24]}",
+                                "type": "function",
+                                "function": {
+                                    "name": tool_call["name"],
+                                    "arguments": json.dumps(tool_call["arguments"]),
+                                },
+                            }
+                        ],
+                    }
+                    finish_reason = "tool_calls"
+                else:
+                    message = {"role": "assistant", "content": full}
+                    finish_reason = last.finish_reason if last else "stop"
                 payload = {
                     "id": req_id,
                     "object": "chat.completion",
@@ -290,8 +390,8 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
                     "choices": [
                         {
                             "index": 0,
-                            "message": {"role": "assistant", "content": full},
-                            "finish_reason": (last.finish_reason if last else "stop"),
+                            "message": message,
+                            "finish_reason": finish_reason,
                         }
                     ],
                     "usage": {

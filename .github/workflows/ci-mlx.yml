@@ -93,10 +93,13 @@ jobs:
       - name: Build MLX overlay
         # Resolves mlx-swift / mlx-swift-lm / swift-transformers dependencies
         # and compiles MotifKit + MotifKitMLX + all MLX-gated targets.
+        # --build-tests also produces the .xctest bundle NOW, so the metallib
+        # step below has a bundle to install into; the test step then uses
+        # --skip-build so the bundle (with the metallib inside) is not rebuilt.
         env:
           MOTIFKIT_ENABLE_MLX: "1"
         run: |
-          swift build --package-path swift
+          swift build --package-path swift --build-tests
 
       - name: Build MotifDecodeBench
         env:
@@ -125,7 +128,7 @@ jobs:
           MOTIFKIT_ENABLE_MLX: "1"
           MOTIFKIT_RUN_MLX_RUNTIME_TESTS: "1"
         run: |
-          swift test --package-path swift
+          swift test --package-path swift --skip-build
 
       - name: Upload Swift build logs on failure
         if: failure()

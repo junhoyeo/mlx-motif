@@ -30,8 +30,15 @@ exact-length dequantized slices.
 from __future__ import annotations
 
 import mlx.core as mx
-from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.cache import _BaseCache
+
+# NOTE: import the cache-module `create_attention_mask`, whose signature is
+# `(N, offset, return_array, window_size)` — NOT the base-module one
+# `(h, cache=None, window_size=None, return_array=False)`. `make_mask` below is
+# invoked by mlx-lm as `cache.make_mask(N, return_array=..., window_size=...)`
+# and forwards `offset=self.offset`, which only the cache-module function
+# accepts. Importing from `mlx_lm.models.base` here raises TypeError on any
+# invocation (see cache-module `_BaseCache.make_mask`, whose body this mirrors).
+from mlx_lm.models.cache import _BaseCache, create_attention_mask
 
 
 class MotifGroupedKVCacheBase(_BaseCache):
@@ -139,6 +146,25 @@ class MotifGroupedKVCacheBase(_BaseCache):
     def _expand_slot(self, slot, fresh):
         raise NotImplementedError
 
+    @staticmethod
+    def _assert_uniform_heads(k1, k2, v1, v2) -> None:
+        """All four slots share one allocation head count (derived from k1).
+
+        With k_ratio > 1 the model produces k1 with ``k_groups*k_ratio`` heads
+        but k2/v1/v2 with ``k_groups`` heads; storing them in equally-shaped
+        slots would fail (or silently corrupt) at write time. Guard loudly here
+        so the unsupported combination is unmistakable even if a caller
+        constructs the cache directly (bypassing ``Model.make_cache``).
+        """
+        h1 = k1.shape[1]
+        if not (k2.shape[1] == v1.shape[1] == v2.shape[1] == h1):
+            raise ValueError(
+                "4-slot grouped KV cache requires k1/k2/v1/v2 to share a head "
+                f"count; got k1={h1}, k2={k2.shape[1]}, v1={v1.shape[1]}, "
+                f"v2={v2.shape[1]}. This happens with k_ratio > 1, which the "
+                "4-slot cache does not support."
+            )
+
 
 class MotifGroupedKVCache(MotifGroupedKVCacheBase):
     """4-slot unquantized KV cache for grouped DiffAttn (k1, k2, v1, v2).
@@ -188,6 +214,7 @@ class MotifGroupedKVCache(MotifGroupedKVCacheBase):
         `ensure_row_contiguous` does not copy the whole live KV region on
         every decode step.
         """
+        self._assert_uniform_heads(k1, k2, v1, v2)
         B, H, S, D = k1.shape
         prev = self.offset
         self._grow(B, H, S, D, k1.dtype)
@@ -322,6 +349,7 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
         return self.k1, self.k2, self.v1, self.v2
 
     def _update_4(self, k1, k2, v1, v2):
+        self._assert_uniform_heads(k1, k2, v1, v2)
         B, H, S, D = k1.shape
         prev = self.offset
         self._grow(B, H, S, D, k1.dtype)

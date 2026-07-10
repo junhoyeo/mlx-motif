@@ -14,8 +14,13 @@ import XCTest
 ///
 /// ## What "correct" means here (and an honest caveat for the q4 checkpoint)
 ///
-/// Reuse is mathematically lossless: it feeds the exact KV the model already
-/// computed. The strongest *achievable* bit-exact invariant on the real q4
+/// Reuse feeds the exact KV the model already computed, provided the carried
+/// cache offset stays reconciled with the recorded tokens. `generateTokens`
+/// steps the stop token through the model before stopping, so an EOS-terminated
+/// turn leaves the cache one position ahead of `generatedTokenIDs`;
+/// `streamResponse` trims that surplus before carrying the cache forward.
+/// ``testEOSTerminatedTurnReconcilesCacheOffset`` is the regression gate for
+/// that reconciliation. The strongest *achievable* bit-exact invariant on the real q4
 /// model is proven by ``testReuseEqualsBatchedReconstruction``: continuing from
 /// the carried cache yields byte-identical tokens to feeding the same prefix as
 /// a single batched forward into a fresh cache.
@@ -148,6 +153,79 @@ final class MotifMLXNativeRuntimeCacheReuseTests: XCTestCase {
             messages: [.user("A completely unrelated question about the ocean.")],
             maxTokens: 8)
         XCTAssertFalse(r3.reused, "divergent prompt must fall back to a full prefill")
+    }
+
+    /// REGRESSION GATE for the EOS off-by-one: after a turn that terminates on
+    /// the stop token (the normal chat case, *not* the maxTokens cap), the
+    /// carried cache offset must equal the number of tokens we recorded. Before
+    /// the fix the cache was left one position ahead — `generateTokens` steps
+    /// the stop token through the model but never yields it — so the next reused
+    /// turn appended its suffix on top of a stale duplicate stop-token KV and
+    /// shifted every RoPE position by +1.
+    ///
+    /// We also verify turn 2 still reuses the (now reconciled) cache and that its
+    /// output matches a full fresh re-prefill of the same conversation up to the
+    /// documented q4 [1,1]-vs-[1,n] rounding divergence — i.e. the off-by-one is
+    /// gone as a *structural* error, not merely masked by kernel noise.
+    func testEOSTerminatedTurnReconcilesCacheOffset() async throws {
+        try requireRuntime()
+        let dir = try modelDirectory()
+        let runtime = try await MotifMLXNativeRuntime.load(modelDirectory: dir)
+
+        // Generous cap so a short answer terminates via EOS rather than the cap.
+        let capTurn1 = 256
+        let turn1: [MotifChatMessage] = [.user("Reply with exactly one short sentence and stop.")]
+        let r1 = try await runTurn(runtime, messages: turn1, maxTokens: capTurn1)
+
+        // Only this test's scenario (EOS stop) exercises the off-by-one; a turn
+        // that hits the cap is already aligned, so skip if the model rambled.
+        try XCTSkipUnless(
+            r1.tokens.count < capTurn1,
+            "turn 1 hit the maxTokens cap instead of terminating via EOS; "
+                + "cannot exercise the EOS off-by-one on this run.")
+
+        // Core invariant: the reconciliation trimmed the stepped-but-unyielded
+        // stop-token KV, so offset == recorded token count. Without the fix this
+        // would be off by exactly one.
+        XCTAssertNotNil(runtime.reuseCacheOffset, "an EOS-terminated turn must carry a reuse cache")
+        XCTAssertEqual(
+            runtime.reuseCacheOffset, runtime.cachedTokenCount,
+            "after an EOS-terminated turn the cache offset must equal cachedTokenIDs.count "
+                + "(regression: stop-token KV left the cache one position ahead)")
+
+        // Turn 2 must reuse the reconciled cache and produce the same tokens as a
+        // fresh full re-prefill, up to the documented q4 rounding divergence.
+        let reply = runtime.generationContext.tokenizer.decode(tokens: r1.tokens)
+        let turn2: [MotifChatMessage] = turn1 + [
+            .assistant(reply),
+            .user("Now reply with a different one short sentence and stop."),
+        ]
+        let r2 = try await runTurn(runtime, messages: turn2, maxTokens: 48)
+        XCTAssertTrue(r2.reused, "prefix-extension turn after EOS must reuse the reconciled cache")
+        XCTAssertEqual(
+            runtime.reuseCacheOffset, runtime.cachedTokenCount,
+            "cache offset must stay reconciled across a reused EOS-terminated turn")
+
+        // Fresh (no-reuse) baseline of the identical conversation.
+        let freshRuntime = try await MotifMLXNativeRuntime.load(modelDirectory: dir)
+        freshRuntime.setReuseEnabled(false)
+        _ = try await runTurn(freshRuntime, messages: turn1, maxTokens: capTurn1)
+        let r2Fresh = try await runTurn(freshRuntime, messages: turn2, maxTokens: 48)
+
+        // A +1 RoPE shift would diverge from the very first token. Post-fix the
+        // paths share a common prefix and only drift (if at all) from the
+        // documented q4 [1,1]-vs-[1,n] kernel rounding, never a positional shift.
+        let lcp = zip(r2.tokens, r2Fresh.tokens).prefix { $0 == $1 }.count
+        XCTAssertGreaterThan(
+            lcp, 0,
+            "reuse after EOS must share a prefix with a fresh prefill; a divergence at token 0 "
+                + "indicates the +1 RoPE offset shift this test guards against")
+        if r2.tokens == r2Fresh.tokens {
+            print("[cache-reuse EOS gate] reuse == fresh (byte-identical) after EOS-terminated turn 1")
+        } else {
+            print("[cache-reuse EOS gate] reuse vs fresh share \(lcp) tokens then drift "
+                + "(expected on q4: [1,1] decode vs [1,n] prefill rounding, not a positional shift)")
+        }
     }
 
     /// Honest documentation test: reuse vs the legacy full-re-prefill path may

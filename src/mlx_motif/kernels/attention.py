@@ -498,6 +498,18 @@ def sdpa_dual_v_q4(
     assert D % group_size == 0
     assert H_q % H_kv == 0
     assert bits in (4, 8)
+    # Packed-SDPA word contract: each lane loads exactly ONE packed uint32 per
+    # tensor per step (attention.py: `k_pkd = k_data[row_u32]`) and unpacks
+    # qk_per_thread = D/32 channels from it. That is only valid when all of a
+    # lane's channels live in that single word, i.e. qk_per_thread <= EL_PER_INT
+    # (equivalently D/32 <= 32/bits). For e.g. D=256/bits=8 the shifts reach 56
+    # bits (UB on uint32 in Metal) and half the channels are never read, so the
+    # kernel would return silent garbage — fail loudly instead. See the design
+    # note at attention.py:246-249. Ships only with D=128, which satisfies this.
+    assert D // 32 <= 32 // bits, (
+        f"sdpa_dual_v_q4 requires D/32 <= 32/bits (packed word contract "
+        f"qk_per_thread <= EL_PER_INT); got D={D}, bits={bits}"
+    )
     gqa_factor = H_q // H_kv
 
     rows = B * H_q

@@ -662,6 +662,14 @@ public enum MotifSDPADualVQ4 {
               queries.dim(3) % 32 == 0,
               queries.dim(3) % groupSize == 0,
               bits == 4 || bits == 8,
+              // Packed word contract: each lane loads exactly one packed uint32
+              // per tensor per step and unpacks qk_per_thread = D/32 channels
+              // from it, valid only when qk_per_thread <= EL_PER_INT, i.e.
+              // headDim/32 <= 32/bits. Out-of-contract shapes (e.g. D=256/bits=8)
+              // would shift a uint32 by >=32 bits (UB in Metal) and read half the
+              // channels as garbage — route them to reference() instead. Matches
+              // the Python assert in sdpa_dual_v_q4.
+              queries.dim(3) / 32 <= 32 / bits,
               let keyBiases = quantizedKeys.biases,
               let value1Biases = quantizedValue1.biases,
               let value2Biases = quantizedValue2.biases,

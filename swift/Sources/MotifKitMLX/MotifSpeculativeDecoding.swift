@@ -2,6 +2,7 @@
 import Foundation
 import MLX
 import MLXLMCommon
+import MLXRandom
 import MotifKit
 
 public struct MotifSpeculativeDecodingParameters: Codable, Equatable, Sendable {
@@ -15,9 +16,9 @@ public struct MotifSpeculativeDecodingParameters: Codable, Equatable, Sendable {
 }
 
 public enum MotifSpeculativeDecodingError: Error, LocalizedError, Equatable {
-    /// Lossless speculative sampling at temperature > 0 requires rejection
-    /// sampling against the full target distribution, which is not implemented.
-    /// Only greedy (temperature == 0) decoding is supported.
+    /// Retained for API/source stability. Temperature > 0 is now supported via
+    /// lossless rejection sampling (see `MotifSpeculativeEngine.decodeSampling`),
+    /// so this is no longer thrown by `speculativeGenerate`.
     case greedyOnly(Double)
     /// Rejected draft tokens must be trimmed out of the KV caches, so both the
     /// target and draft caches must be trimmable.
@@ -78,21 +79,32 @@ struct MotifSpeculativeEngineOutcome {
     var draftModelRuns = 0
 }
 
-/// Greedy speculative decoding with batched target verification.
+/// Speculative decoding with batched target verification.
 ///
 /// Per cycle the draft model proposes `k` tokens autoregressively from its own
 /// persistent KV cache, then the target model verifies the whole block with a
 /// single batched `[1, k + 1]` forward against its persistent KV cache (the
 /// `+ 1` is the last already-emitted token, whose row yields the target's
-/// prediction for the first proposal position). The longest prefix of
-/// proposals matching the target argmaxes is accepted, plus the target's own
-/// next token (correction on mismatch, bonus on full acceptance). Rows past
-/// the accepted prefix are trimmed from both caches.
+/// prediction for the first proposal position). Accepted proposals plus one
+/// correction/bonus token are emitted; rows past the accepted prefix are
+/// trimmed from both caches.
 ///
-/// Greedy accept rule: a draft token is accepted iff it equals the target
-/// argmax at its position, so the emitted sequence is exactly the target
-/// model's greedy continuation regardless of the draft model — the draft only
-/// changes how many target forwards it takes to produce it.
+/// Two lossless accept rules, selected by `temperature`:
+///
+/// * **Greedy (temperature == 0):** a draft token is accepted iff it equals the
+///   target argmax at its position, so the emitted sequence is exactly the
+///   target model's greedy continuation regardless of the draft model.
+/// * **Sampling (temperature > 0):** standard rejection sampling
+///   (Leviathan et al. 2023 / Chen et al. 2023). The draft proposes token `x`
+///   with probability `q(x)`; it is accepted with probability `min(1, p(x)/q(x))`
+///   where `p` is the target distribution; on rejection the correction token is
+///   drawn from the normalized residual `max(0, p - q)`, and on full acceptance
+///   a bonus token is drawn from `p`. The emitted distribution equals plain
+///   target sampling exactly.
+///
+/// In both cases the draft only changes how many target forwards it takes to
+/// produce the output, never the output's distribution. Sampling draws use the
+/// MLX global RNG, so `MLXRandom.seed(_:)` makes a run reproducible.
 enum MotifSpeculativeEngine {
     static func decode(
         targetModel: any LanguageModel,
@@ -102,13 +114,28 @@ enum MotifSpeculativeEngine {
         promptTokens: [Int],
         maxTokens: Int,
         draftTokenCount: Int,
-        stopTokenIDs: Set<Int>
+        stopTokenIDs: Set<Int>,
+        temperature: Float = 0
     ) throws -> MotifSpeculativeEngineOutcome {
         guard !promptTokens.isEmpty else {
             throw MotifSpeculativeDecodingError.emptyPrompt
         }
         guard targetCache.allSatisfy(\.isTrimmable), draftCache.allSatisfy(\.isTrimmable) else {
             throw MotifSpeculativeDecodingError.cacheNotTrimmable
+        }
+
+        if temperature > 0 {
+            return decodeSampling(
+                targetModel: targetModel,
+                draftModel: draftModel,
+                targetCache: targetCache,
+                draftCache: draftCache,
+                promptTokens: promptTokens,
+                maxTokens: maxTokens,
+                draftTokenCount: draftTokenCount,
+                stopTokenIDs: stopTokenIDs,
+                temperature: temperature
+            )
         }
 
         var outcome = MotifSpeculativeEngineOutcome()
@@ -217,6 +244,169 @@ enum MotifSpeculativeEngine {
 
         return outcome
     }
+
+    /// Lossless speculative SAMPLING via rejection sampling (temperature > 0).
+    ///
+    /// Cache mechanics (proposal, batched verify, per-cycle trim to
+    /// `context[0 ..< count - 1]`) are identical to the greedy path — only the
+    /// token selection and the accept rule differ. All sampling draws go through
+    /// the MLX global RNG (`MLXRandom.uniform`), so seeding with
+    /// `MLXRandom.seed(_:)` makes the whole run reproducible.
+    private static func decodeSampling(
+        targetModel: any LanguageModel,
+        draftModel: any LanguageModel,
+        targetCache: [KVCache],
+        draftCache: [KVCache],
+        promptTokens: [Int],
+        maxTokens: Int,
+        draftTokenCount: Int,
+        stopTokenIDs: Set<Int>,
+        temperature: Float
+    ) -> MotifSpeculativeEngineOutcome {
+        var outcome = MotifSpeculativeEngineOutcome()
+        guard maxTokens > 0 else { return outcome }
+        let draftTokenCount = max(1, draftTokenCount)
+        let inverseTemperature = 1 / temperature
+
+        /// Feed `tokens` through `model` (appending to `cache`) and return the
+        /// logits of the last `lastCount` positions, shape `[lastCount, vocab]`.
+        func forwardTail(
+            _ model: any LanguageModel, tokens: [Int], cache: [KVCache], lastCount: Int
+        ) -> MLXArray {
+            let logits = model(MLXArray(tokens.map(Int32.init), [1, tokens.count]), cache: cache)
+            let length = logits.dim(1)
+            return logits[0, (length - lastCount) ..< length, 0...]
+        }
+
+        /// Temperature-scaled softmax of one `[vocab]` logits row.
+        func probabilities(_ logitsRow: MLXArray) -> MLXArray {
+            softmax(logitsRow * inverseTemperature, axis: -1)
+        }
+
+        /// Inverse-CDF sample of one index from a normalized `[vocab]`
+        /// probability row, using a single global-RNG uniform draw (so the whole
+        /// decode is reproducible under `MLXRandom.seed`).
+        func sampleIndex(_ probabilities: MLXArray) -> Int {
+            let u = MLXRandom.uniform(Float(0) ..< Float(1), [1]).item(Float.self)
+            let cdf = cumsum(probabilities, axis: -1)
+            // Number of CDF entries <= u is the index of the first entry > u.
+            let index = sum((cdf .<= u).asType(.int32)).item(Int.self)
+            return min(max(index, 0), probabilities.dim(0) - 1)
+        }
+
+        func trim(_ caches: [KVCache], by amount: Int) {
+            guard amount > 0 else { return }
+            for cache in caches {
+                cache.trim(amount)
+            }
+        }
+
+        var context = promptTokens
+        var targetCacheCount = 0
+        var draftCacheCount = 0
+
+        while outcome.tokens.count < maxTokens {
+            let remaining = maxTokens - outcome.tokens.count
+            let k = min(draftTokenCount, remaining - 1)
+
+            // 1. Draft proposes k tokens autoregressively, SAMPLING each from its
+            //    own distribution q_i and recording q_i (needed for the accept
+            //    test and the residual on rejection).
+            var proposals: [Int] = []
+            var proposalProbability: [Float] = []  // q_i(x_i)
+            var draftDistributions: [MLXArray] = []  // full q_i, for the residual
+            if k > 0 {
+                let missing = Array(context[draftCacheCount...])
+                var qRow = probabilities(forwardTail(draftModel, tokens: missing, cache: draftCache, lastCount: 1)[0])
+                draftCacheCount = context.count
+                var next = sampleIndex(qRow)
+                proposals.append(next)
+                draftDistributions.append(qRow)
+                proposalProbability.append(qRow[next].item(Float.self))
+                while proposals.count < k {
+                    qRow = probabilities(forwardTail(draftModel, tokens: [next], cache: draftCache, lastCount: 1)[0])
+                    draftCacheCount += 1
+                    next = sampleIndex(qRow)
+                    proposals.append(next)
+                    draftDistributions.append(qRow)
+                    proposalProbability.append(qRow[next].item(Float.self))
+                }
+                outcome.draftModelRuns += 1
+                outcome.proposedDraftTokens += k
+            }
+
+            // 2. Single batched target forward verifies the block. The last
+            //    k + 1 rows are the target distributions p_0 ... p_k.
+            let verifyTokens = Array(context[targetCacheCount...]) + proposals
+            let targetTail = forwardTail(targetModel, tokens: verifyTokens, cache: targetCache, lastCount: k + 1)
+            targetCacheCount = context.count + k
+            outcome.targetModelSteps += 1
+            var targetDistributions: [MLXArray] = []
+            targetDistributions.reserveCapacity(k + 1)
+            for position in 0 ... k {
+                targetDistributions.append(probabilities(targetTail[position]))
+            }
+
+            // 3. Rejection sampling: accept proposal i with prob min(1, p/q); on
+            //    reject draw the correction from the normalized residual and stop
+            //    the block; on full acceptance draw a bonus token from p_k.
+            var accepted = 0
+            var correctionToken = 0
+            var rejected = false
+            while accepted < k {
+                let proposal = proposals[accepted]
+                let targetProbability = targetDistributions[accepted][proposal].item(Float.self)
+                let draftProbability = proposalProbability[accepted]
+                let acceptProbability = draftProbability > 0
+                    ? min(Float(1), targetProbability / draftProbability)
+                    : Float(1)
+                let u = MLXRandom.uniform(Float(0) ..< Float(1), [1]).item(Float.self)
+                if u < acceptProbability {
+                    accepted += 1
+                } else {
+                    let residual = maximum(targetDistributions[accepted] - draftDistributions[accepted], 0)
+                    // Residual mass is > 0 whenever a rejection occurs (p != q).
+                    let normalized = residual / sum(residual)
+                    correctionToken = sampleIndex(normalized)
+                    rejected = true
+                    break
+                }
+            }
+            if !rejected {
+                // All k proposals accepted (or k == 0): bonus token from p_k.
+                correctionToken = sampleIndex(targetDistributions[k])
+            }
+            outcome.acceptedDraftTokens += accepted
+            outcome.rejectedDraftTokens += k - accepted
+
+            // 4. Emit accepted proposals + the correction/bonus token, honoring
+            //    stop tokens and the maxTokens budget.
+            let previousCount = context.count
+            var stopped = false
+            let emitted = Array(proposals[0 ..< accepted]) + [correctionToken]
+            for token in emitted {
+                if stopTokenIDs.contains(token) {
+                    stopped = true
+                    break
+                }
+                outcome.tokens.append(token)
+                context.append(token)
+                if outcome.tokens.count >= maxTokens { break }
+            }
+            if stopped || outcome.tokens.count >= maxTokens { break }
+
+            // 5. Trim rows past the accepted prefix so both caches again hold
+            //    exactly context[0 ..< count - 1] (identical to the greedy path).
+            let targetValid = context.count - 1  // == previousCount + accepted
+            trim(targetCache, by: targetCacheCount - targetValid)
+            targetCacheCount = targetValid
+            let draftValid = previousCount + min(accepted, k - 1)
+            trim(draftCache, by: draftCacheCount - draftValid)
+            draftCacheCount = draftValid
+        }
+
+        return outcome
+    }
 }
 
 extension MotifMLXNativeRuntime {
@@ -227,20 +417,26 @@ extension MotifMLXNativeRuntime {
     /// trimming rejected rows from both caches. Accepted-block cycles advance
     /// the output by up to `draftTokens + 1` tokens per target forward.
     ///
-    /// Greedy only: throws ``MotifSpeculativeDecodingError/greedyOnly(_:)``
-    /// when `parameters.temperature != 0`. The emitted tokens follow the greedy
-    /// accept rule (a draft token is accepted iff it equals the target argmax
-    /// at that position), so the output is the target model's own greedy
-    /// continuation; the draft model only reduces the number of target
-    /// forwards. The draft runtime must share the target's tokenizer and
-    /// vocabulary — proposals are compared as token IDs.
+    /// Two lossless modes, selected by `parameters.temperature`:
+    ///
+    /// * **Greedy (temperature == 0):** a draft token is accepted iff it equals
+    ///   the target argmax at that position, so the output is the target model's
+    ///   own greedy continuation.
+    /// * **Sampling (temperature > 0):** lossless rejection sampling
+    ///   (Leviathan/Chen) — the emitted distribution equals plain target
+    ///   sampling exactly. Draws use the MLX global RNG, so `MLXRandom.seed(_:)`
+    ///   makes a run reproducible.
+    ///
+    /// In both modes the draft only reduces the number of target forwards, never
+    /// changes the output's distribution. The draft runtime must share the
+    /// target's tokenizer and vocabulary — proposals are compared as token IDs.
     ///
     /// Exactness caveat: verification uses batched forwards while plain
     /// generation uses `[1, 1]` decode steps. On quantized (q4/q8) checkpoints
     /// the two can round differently on near-tie logits, so the output is a
-    /// valid greedy decode but not guaranteed byte-identical to the sequential
-    /// path (same property documented for KV-cache reuse in
-    /// `MotifMLXNativeRuntimeCacheReuseTests`). On fp16/fp32 weights the
+    /// valid decode but not guaranteed byte-identical to the sequential path
+    /// (same property documented for KV-cache reuse in
+    /// `MotifMLXNativeRuntimeCacheReuseTests`). On fp16/fp32 weights the greedy
     /// equivalence is exact in practice and is asserted token-for-token by
     /// `MotifSpeculativeDecodingTests`.
     public func speculativeGenerate(
@@ -249,16 +445,13 @@ extension MotifMLXNativeRuntime {
         parameters: MotifGenerationParameters,
         speculativeParameters: MotifSpeculativeDecodingParameters = .init()
     ) async throws -> MotifSpeculativeGenerationResult {
-        guard parameters.temperature == 0 else {
-            throw MotifSpeculativeDecodingError.greedyOnly(parameters.temperature)
-        }
         let started = Date()
         let input = MotifMLXChatInputProcessor.userInput(from: messages)
         let targetInput = try await inputProcessor.prepare(input: input)
         let promptTokens = targetInput.text.tokens.asArray(Int.self)
         let generationParameters = GenerateParameters(
             maxTokens: parameters.maxTokens,
-            temperature: 0
+            temperature: Float(parameters.temperature)
         )
         let outcome = try MotifSpeculativeEngine.decode(
             targetModel: generationContext.model,
@@ -268,7 +461,8 @@ extension MotifMLXNativeRuntime {
             promptTokens: promptTokens,
             maxTokens: parameters.maxTokens,
             draftTokenCount: speculativeParameters.draftTokens,
-            stopTokenIDs: speculativeStopTokenIDs()
+            stopTokenIDs: speculativeStopTokenIDs(),
+            temperature: Float(parameters.temperature)
         )
         let elapsed = Date().timeIntervalSince(started)
         let text = generationContext.tokenizer.decode(tokens: outcome.tokens)

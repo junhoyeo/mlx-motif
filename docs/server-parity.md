@@ -10,9 +10,10 @@ Two OpenAI-compatible HTTP servers ship in this repo:
 Both expose the same minimal surface: `POST /v1/chat/completions` and
 `GET /v1/models`, with request params `messages`, `stream`, `max_tokens`,
 `temperature`, and the Motif-specific `think_mode`
-(`visible` | `hidden` | `captured`). The Python server additionally supports
-prompt-based `tools` / `tool_choice` (see "Tool / function calling" below);
-the Swift server does not.
+(`visible` | `hidden` | `captured`). **Both** servers also support prompt-based
+`tools` / `tool_choice` (see "Tool / function calling" below); the two
+implementations inject a byte-identical system preamble, pinned by a
+cross-language golden fixture (`tests/fixtures/tool_preamble_cases.json`).
 
 This document records what is aligned, what this change (PR) fixed, and what
 remains divergent or unimplemented. It is intentionally conservative: where a
@@ -82,15 +83,26 @@ The `MotifNativeGenerate` CLI also prints the terminal counts to stderr
 (`[usage] prompt_tokens=… generation_tokens=… total_tokens=…`), keeping stdout
 reserved for streamed text.
 
-## Tool / function calling — supported (prompt-based, Python only)
+## Tool / function calling — supported (prompt-based, both servers)
 
-The Python server supports OpenAI-style `tools` / `tool_choice` on
+Both servers support OpenAI-style `tools` / `tool_choice` on
 `POST /v1/chat/completions`. **This is prompt-injected tool calling, not
 model-native function calling.** Motif's chat template has no special
 tool/function tokens, so we do not and cannot claim native tool-calling
 parity with the OpenAI API.
 
-How it works (`src/mlx_motif/tool_calls.py`):
+The two implementations are kept in lockstep: the Python
+`build_tools_preamble` (`src/mlx_motif/tool_calls.py`) and the Swift
+`MotifToolCalling.buildToolsPreamble`
+(`swift/Sources/MotifKit/MotifToolCalling.swift`) emit a **byte-identical**
+preamble, and the parsers accept the same tool-call shapes. This is pinned by
+a shared cross-language golden fixture
+(`tests/fixtures/tool_preamble_cases.json`), asserted from both
+`tests/test_tool_calls.py` (Python) and
+`swift/Tests/MotifKitTests/MotifToolCallingTests.swift` (Swift).
+
+How it works (Python `src/mlx_motif/tool_calls.py`; the Swift server mirrors
+this in `MotifToolCalling.swift` + `MotifNativeServe/main.swift`):
 
 1. **Inject.** When `tools` are present, a deterministic system preamble is
    built from the tools list (each tool's name / description / JSON-Schema
@@ -116,9 +128,9 @@ How it works (`src/mlx_motif/tool_calls.py`):
 
 | Aspect                  | Python                                      | Swift | Status |
 |-------------------------|---------------------------------------------|-------|--------|
-| `tools` request param   | accepted; injected as system preamble       | not implemented | Python-only |
-| `tool_choice`           | `none` disables; otherwise prompt-default   | not implemented | Python-only |
-| `tool_calls` response   | OpenAI shape, `finish_reason: "tool_calls"` | not implemented | Python-only |
+| `tools` request param   | accepted; injected as system preamble       | same (byte-identical preamble) | aligned |
+| `tool_choice`           | `none` disables; otherwise prompt-default   | `none` disables; otherwise prompt-default | aligned |
+| `tool_calls` response   | OpenAI shape, `finish_reason: "tool_calls"` | same shape, `finish_reason: "tool_calls"` | aligned |
 
 **Honest limitations:**
 
@@ -127,13 +139,17 @@ How it works (`src/mlx_motif/tool_calls.py`):
 - Because the small model loops, a server-side **stop/parse layer** is
   required — the parser extracts only the first call (it does not impose a
   generation stop sequence, so tokens are still generated up to `max_tokens`).
-- No execution of tools and no multi-turn tool-result handling beyond passing
-  `tool`-role messages straight through to the prompt; only the request→tool_call
-  emission is shaped here.
+- **Neither HTTP server executes tools.** They only shape the request→tool_call
+  emission and pass `tool`-role messages straight through to the prompt. A
+  separate, bounded tool-**execution** loop (`run_tool_loop` in
+  `tool_calls.py`) is exposed as a CLI (`mlx-motif tools-demo`), which
+  generate→parse→execute→re-generate up to `max_rounds` using SAFE builtin demo
+  tools (`get_current_time` and an AST-whitelisted `calculator` via
+  `safe_arithmetic` — no `eval`/`exec`). This is a Python-side facility, not an
+  HTTP-server feature.
 - Streaming buffers the output when `tools` are present (it cannot stream a
   partial JSON tool call meaningfully), so the tool call arrives in a single
-  delta rather than token-by-token.
-- Swift `MotifNativeServe` does not implement tools.
+  delta rather than token-by-token. Both servers behave this way.
 
 ## Unimplemented params (both servers)
 

@@ -1,7 +1,7 @@
 # Design: `sdpa_dual_v_q4` — quantized-input shared-QK dual-V SDPA
 
 Status: **shipped**. Kernel + tests + bench + model wire-in landed.
-- Kernel: `src/mlx_motif/kernels.py::sdpa_dual_v_q4` (+ `_dequant_probe` standalone)
+- Kernel: `src/mlx_motif/kernels/attention.py::sdpa_dual_v_q4` (+ `_dequant_probe` standalone). (The kernels module was split out of the old single-file `src/mlx_motif/kernels.py`.)
 - Cache hook: `MotifGroupedQuantizedKVCache.update_and_fetch_4_quantized` returns triples
 - Wire-in: `MotifAttention._forward_grouped` auto-selects when cache is quantized (env-gated by `MLX_MOTIF_QUANT_SDPA`, default on)
 - Tests: `tests/test_kernels_sdpa_dual_v_q4.py` (37 cases), `tests/test_dequant_probe.py` (48), end-to-end via `tests/test_model.py::test_quant_cache_path_runs_and_close_to_fp16`
@@ -11,6 +11,49 @@ Status: **shipped**. Kernel + tests + bench + model wire-in landed.
 Two implementation deltas from the original sketch below:
 1. **MLX qdot trick** for the QK side (mask-without-shift; `q_pre[j] = scale*q[j] / 2^(shift_base+j*BITS)`, then in-place mask of K). Borrowed from `mlx/backend/metal/kernels/quantized.h::qdot`. Cuts about 15-20% off the inner loop in our measurements.
 2. Register pressure on bf16 needed trimming — scope-limited intermediates and held scales/biases in `T` not `U` (otherwise the kernel hits M1 Max's 896-thread cap and Metal refuses to launch at 1024).
+
+### Shipped signature deltas (supersedes the sketch below)
+
+The `## Skeleton` section further down shows the *original* public signature. The
+shipped `sdpa_dual_v_q4` differs in three ways that the sketch predates:
+
+3. **Runtime KV length, not a `KV_SEQ` template constant.** The kernel takes the
+   live KV length as a *runtime* int32 input (`kv_params = [kv_len, kv_cap]`),
+   and the wrapper grew a `kv_len: int | None = None` parameter (defaults to the
+   full buffer length). The KV loop is bounded by `kv_len`; row strides use
+   `kv_cap`. This is deliberate: a *template* KV length would force a fresh Metal
+   JIT compile (~40-100 ms) for every previously-unseen context length — and
+   decode grows KV by exactly one row per token, so *every* decode step would be
+   a new length and recompile. A runtime length compiles once and reuses.
+
+4. **Full step-padded capacity buffers, no exact-length slice.** The 4-slot
+   caches now hand the kernel their FULL row-contiguous, step-padded capacity
+   buffers (`(B, H_kv, KV_cap, …)`) plus `kv_len=cache.offset`, and the kernel
+   simply stops the loop at `kv_len` (padded rows past the live region are never
+   read). Passing an exact-length slice `[..., :offset, :]` instead used to force
+   an `ensure_row_contiguous` copy of the whole live KV region on every call;
+   the full-buffer + runtime-length contract avoids that copy entirely. See
+   `cache.py::update_and_fetch_4_quantized` and the `kv_len` docstring on the
+   wrapper.
+
+5. **Packed-word shape contract is ENFORCED, not assumed.** The sketch below
+   *assumes* each lane's `qk_per_thread = D/32` channels come from a single
+   packed uint32 (`qk_per_thread <= EL_PER_INT`). The shipped code enforces the
+   stronger *sufficient* condition — divisibility on both windows — and rejects
+   or falls back on violations:
+   - Python (`sdpa_dual_v_q4`): `assert (32 // bits) % (D // 32) == 0`
+     (`qk_per_thread | EL_PER_INT`, single packed word) **and**
+     `assert group_size % (D // 32) == 0` (`qk_per_thread | GROUP_SIZE`, single
+     scale/bias group).
+   - Swift (`MotifMetalKernels.swift`): the same two divisibility checks guard
+     the fast path and route out-of-contract shapes to the reference
+     implementation instead of dispatching a corrupting kernel.
+
+   The old `qk_per_thread <= EL_PER_INT` guard is only *necessary*: e.g.
+   `D=96, bits=8` gives `qk_per_thread=3 <= EL_PER_INT=4` yet lane 1's block
+   `{3,4,5}` straddles two words. Divisibility (`3 ∤ 4`) correctly rejects it.
+   The shipped `D=128` shape gives `qk_per_thread=4`, and `4|8`, `4|4`,
+   `4|{32,64,128}` all hold.
 
 Below is the original design doc, kept for context.
 
@@ -88,7 +131,10 @@ Identical to `sdpa_dual_v`. Output is bf16/fp16, not quantized.
 
 ## Skeleton
 
-The skeleton should live in `src/mlx_motif/kernels.py` next to `sdpa_dual_v`. Public API:
+The skeleton should live next to `sdpa_dual_v` (shipped at
+`src/mlx_motif/kernels/attention.py`; originally sketched for the old
+single-file `src/mlx_motif/kernels.py`). Public API (the shipped wrapper also
+takes `kv_len: int | None = None` — see "Shipped signature deltas" above):
 
 ```python
 def sdpa_dual_v_q4(

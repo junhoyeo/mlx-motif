@@ -79,15 +79,20 @@ useful trend evidence but still must not be cited as clean parity.
    confounded by different context lengths.  The sentinel test asserts these
    rows remain flagged rather than asserting a floor on their values.
 
-2. **Low-`max_tokens` methodology caveat.** All sweep cells ran with
-   `--max-tokens 8` and `--n-runs 1` (no warmup).  This makes each measurement
-   prefill-dominated.  The numbers reflect prompt-processing (KV-cache fill)
-   speed, not steady-state autoregressive decode throughput.  Real-world
-   generation throughput may differ.
+**Scope of caveats 2-3:** they describe **only the 2026-05-27 target baseline**.
+The later "Certified sweep update (20260531T184554Z)" section was produced with
+`--max-tokens 64`, `--n-runs 5`, and `--warmup-runs 1`, so it is not subject to
+them.
 
-3. **Single-run, no warmup.** With `--n-runs 1` and `--warmup-runs 0`, thermal
-   state and Metal shader JIT can affect the result.  Treat individual numbers
-   as indicative, not statistically robust.
+2. **Low-`max_tokens` methodology caveat (2026-05-27 baseline).** The
+   2026-05-27 target sweep cells ran with `--max-tokens 8` and `--n-runs 1` (no
+   warmup).  This makes each measurement prefill-dominated.  The numbers reflect
+   prompt-processing (KV-cache fill) speed, not steady-state autoregressive
+   decode throughput.  Real-world generation throughput may differ.
+
+3. **Single-run, no warmup (2026-05-27 baseline).** With `--n-runs 1` and
+   `--warmup-runs 0`, thermal state and Metal shader JIT can affect the result.
+   Treat individual numbers as indicative, not statistically robust.
 
 ## Gap-to-beat
 

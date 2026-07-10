@@ -18,7 +18,7 @@ MotifChatApp (SwiftUI)
   - an OpenAI-compatible streaming backend for the existing `mlx-motif serve`
   - a placeholder native backend error type for non-MLX builds
 - `MotifChatApp` is a SwiftUI macOS app scaffold with chat and runtime panels. Its default app target uses the OpenAI-compatible endpoint so non-MLX builds stay lightweight. When built with `MOTIFKIT_ENABLE_MLX=1`, it also links `MotifKitMLX` and can stream directly from a converted local checkpoint.
-- `MotifKitMLX` is disabled by default so the package stays buildable on the repo's current Xcode 16.2 / Swift 6.0.3 toolchain. With `MOTIFKIT_ENABLE_MLX=1`, `MotifMLXBackend(modelDirectory:)` now owns the native reference path: build the Motif decoder, load safetensors through MLXLMCommon, apply the tokenizer/chat template via swift-tokenizers, and stream generated events. Grouped four-slot q4/q8 caches are opt-in, and decode-time q4 uses direct packed custom Metal by default with `MLX_MOTIF_DISABLE_KERNELS=1` as the reference fallback.
+- `MotifKitMLX` is disabled by default so the package stays buildable on the repo's current Xcode 16.2 / Swift 6.0.3 toolchain. With `MOTIFKIT_ENABLE_MLX=1`, `MotifMLXBackend(modelDirectory:)` now owns the native reference path: build the Motif decoder, load safetensors through MLXLMCommon, apply the tokenizer/chat template via swift-tokenizers, and stream generated events. The grouped **fp16 four-slot KV cache is the default** (mirroring the Python `Model.make_cache`; opt out with `MLX_MOTIF_4SLOT_CACHE=0`); the quantized q4/q8 four-slot variants remain opt-in. Decode-time q4 uses direct packed custom Metal by default with `MLX_MOTIF_DISABLE_KERNELS=1` as the reference fallback.
 
 ## Verify
 
@@ -68,7 +68,12 @@ MOTIFKIT_ENABLE_MLX=1 swift build --package-path swift --target MotifKitMLX
 MOTIFKIT_ENABLE_MLX=1 swift build --package-path swift --target MotifNativeGenerate
 MOTIFKIT_ENABLE_MLX=1 swift build --package-path swift --target MotifNativeEvaluate
 MOTIFKIT_ENABLE_MLX=1 swift build --package-path swift --target MotifNativeServe
+MOTIFKIT_ENABLE_MLX=1 swift build --package-path swift --target MotifDecodeBench
 ```
+
+The MLX-only executable targets are `MotifNativeGenerate`, `MotifNativeEvaluate`,
+`MotifNativeServe`, and `MotifDecodeBench` (a synthetic per-layer decode
+micro-benchmark; run with `--config`, `--contexts`, `--warmup`, `--timed`).
 
 Once the repo moves to Xcode 16.3+ / Swift 6.1+, update the pins in `Package.swift` to `mlx-swift-lm` 3.31.3+ and `mlx-swift` 0.31.3+.
 
@@ -94,7 +99,7 @@ MOTIFKIT_ENABLE_MLX=1 swift run --package-path swift MotifNativeGenerate \
   --temperature 0
 ```
 
-Use `--speculative --speculative-draft-model <dir> --speculative-draft-tokens 4 --json` to run the Swift target/draft speculative decoder and emit acceptance metrics. The decoder is greedy-only (`--temperature 0`): the draft proposes K tokens from a persistent draft KV cache and the target verifies each block with a single batched `[1, K+1]` forward against a persistent target KV cache, trimming rejected rows, so accepted blocks advance up to K+1 tokens per target forward (`targetModelSteps` < `targetTokens` in the metrics). Output follows the greedy accept rule (draft token accepted iff it equals the target argmax), i.e. it is the target model's own greedy continuation; wall-clock speedup additionally requires a draft model meaningfully cheaper than the target.
+Use `--speculative --speculative-draft-model <dir> --speculative-draft-tokens 4 --json` to run the Swift target/draft speculative decoder and emit acceptance metrics. The draft proposes K tokens from a persistent draft KV cache and the target verifies each block with a single batched `[1, K+1]` forward against a persistent target KV cache, trimming rejected rows, so accepted blocks advance up to K+1 tokens per target forward (`targetModelSteps` < `targetTokens` in the metrics). Both accept rules are **lossless** (the output distribution is exactly the target model's): at `--temperature 0` a draft token is accepted iff it equals the target argmax (the target's own greedy continuation); at `--temperature > 0` the decoder uses standard rejection sampling (accept with probability `min(1, p/q)`, otherwise resample from the normalized residual). Wall-clock speedup additionally requires a draft model meaningfully cheaper than the target.
 
 ## Native eval/bench CLI
 
@@ -145,18 +150,28 @@ MOTIFKIT_ENABLE_MLX=1 swift run --package-path swift MotifNativeServe \
 ```
 
 Supported routes are `GET /v1/models` and `POST /v1/chat/completions`, including
-SSE streaming when `stream: true`. This is a native parity surface, not yet a
-production-hardened replacement for the Python server.
+SSE streaming when `stream: true`. Like the Python server, it also accepts
+OpenAI-style `tools` / `tool_choice`: when tools are declared (and not
+suppressed by `tool_choice: "none"`) it injects the byte-identical
+`MotifToolCalling.buildToolsPreamble` preamble and returns OpenAI-shaped
+`tool_calls` with `finish_reason: "tool_calls"`. See
+[`../docs/server-parity.md`](../docs/server-parity.md) for the full parity
+matrix. This is a native parity surface, not yet a production-hardened
+replacement for the Python server.
 
 ## Runtime cache/kernel feature flags
 
 The Swift MLX path reads Python-compatible flags:
 
 ```bash
-MLX_MOTIF_4SLOT_CACHE=1   # grouped fp four-slot cache
+# 4-slot cache: DEFAULT is fp16 four-slot (unset == "1"); only an explicit
+# falsy value opts out.
+MLX_MOTIF_4SLOT_CACHE=1   # grouped fp16 four-slot cache (the default)
+MLX_MOTIF_4SLOT_CACHE=0   # disable; fall back to the stock KV cache
 MLX_MOTIF_4SLOT_CACHE=q4  # grouped q4 packed cache + direct packed sdpa_dual_v_q4
 MLX_MOTIF_4SLOT_CACHE=q8  # grouped q8 packed cache + direct packed sdpa_dual_v_q4
 MLX_MOTIF_DUAL_V=0        # disable dual-V wrapper routing
 MLX_MOTIF_QUANT_SDPA=0    # keep q4/q8 cache on the dequant bridge path
+MLX_MOTIF_FUSE_QKV=0      # disable QKV fusion (fused defaults ON for grouped q4 decode)
 MLX_MOTIF_DISABLE_KERNELS=1
 ```

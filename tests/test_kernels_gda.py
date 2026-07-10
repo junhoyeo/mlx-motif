@@ -66,6 +66,8 @@ def test_gda_post_register_cache_edge_channels(d):
     ref = gda_post_reference(merged, subln_w, lambda_full, lambda_init, q_groups, gr, eps)
     got = gda_post(merged, subln_w, lambda_full, lambda_init, q_groups, gr, eps)
     np.testing.assert_allclose(
-        np.array(got.astype(mx.float32)), np.array(ref.astype(mx.float32)),
-        rtol=1e-4, atol=1e-4,
+        np.array(got.astype(mx.float32)),
+        np.array(ref.astype(mx.float32)),
+        rtol=1e-4,
+        atol=1e-4,
     )

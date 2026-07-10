@@ -170,8 +170,9 @@ def test_rope_before_split_equals_rope_after_split(offset):
     B, S, d = 1, 4, 128
     k_groups, kr = 2, 1  # num_kv_heads = k_groups * (kr + 1) = 4
     num_kv_heads = k_groups * (kr + 1)
-    rope = initialize_rope(d, base=10000.0, traditional=False, scaling_config=None,
-                           max_position_embeddings=4096)
+    rope = initialize_rope(
+        d, base=10000.0, traditional=False, scaling_config=None, max_position_embeddings=4096
+    )
 
     k = mx.random.normal((B, num_kv_heads, S, d))
 

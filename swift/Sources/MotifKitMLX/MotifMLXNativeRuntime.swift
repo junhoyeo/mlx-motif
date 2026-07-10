@@ -211,6 +211,7 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
             perLayerQuantization: baseConfiguration.perLayerQuantization
         )
         model.fuseQueryKeyValueProjectionsIfPossible()
+        configureGPUMemoryLimits()
 
         let eosTokenIDs = Set(
             ([bundle.configuration.eosTokenId].compactMap { $0 })
@@ -247,6 +248,21 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
             generationContext: context,
             inputProcessor: inputProcessor
         )
+    }
+
+    /// Configure MLX GPU memory limits for the multi-GB working set once the
+    /// model is resident, mirroring what mlx-lm does on the Python side.
+    ///
+    /// The pinned mlx-swift exposes no persistent wired-limit setter (only the
+    /// scoped `withWiredLimit`/ticket APIs), so we act conservatively on what is
+    /// available: bound the reusable buffer cache to the device's recommended
+    /// max working set instead of letting it default to the (1.5x-larger) memory
+    /// limit. This caps cache growth over long chats and reduces eviction of the
+    /// resident weight buffers, without the malloc stalls a tighter `memoryLimit`
+    /// could introduce.
+    private static func configureGPUMemoryLimits() {
+        guard let recommended = MLX.GPU.maxRecommendedWorkingSetBytes() else { return }
+        MLX.Memory.cacheLimit = recommended
     }
 
     public init(
@@ -293,12 +309,8 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
         parameters: MotifGenerationParameters
     ) -> AsyncThrowingStream<MotifGenerationEvent, any Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
-                    var thinkFilter = ThinkStreamFilter(
-                        mode: parameters.thinkMode,
-                        startsInsideThinkBlock: try inputProcessor.promptText(for: messages).trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix(ThinkStreamFilter.openTag)
-                    )
                     let input = MotifMLXChatInputProcessor.userInput(from: messages)
                     let lmInput = try await inputProcessor.prepare(input: input)
                     let generationParameters = GenerateParameters(
@@ -310,6 +322,22 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                     // matching and to report the authoritative prompt-token
                     // count regardless of how many tokens we actually prefill).
                     let promptTokens = lmInput.text.tokens.asArray(Int.self)
+
+                    // Detect whether the generation prompt already ends inside a
+                    // <think> block. Only the trailing text matters, so decode
+                    // just the last few prompt tokens (already tokenized above)
+                    // instead of re-applying the chat template to the whole
+                    // conversation and detokenizing every prompt token via
+                    // `promptText(for:)` — O(conversation) work duplicated per
+                    // turn purely to test a suffix.
+                    let thinkProbeTokens = Array(promptTokens.suffix(8))
+                    let thinkProbeText = generationContext.tokenizer.decode(tokens: thinkProbeTokens)
+                    var thinkFilter = ThinkStreamFilter(
+                        mode: parameters.thinkMode,
+                        startsInsideThinkBlock: thinkProbeText
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .hasSuffix(ThinkStreamFilter.openTag)
+                    )
 
                     // Decide whether the carried cache can be reused. Reuse is
                     // only valid when the cache holds a clean prefix of the new
@@ -334,6 +362,27 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                             cache = existingCache
                             prefillInput = LMInput(tokens: MLXArray(Array(promptTokens[prefix...])))
                             reusedCache = true
+                        } else if prefix == promptTokens.count, prefix >= 2, prefix < existingTokens.count,
+                                  existingCache.allSatisfy(\.isTrimmable) {
+                            // Regenerate / trailing-edit: the new prompt is a
+                            // strict prefix of the cached tokens (e.g. the user
+                            // dropped the previous assistant reply to regenerate,
+                            // or trimmed trailing messages). Trim the stale tail
+                            // out of the carried cache and re-run only the final
+                            // prompt token, reusing the KV for the whole shared
+                            // prefix instead of an O(conversation) re-prefill.
+                            // The exact suffix would be empty, so we keep one
+                            // fewer token and feed the last prompt token. trim()
+                            // is offset-only on both grouped caches, so the kept
+                            // KV is exactly what a fresh prefill of the prefix
+                            // would have produced.
+                            let keep = prefix - 1
+                            for layerCache in existingCache {
+                                _ = layerCache.trim(layerCache.offset - keep)
+                            }
+                            cache = existingCache
+                            prefillInput = LMInput(tokens: MLXArray(Array(promptTokens[keep...])))
+                            reusedCache = true
                         } else {
                             cache = generationContext.model.newCache(parameters: generationParameters)
                             prefillInput = lmInput
@@ -353,6 +402,13 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                         context: generationContext
                     )
                     for await generation in stream {
+                        // Stop draining as soon as the consumer aborts. Consumer
+                        // cancellation is propagated to `task` via
+                        // `continuation.onTermination` below; cancelling this
+                        // wrapper task also terminates the inner generation
+                        // stream, which cancels the underlying token loop so the
+                        // GPU stops decoding instead of running to maxTokens/EOS.
+                        if Task.isCancelled { break }
                         switch generation {
                         case .token(let token):
                             generatedTokenIDs.append(token)
@@ -392,6 +448,12 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                             continuation.yield(.completed(usage: usage))
                         }
                     }
+                    if Task.isCancelled {
+                        // Aborted mid-turn before the terminal `.info`: the
+                        // carried cache was advanced past `cachedTokenIDs`, so
+                        // drop it to force a clean prefill next turn.
+                        resetCache()
+                    }
                     continuation.finish()
                 } catch {
                     // Generation aborted before producing terminal info; the
@@ -402,6 +464,10 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                     continuation.finish(throwing: error)
                 }
             }
+            // Propagate consumer cancellation (UI stop / dropped iterator) into
+            // the generation task so an aborted chat turn stops GPU work instead
+            // of decoding to maxTokens/EOS.
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 
@@ -434,7 +500,11 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                 let x = MLXArray(inputIDs, [1, inputIDs.count])
                 let y = MLXArray(targetIDs, [1, targetIDs.count])
                 let logits = generationContext.model(x, cache: nil).asType(.float32)
-                let logProbabilities = log(softmax(logits, axis: -1))
+                // Numerically stable log-softmax (logits - logSumExp) instead of
+                // log(softmax(...)): the latter underflows to 0 -> -inf for
+                // low-probability target tokens and poisons totalNLL. Matches the
+                // Python reference (scripts/perplexity.py uses nn.log_softmax).
+                let logProbabilities = logSoftmax(logits, axis: -1)
                 let gathered = takeAlong(logProbabilities, y.reshaped([1, targetIDs.count, 1]), axis: -1)
                 let nll = -sum(gathered).item(Float.self)
                 totalNLL += Double(nll)

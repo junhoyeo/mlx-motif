@@ -38,7 +38,141 @@ import mlx.core as mx
 # and forwards `offset=self.offset`, which only the cache-module function
 # accepts. Importing from `mlx_lm.models.base` here raises TypeError on any
 # invocation (see cache-module `_BaseCache.make_mask`, whose body this mirrors).
-from mlx_lm.models.cache import _BaseCache, create_attention_mask
+from mlx_lm.models.cache import KVCache, _BaseCache, create_attention_mask
+
+# --------------------------------------------------------------------------- #
+# Vanilla (2.6B, ungrouped) DiffAttn V-cache slab ordering
+# --------------------------------------------------------------------------- #
+#
+# The vanilla forward (`MotifAttention._forward_vanilla`) stores V in the KV
+# cache in *slab* head order rather than the projection's *paired* head order.
+# These helpers make the two orderings explicit and mutually invertible so any
+# consumer that needs HF/paired-ordered V can recover it, and a unit test can
+# prove the round-trip. See `MotifVanillaKVCache` for the cache that carries
+# the ordering marker.
+
+
+def vanilla_v_paired_to_slab_perm(n_kv_heads: int) -> mx.array:
+    """Head-axis index mapping *paired* V order -> *slab* V order.
+
+    The V projection emits paired head order
+    ``[v0_a, v0_b, v1_a, v1_b, ...]`` — head block ``2*h + s`` for kv head ``h``
+    and slot ``s`` in ``{0=a, 1=b}``. The vanilla forward reorders this into
+    slab order ``[va_0 .. va_{H-1}, vb_0 .. vb_{H-1}]`` — head block ``s*H + h``
+    — so the two ``d``-wide value slabs are contiguous head-axis slices after
+    cache fetch (``v[:, :H]`` / ``v[:, H:]``).
+
+    Returns an int32 index array of length ``2*n_kv_heads`` such that indexing
+    the head axis, ``paired[:, perm]``, yields the slab-ordered tensor.
+    """
+    h = n_kv_heads
+    return mx.array([2 * (p % h) + (p // h) for p in range(2 * h)], dtype=mx.int32)
+
+
+def vanilla_v_slab_to_paired_perm(n_kv_heads: int) -> mx.array:
+    """Inverse of :func:`vanilla_v_paired_to_slab_perm`: *slab* -> *paired* (HF).
+
+    Returns an int32 index array of length ``2*n_kv_heads`` such that indexing
+    the head axis, ``slab[:, perm]``, restores the original HF paired head
+    order. This is the permutation any consumer needs to recover HF-ordered V
+    from the raw slab-ordered cache. Round-trip ``inverse(perm(x)) == x`` is
+    unit-tested (see ``tests/test_vanilla_slab_cache.py``).
+    """
+    h = n_kv_heads
+    return mx.array([(q % 2) * h + (q // 2) for q in range(2 * h)], dtype=mx.int32)
+
+
+class MotifVanillaKVCache(KVCache):
+    """KV cache for the vanilla (2.6B, ungrouped) Differential Attention path.
+
+    INVARIANT — V is stored in *slab* head order::
+
+        [va_0 .. va_{Hk-1}, vb_0 .. vb_{Hk-1}]
+
+    NOT the V projection's *paired* order ``[v0_a, v0_b, v1_a, v1_b, ...]``.
+    ``MotifAttention._forward_vanilla`` reorders V into slab order at
+    projection time (a cheap ``O(S*d)`` op on the new tokens — ``S == 1`` at
+    decode) so the two ``d``-wide value slabs ``v[:, :Hk]`` / ``v[:, Hk:]``
+    become contiguous head-axis slices after fetch. K is stored in the normal
+    paired stripe order; only V is slab-ordered.
+
+    Why this subclass exists: a plain ``KVCache`` advertises no head ordering,
+    so any consumer that reads ``.values`` (or a serialized ``.state``)
+    expecting HF/paired head order would get **silently wrong** values. This
+    subclass makes the non-standard ordering self-describing:
+
+      * ``meta_state`` carries the ``V_HEAD_ORDER`` marker. Restoring a state
+        whose marker does not match ``V_HEAD_ORDER`` — or an unmarked
+        (stock ``KVCache``) state whose V ordering is unknown — fails loudly
+        (see the ``meta_state`` setter) instead of silently mis-ordering V.
+      * ``hf_ordered_values()`` returns V re-permuted back to HF paired order
+        for anyone who genuinely needs HF-ordered V.
+
+    Runtime behaviour (``update_and_fetch`` / ``state`` / ``trim`` /
+    ``update_and_fetch`` growth) is inherited unchanged from ``KVCache`` — this
+    is purely a typed, self-describing wrapper and does not alter numerics.
+
+    Interop caveat: ``mlx_lm.models.cache.load_prompt_cache`` reconstructs a
+    cache via ``globals()[class_name].from_state(...)`` resolved in the mlx-lm
+    cache module namespace, where ``MotifVanillaKVCache`` is not defined —
+    loading a saved vanilla cache through stock mlx-lm tooling therefore raises
+    ``KeyError`` (loud) rather than silently rebuilding a bare ``KVCache`` with
+    mis-interpreted V. No code path in this repo serializes the vanilla cache
+    today; ``.state`` only ever round-trips through this same model code.
+    """
+
+    #: Ordering marker embedded in ``meta_state`` and checked on restore.
+    V_HEAD_ORDER = "slab"
+
+    @property
+    def meta_state(self):
+        # Stock KVCache carries no meta_state (inherits the empty ``_BaseCache``
+        # one). We publish the V head-ordering marker so it is serialized with
+        # the state and can be validated on restore.
+        return (self.V_HEAD_ORDER,)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        # ``_BaseCache.from_state`` assigns ``state`` first (which sets
+        # keys/values/offset via KVCache.state.setter) and then ``meta_state``;
+        # validate the ordering marker here so a state captured under a
+        # different (or unknown) V head order cannot be silently restored into
+        # code that assumes slab order.
+        marker = None
+        if isinstance(v, (tuple, list)):
+            marker = v[0] if len(v) else None
+        elif v not in (None, ""):
+            marker = v
+        if marker is None:
+            raise ValueError(
+                "MotifVanillaKVCache.from_state: state carries no V head-order "
+                "marker (unmarked / stock KVCache state). The vanilla path "
+                "stores V in slab head order; an unmarked state has an unknown "
+                "V ordering and cannot be safely restored. Expected "
+                f"meta_state marker {self.V_HEAD_ORDER!r}."
+            )
+        if marker != self.V_HEAD_ORDER:
+            raise ValueError(
+                "MotifVanillaKVCache.from_state: V head-order marker mismatch — "
+                f"got {marker!r}, expected {self.V_HEAD_ORDER!r}. Restoring a "
+                "cache with a different V head ordering into the slab-ordered "
+                "vanilla path would silently corrupt attention outputs."
+            )
+
+    def hf_ordered_values(self):
+        """Return the live V cache reordered from slab head order to HF paired
+        order ``[v0_a, v0_b, v1_a, v1_b, ...]``.
+
+        Named accessor for any consumer that needs HF-ordered V rather than the
+        raw slab-ordered ``.values``. Returns ``None`` if the cache is empty;
+        otherwise a ``(B, 2*Hk, offset, d)`` array (a gathered copy — the raw
+        cache buffer is left untouched).
+        """
+        if self.values is None:
+            return None
+        n_kv_heads = self.values.shape[1] // 2
+        perm = vanilla_v_slab_to_paired_perm(n_kv_heads)
+        return self.values[:, perm, : self.offset, :]
 
 
 class MotifGroupedKVCacheBase(_BaseCache):

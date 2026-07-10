@@ -476,6 +476,21 @@ public final class MotifMLXAttentionScaffold: Module {
         }
     }
 
+    // V-cache head-ordering invariant (Swift vs Python divergence):
+    //
+    // Unlike the Python reference (`_forward_vanilla` in src/mlx_motif/model.py),
+    // this Swift path stores V in the KV cache in the projection's *paired* head
+    // order [v0_a, v0_b, v1_a, v1_b, ...] — the raw `valueProjection` output is
+    // written straight to `cache.update`. The reshape → transpose → reshape into
+    // a 2*headDim-wide per-KV-head V happens AFTER fetch, on the full cached V.
+    // So the Swift vanilla V cache is HF-ordered and does NOT carry the Python
+    // side's *slab* head-order trap; no ordering marker is needed here, and the
+    // `KVCache` type is correct as-is.
+    //
+    // DIRECTIVE: if this path is ever reworked to the Python-style per-slab SDPA
+    // (which stores V slab-ordered [va_0..va_{Hk-1}, vb_0..vb_{Hk-1}] at
+    // projection time), mirror the Python `MotifVanillaKVCache` marker/accessor
+    // here so the non-standard V ordering cannot leak silently.
     private func forwardVanilla(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,

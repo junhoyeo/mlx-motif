@@ -12,14 +12,49 @@ import json
 from pathlib import Path
 
 import mlx.nn as nn
+from huggingface_hub import snapshot_download
 from mlx_lm.utils import TokenizerWrapper, load_tokenizer
 from mlx_lm.utils import load_model as _mlx_lm_load_model
 
 from mlx_motif.model import Model, ModelArgs
 
+# Mirrors mlx-lm's `_download` allow-list so a Hub repo id pulls exactly the
+# files our checkpoints ship (weights, config, tokenizer, chat template).
+_HUB_ALLOW_PATTERNS = [
+    "*.json",
+    "model*.safetensors",
+    "*.py",
+    "tokenizer.model",
+    "*.tiktoken",
+    "tiktoken.model",
+    "*.txt",
+    "*.jsonl",
+    "*.jinja",
+]
+
 
 def _get_motif_classes(config: dict):
     return Model, ModelArgs
+
+
+def _resolve_model_path(path: str | Path, revision: str | None = None) -> Path:
+    """Resolve `path` to a local directory, downloading from the Hub if needed.
+
+    A local directory that exists is used as-is; anything else is treated as a
+    Hugging Face repo id and fetched via `snapshot_download` (matching what
+    mlx-lm's own `load()` does). Without this, `load("org/model")` would look
+    for `./org/model/config.json` on disk and fail.
+    """
+    p = Path(path)
+    if p.exists():
+        return p
+    return Path(
+        snapshot_download(
+            str(path),
+            revision=revision,
+            allow_patterns=_HUB_ALLOW_PATTERNS,
+        )
+    )
 
 
 def _register_extra_eos_from_generation_config(
@@ -56,16 +91,21 @@ def _register_extra_eos_from_generation_config(
 def load(
     path: str | Path,
     fuse_qkv: bool = True,
+    revision: str | None = None,
 ) -> tuple[nn.Module, TokenizerWrapper]:
     """Load a converted MLX Motif checkpoint and its tokenizer.
 
     Args:
-        path: directory containing `model.safetensors*` and tokenizer files
+        path: a local directory containing `model.safetensors*` + tokenizer
+            files, OR a Hugging Face repo id (e.g.
+            ``"junhoyeo/Motif-2.6B-MLX-q4"``), which is downloaded on first use.
         fuse_qkv: if True (default), call `model.fuse_qkv()` after loading
             so the 3 grouped-attn projections collapse into one QuantizedLinear
             (~+10% on the per-layer projection cost).
+        revision: optional Hub revision (branch, tag, or commit) when `path`
+            is a repo id.
     """
-    path = Path(path)
+    path = _resolve_model_path(path, revision=revision)
     model, _ = _mlx_lm_load_model(path, get_model_classes=_get_motif_classes)
     if fuse_qkv and hasattr(model, "fuse_qkv"):
         model.fuse_qkv()

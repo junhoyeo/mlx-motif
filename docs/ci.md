@@ -63,10 +63,12 @@ and does not block merging. The hosted lane (`ci.yml`) remains the gate.
 1. **Xcode 26** installed at `/Applications/Xcode_26.app` (or any path matching
    `Xcode_26*.app`).  The workflow's toolchain-selection step scans for
    `version 6.[2-9]` or later in `swift --version`.
-2. Select it as the active toolchain:
+2. No manual `xcode-select` is needed: the workflow steers the toolchain via
+   `DEVELOPER_DIR` per job (the runner service has no TTY/passwordless sudo,
+   so the workflow deliberately avoids `sudo xcode-select`). Selecting Xcode 26
+   system-wide is optional:
    ```sh
-   sudo xcode-select -s /Applications/Xcode_26.app/Contents/Developer
-   swift --version   # should print "Swift version 6.2.x" or later
+   swift --version   # should print "Swift version 6.2.x" or later once selected
    ```
 3. Accept the Xcode licence:
    ```sh

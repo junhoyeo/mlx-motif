@@ -189,3 +189,72 @@ def test_sdpa_dual_v_q4_rejects_out_of_contract_head_dim(D, bits):
     with pytest.raises(AssertionError, match=r"D/32 <= 32/bits"):
         out = sdpa_dual_v_q4(q, k_q, v_q, v_q, scale, group_size=group_size, bits=bits)
         mx.eval(out)
+
+
+@pytest.mark.parametrize(
+    "D,bits",
+    [
+        # qk_per_thread = D/32 satisfies the OLD guard (D/32 <= 32/bits) but does
+        # NOT divide EL_PER_INT = 32/bits, so a lane's contiguous channel block
+        # straddles two packed uint32 words. These are the shapes the necessary-
+        # only guard let through; the sufficient guard must reject them.
+        (96, 8),  # qk_per_thread=3, EL_PER_INT=4: 3<=4 (old OK) but 3 does not divide 4
+        (96, 4),  # qk_per_thread=3, EL_PER_INT=8: 3<=8 (old OK) but 3 does not divide 8
+        (160, 4),  # qk_per_thread=5, EL_PER_INT=8: 5<=8 (old OK) but 5 does not divide 8
+    ],
+)
+def test_sdpa_dual_v_q4_rejects_word_straddling_head_dim(D, bits):
+    """Non-power-of-two head dims whose lane block straddles a packed word.
+
+    D/32 <= 32/bits (the old NECESSARY guard) is not enough: unless
+    qk_per_thread | EL_PER_INT the block [base, base+qk_per_thread) crosses a
+    uint32 boundary for some lane, so channels past the boundary are read from a
+    word that was never loaded and their shifts reach >= 32 bits (UB in Metal).
+    The sufficient guard must fail loudly for these instead of returning garbage.
+    """
+    group_size = 32  # divides D=96 and D=160; isolates the word-straddle condition
+    assert D % group_size == 0
+    assert D // 32 <= 32 // bits, "test shape must PASS the old necessary-only guard"
+    B, H, KV = 1, 4, 64
+    scale = 1.0 / (D**0.5)
+    q = mx.random.normal((B, H, 1, D)).astype(mx.float16)
+    k = mx.random.normal((B, H, KV, D)).astype(mx.float16)
+    v = mx.random.normal((B, H, KV, D)).astype(mx.float16)
+
+    k_q = mx.quantize(k, group_size=group_size, bits=bits)
+    v_q = mx.quantize(v, group_size=group_size, bits=bits)
+
+    with pytest.raises(AssertionError, match=r"qk_per_thread \| EL_PER_INT"):
+        out = sdpa_dual_v_q4(q, k_q, v_q, v_q, scale, group_size=group_size, bits=bits)
+        mx.eval(out)
+
+
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+@pytest.mark.parametrize("bits", [4, 8])
+def test_sdpa_dual_v_q4_accepts_shipped_shape_boundaries(group_size, bits):
+    """D=128 (the shipped head dim) must PASS the sufficient guard for every
+    supported group_size (32/64/128) and bits (4/8): qk_per_thread=4 divides both
+    EL_PER_INT in {4,8} and every group_size in {32,64,128}. The kernel runs and
+    matches the dequant reference (no AssertionError, correct numerics).
+    """
+    D = 128
+    B, H, KV = 1, 4, 64
+    mx.random.seed(0)
+    scale = 1.0 / (D**0.5)
+    q = mx.random.normal((B, H, 1, D)).astype(mx.float16)
+    k = mx.random.normal((B, H, KV, D)).astype(mx.float16)
+    v1 = mx.random.normal((B, H, KV, D)).astype(mx.float16)
+    v2 = mx.random.normal((B, H, KV, D)).astype(mx.float16)
+
+    k_q = mx.quantize(k, group_size=group_size, bits=bits)
+    v1_q = mx.quantize(v1, group_size=group_size, bits=bits)
+    v2_q = mx.quantize(v2, group_size=group_size, bits=bits)
+
+    a = sdpa_dual_v_q4(q, k_q, v1_q, v2_q, scale, group_size=group_size, bits=bits)
+    b = sdpa_dual_v_q4_reference(q, k_q, v1_q, v2_q, scale, group_size=group_size, bits=bits)
+
+    assert a.shape == (B, H, 1, 2 * D)
+    md = float(mx.max(mx.abs(a - b)))
+    assert mx.allclose(a, b, atol=5e-3, rtol=5e-3).item(), (
+        f"group_size={group_size} bits={bits}: max diff = {md:.3e}"
+    )

@@ -562,17 +562,49 @@ def sdpa_dual_v_q4(
     assert H_q % H_kv == 0
     assert bits in (4, 8)
     assert 0 <= kv_len <= KV_cap, f"kv_len={kv_len} must be in [0, {KV_cap}]"
-    # Packed-SDPA word contract: each lane loads exactly ONE packed uint32 per
-    # tensor per step (attention.py: `k_pkd = k_data[row_u32]`) and unpacks
-    # qk_per_thread = D/32 channels from it. That is only valid when all of a
-    # lane's channels live in that single word, i.e. qk_per_thread <= EL_PER_INT
-    # (equivalently D/32 <= 32/bits). For e.g. D=256/bits=8 the shifts reach 56
-    # bits (UB on uint32 in Metal) and half the channels are never read, so the
-    # kernel would return silent garbage — fail loudly instead. See the design
-    # note at attention.py:246-249. Ships only with D=128, which satisfies this.
-    assert D // 32 <= 32 // bits, (
-        f"sdpa_dual_v_q4 requires D/32 <= 32/bits (packed word contract "
-        f"qk_per_thread <= EL_PER_INT); got D={D}, bits={bits}"
+    # --- Packed-SDPA lane -> word -> group contract (SUFFICIENT, not just necessary) ---
+    # Threadgroup geometry fixes BD=32 lanes. Each lane owns a CONTIGUOUS block
+    # of qk_per_thread = D/32 channels starting at `base = sg_lid * qk_per_thread`
+    # (base is a multiple of qk_per_thread; sg_lid in [0,32)). Inside the kv loop
+    # (see _SDPA_DUAL_V_Q4_SRC) the kernel, per tensor per step:
+    #   * loads exactly ONE packed uint32 `u32_idx_base = base / EL_PER_INT`
+    #     (EL_PER_INT = 32/bits channels per word) and reads channel base+j at bit
+    #     `shift_base + j*BITS` with `shift_base = (base % EL_PER_INT) * BITS`;
+    #   * loads exactly ONE scale/bias `group_idx = base / GROUP_SIZE`.
+    # Both indexings are correct ONLY if the whole block [base, base+qk_per_thread)
+    # stays inside a single word (an EL_PER_INT-channel window) AND inside a single
+    # quant group (a GROUP_SIZE-channel window).
+    #
+    # Lemma. Contiguous length-L blocks placed at multiples of L all fit inside
+    # every aligned size-W window  <=>  L | W. (If L|W each window is a union of
+    # whole blocks; if L does not divide W, the block starting at the largest
+    # multiple of L below a window boundary straddles that boundary.) Over the 32
+    # lanes `base % W` attains its worst value W - gcd(L,W), and
+    # (W - gcd(L,W)) + L - 1 < W  <=>  L <= gcd(L,W)  <=>  L | W.
+    #
+    # The OLD guard `qk_per_thread <= EL_PER_INT` (i.e. D/32 <= 32/bits) is only
+    # NECESSARY. Counter-example that passes it yet corrupts: D=96, bits=8 gives
+    # qk_per_thread=3, EL_PER_INT=4 (3<=4 passes), but lane sg_lid=1 has base=3 and
+    # its block {3,4,5} straddles words 0/1 — channels 4,5 are read from the never-
+    # loaded next word and their shifts 32,40 (>= 32) are UB on a Metal uint32.
+    # The SUFFICIENT condition is divisibility on BOTH windows:
+    #   (1) qk_per_thread | EL_PER_INT   -> single packed word   (implies the old <=)
+    #   (2) qk_per_thread | GROUP_SIZE   -> single scale/bias group
+    # Under (1), qk_per_thread in {1,2,4,8} and D = 32*qk_per_thread is a power of
+    # two; for any real group_size (a power-of-two multiple of 32) (2) then holds
+    # automatically, but it is asserted explicitly so a hand-built group_size can
+    # never smuggle straddling groups past the guard. Under (1) the max shift is
+    # (EL_PER_INT-1)*BITS = 32-BITS < 32, so every shift is in range. D=128 (the
+    # shipped shape) gives qk_per_thread=4: 4|8 and 4|4, and 4|{32,64,128}. OK.
+    assert (32 // bits) % (D // 32) == 0, (
+        f"sdpa_dual_v_q4 requires qk_per_thread | EL_PER_INT so each lane's D/32 "
+        f"channels come from ONE packed uint32 (implies D/32 <= 32/bits); got "
+        f"D={D}, bits={bits} -> qk_per_thread={D // 32}, EL_PER_INT={32 // bits}"
+    )
+    assert group_size % (D // 32) == 0, (
+        f"sdpa_dual_v_q4 requires qk_per_thread | group_size so each lane's D/32 "
+        f"channels share ONE scale/bias group; got D={D}, group_size={group_size} "
+        f"-> qk_per_thread={D // 32}"
     )
     gqa_factor = H_q // H_kv
 

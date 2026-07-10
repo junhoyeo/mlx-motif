@@ -707,14 +707,25 @@ public enum MotifSDPADualVQ4 {
               queries.dim(3) % 32 == 0,
               queries.dim(3) % groupSize == 0,
               bits == 4 || bits == 8,
-              // Packed word contract: each lane loads exactly one packed uint32
-              // per tensor per step and unpacks qk_per_thread = D/32 channels
-              // from it, valid only when qk_per_thread <= EL_PER_INT, i.e.
-              // headDim/32 <= 32/bits. Out-of-contract shapes (e.g. D=256/bits=8)
-              // would shift a uint32 by >=32 bits (UB in Metal) and read half the
-              // channels as garbage — route them to reference() instead. Matches
-              // the Python assert in sdpa_dual_v_q4.
-              queries.dim(3) / 32 <= 32 / bits,
+              // Packed-SDPA lane -> word -> group contract (SUFFICIENT, not just
+              // necessary). Each lane owns a CONTIGUOUS block of qk_per_thread =
+              // D/32 channels starting at base = sg_lid*qk_per_thread, and per
+              // tensor per step loads exactly ONE packed uint32 (EL_PER_INT =
+              // 32/bits channels/word) and ONE scale/bias (GROUP_SIZE channels/
+              // group). The block is read correctly only if it stays inside a
+              // single word AND a single quant group. Contiguous length-L blocks
+              // at multiples of L fit inside every aligned size-W window iff L|W,
+              // so the sufficient condition is qk_per_thread | EL_PER_INT (single
+              // word; implies the old qk_per_thread <= EL_PER_INT) AND
+              // qk_per_thread | GROUP_SIZE (single scale/bias group). The old
+              // `<=` guard is only necessary: e.g. D=96/bits=8 gives
+              // qk_per_thread=3, EL_PER_INT=4 (3<=4 passes) but lane 1's block
+              // {3,4,5} straddles words 0/1 — channels 4,5 read the never-loaded
+              // next word with shifts 32/40 (>=32, UB in Metal). Route every
+              // out-of-contract shape to reference() instead. Mirrors the Python
+              // asserts in sdpa_dual_v_q4.
+              (32 / bits) % (queries.dim(3) / 32) == 0, // qk_per_thread | EL_PER_INT
+              groupSize % (queries.dim(3) / 32) == 0,   // qk_per_thread | GROUP_SIZE
               let keyBiases = quantizedKeys.biases,
               let value1Biases = quantizedValue1.biases,
               let value2Biases = quantizedValue2.biases,

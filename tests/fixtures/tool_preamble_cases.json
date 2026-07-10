@@ -1,0 +1,133 @@
+{
+  "cases": [
+    {
+      "name": "single_weather",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get the weather for a city",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ],
+      "expected": "You have access to the following tools. When a tool is needed to answer the user, respond with a SINGLE JSON object on its own and nothing else, in this exact form:\n{\"tool_call\": {\"name\": \"<tool name>\", \"arguments\": {<json arguments>}}}\nDo not wrap the JSON in markdown fences. Emit it exactly once. If no tool is needed, answer the user normally in plain text.\n\nAvailable tools:\n- get_weather: Get the weather for a city\n  parameters schema: {\"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}"
+    },
+    {
+      "name": "two_tools_time_calc",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_current_time",
+            "description": "Get the current local date and time as an ISO 8601 string.",
+            "parameters": {
+              "type": "object",
+              "properties": {}
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "calculator",
+            "description": "Evaluate a basic arithmetic expression.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "expression": {
+                  "type": "string",
+                  "description": "e.g. 2 * (3 + 4)"
+                }
+              },
+              "required": [
+                "expression"
+              ]
+            }
+          }
+        }
+      ],
+      "expected": "You have access to the following tools. When a tool is needed to answer the user, respond with a SINGLE JSON object on its own and nothing else, in this exact form:\n{\"tool_call\": {\"name\": \"<tool name>\", \"arguments\": {<json arguments>}}}\nDo not wrap the JSON in markdown fences. Emit it exactly once. If no tool is needed, answer the user normally in plain text.\n\nAvailable tools:\n- get_current_time: Get the current local date and time as an ISO 8601 string.\n  parameters schema: {\"properties\": {}, \"type\": \"object\"}\n- calculator: Evaluate a basic arithmetic expression.\n  parameters schema: {\"properties\": {\"expression\": {\"description\": \"e.g. 2 * (3 + 4)\", \"type\": \"string\"}}, \"required\": [\"expression\"], \"type\": \"object\"}"
+    },
+    {
+      "name": "no_description_empty_params",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "ping",
+            "parameters": {}
+          }
+        }
+      ],
+      "expected": "You have access to the following tools. When a tool is needed to answer the user, respond with a SINGLE JSON object on its own and nothing else, in this exact form:\n{\"tool_call\": {\"name\": \"<tool name>\", \"arguments\": {<json arguments>}}}\nDo not wrap the JSON in markdown fences. Emit it exactly once. If no tool is needed, answer the user normally in plain text.\n\nAvailable tools:\n- ping:\n  parameters schema: {}"
+    },
+    {
+      "name": "nested_schema_sorted_keys",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "search",
+            "description": "Search with options",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "query": {
+                  "type": "string"
+                },
+                "limit": {
+                  "type": "integer",
+                  "default": 10,
+                  "minimum": 1
+                },
+                "filters": {
+                  "type": "object",
+                  "properties": {
+                    "tags": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
+                    },
+                    "active": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              },
+              "required": [
+                "query"
+              ]
+            }
+          }
+        }
+      ],
+      "expected": "You have access to the following tools. When a tool is needed to answer the user, respond with a SINGLE JSON object on its own and nothing else, in this exact form:\n{\"tool_call\": {\"name\": \"<tool name>\", \"arguments\": {<json arguments>}}}\nDo not wrap the JSON in markdown fences. Emit it exactly once. If no tool is needed, answer the user normally in plain text.\n\nAvailable tools:\n- search: Search with options\n  parameters schema: {\"properties\": {\"filters\": {\"properties\": {\"active\": {\"type\": \"boolean\"}, \"tags\": {\"items\": {\"type\": \"string\"}, \"type\": \"array\"}}, \"type\": \"object\"}, \"limit\": {\"default\": 10, \"minimum\": 1, \"type\": \"integer\"}, \"query\": {\"type\": \"string\"}}, \"required\": [\"query\"], \"type\": \"object\"}"
+    },
+    {
+      "name": "missing_parameters_defaults_empty",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "noop",
+            "description": "does nothing"
+          }
+        }
+      ],
+      "expected": "You have access to the following tools. When a tool is needed to answer the user, respond with a SINGLE JSON object on its own and nothing else, in this exact form:\n{\"tool_call\": {\"name\": \"<tool name>\", \"arguments\": {<json arguments>}}}\nDo not wrap the JSON in markdown fences. Emit it exactly once. If no tool is needed, answer the user normally in plain text.\n\nAvailable tools:\n- noop: does nothing\n  parameters schema: {}"
+    }
+  ]
+}

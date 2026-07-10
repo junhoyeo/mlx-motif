@@ -192,8 +192,7 @@ final class MotifSpeculativeDecodingTests: XCTestCase {
         }
     }
 
-    /// Non-greedy temperatures are rejected loudly instead of silently
-    /// producing a non-target distribution.
+    /// The empty-prompt guard still throws (shared by both greedy and sampling).
     func testEngineRejectsEmptyPromptAndGuardsAreThrown() throws {
         try requireMLXRuntime()
         let model = try makeModel(seed: 7)
@@ -202,6 +201,86 @@ final class MotifSpeculativeDecodingTests: XCTestCase {
         ) { error in
             XCTAssertEqual(error as? MotifSpeculativeDecodingError, .emptyPrompt)
         }
+    }
+
+    // MARK: - Speculative sampling (temperature > 0)
+
+    private func speculativeSampling(
+        target: MotifMLXModel,
+        draft: MotifMLXModel,
+        prompt: [Int],
+        maxTokens: Int,
+        temperature: Float,
+        draftTokenCount: Int = 4,
+        stopTokenIDs: Set<Int> = []
+    ) throws -> MotifSpeculativeEngineOutcome {
+        try MotifSpeculativeEngine.decode(
+            targetModel: target,
+            draftModel: draft,
+            targetCache: target.newCache(parameters: GenerateParameters(temperature: temperature)),
+            draftCache: draft.newCache(parameters: GenerateParameters(temperature: temperature)),
+            promptTokens: prompt,
+            maxTokens: maxTokens,
+            draftTokenCount: draftTokenCount,
+            stopTokenIDs: stopTokenIDs,
+            temperature: temperature
+        )
+    }
+
+    /// (i) Temperature > 0 no longer throws — rejection sampling is implemented.
+    func testSamplingTemperatureDoesNotThrow() throws {
+        try requireMLXRuntime()
+        let model = try makeModel(seed: 7)
+        MLXRandom.seed(42)
+        XCTAssertNoThrow(
+            try speculativeSampling(
+                target: model, draft: model, prompt: prompt, maxTokens: 8, temperature: 0.8)
+        )
+        let outcome = try speculativeSampling(
+            target: model, draft: model, prompt: prompt, maxTokens: 8, temperature: 0.8)
+        XCTAssertEqual(outcome.tokens.count, 8, "sampling must still honor the maxTokens budget")
+    }
+
+    /// (ii) Self-draft (draft == target) means q == p at every position, so the
+    /// accept probability min(1, p/q) is 1 and essentially every proposal is
+    /// accepted. Assert acceptance rate > 0.95 over a run.
+    func testSelfDraftSamplingAcceptanceRateNearOne() throws {
+        try requireMLXRuntime()
+        let model = try makeModel(seed: 7)
+        MLXRandom.seed(123)
+        let outcome = try speculativeSampling(
+            target: model, draft: model, prompt: prompt, maxTokens: 48, temperature: 0.8)
+        XCTAssertGreaterThan(outcome.proposedDraftTokens, 0)
+        let acceptanceRate = Double(outcome.acceptedDraftTokens) / Double(outcome.proposedDraftTokens)
+        XCTAssertGreaterThan(
+            acceptanceRate, 0.95,
+            "self-draft rejection sampling (p == q) must accept nearly all proposals; "
+                + "got \(outcome.acceptedDraftTokens)/\(outcome.proposedDraftTokens)")
+        print(
+            "[speculative sampling gate] self-draft acceptance "
+                + "\(outcome.acceptedDraftTokens)/\(outcome.proposedDraftTokens) = \(acceptanceRate)")
+    }
+
+    /// (iii) Determinism: the same MLXRandom seed reproduces the sampled output
+    /// exactly. Runs the decode twice with the same seed and asserts equality.
+    func testSeededSamplingIsDeterministic() throws {
+        try requireMLXRuntime()
+        let target = try makeModel(seed: 7)
+        let draft = try makeModel(seed: 99)
+
+        func run() throws -> [Int] {
+            MLXRandom.seed(2024)
+            return try speculativeSampling(
+                target: target, draft: draft, prompt: prompt, maxTokens: 24, temperature: 0.9
+            ).tokens
+        }
+
+        let first = try run()
+        let second = try run()
+        XCTAssertFalse(first.isEmpty)
+        XCTAssertEqual(
+            first, second,
+            "the same MLXRandom seed must reproduce the sampled speculative output exactly")
     }
 }
 #endif

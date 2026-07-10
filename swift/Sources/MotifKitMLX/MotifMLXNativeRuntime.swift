@@ -312,6 +312,47 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
         }
     }
 
+    /// Test hook: when false, ``reconcileEOSCacheSurplus`` skips its debug
+    /// `assertionFailure` on the non-trimmable path (it still logs to stderr and
+    /// reports failure). This lets the release-fallback path be unit-tested with
+    /// a non-trimmable KVCache double without trapping in a debug test build.
+    /// Defaults to true so a real non-trimmable cache trips the assertion loudly.
+    nonisolated(unsafe) static var assertsOnUnreconcilableEOSCache = true
+
+    /// Reconcile the surplus stop-token KV that an EOS-terminated turn leaves in
+    /// the cache before it is carried forward for reuse. `surplus` is
+    /// `cache.offset - recordedTokenCount` (see the `reuseCache` doc for why an
+    /// EOS turn ends one position ahead of the recorded tokens).
+    ///
+    /// Motif's caches (``MotifGroupedKVCache`` / ``MotifGroupedQuantizedKVCache``
+    /// / mlx-lm's `KVCacheSimple`) are always trimmable, so the common path just
+    /// trims every layer by `surplus` and returns `true` (safe to reuse). If a
+    /// non-trimmable cache ever routes through `streamResponse`, the surplus
+    /// cannot be removed — silently skipping that layer (the previous behavior)
+    /// would leave its offset one ahead and shift every RoPE position of the
+    /// next reused suffix by +1. Guard loudly: `assertionFailure` in debug plus a
+    /// stderr warning, and return `false` so the caller invalidates reuse (safe
+    /// fallback: a clean full prefill next turn). Static and input-driven so the
+    /// guard is unit-testable with a KVCache test double.
+    @discardableResult
+    static func reconcileEOSCacheSurplus(_ cache: [KVCache], surplus: Int) -> Bool {
+        guard surplus > 0 else { return true }
+        guard cache.allSatisfy(\.isTrimmable) else {
+            let message = "MotifMLXNativeRuntime: cannot reconcile EOS cache offset "
+                + "(surplus \(surplus)); a non-trimmable KV cache routed through streamResponse. "
+                + "Invalidating cross-turn reuse and forcing a clean prefill next turn."
+            if assertsOnUnreconcilableEOSCache {
+                assertionFailure(message)
+            }
+            FileHandle.standardError.write(Data((message + "\n").utf8))
+            return false
+        }
+        for kvCache in cache {
+            kvCache.trim(surplus)
+        }
+        return true
+    }
+
     /// Length of the longest common prefix of two token-ID sequences.
     private static func commonPrefixLength(_ lhs: [Int], _ rhs: [Int]) -> Int {
         var length = 0
@@ -468,13 +509,17 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                                 // MotifMLXNativeRuntimeCacheReuseTests gate).
                                 let recordedTokenCount = promptTokens.count + generatedTokenIDs.count
                                 let extra = (cache.first?.offset ?? recordedTokenCount) - recordedTokenCount
-                                if extra > 0 {
-                                    for kvCache in cache where kvCache.isTrimmable {
-                                        kvCache.trim(extra)
-                                    }
+                                if Self.reconcileEOSCacheSurplus(cache, surplus: extra) {
+                                    reuseCache = cache
+                                    cachedTokenIDs = promptTokens + generatedTokenIDs
+                                } else {
+                                    // A non-trimmable layer left the surplus
+                                    // stop-token KV unreconciled; carrying the
+                                    // cache forward would append the next reused
+                                    // suffix at the wrong offset. Drop it so the
+                                    // next turn does a clean full prefill.
+                                    resetCache()
                                 }
-                                reuseCache = cache
-                                cachedTokenIDs = promptTokens + generatedTokenIDs
                             }
                             // Report the authoritative prompt-token count (the
                             // FULL prompt, not just the suffix we prefilled) so

@@ -13,8 +13,8 @@ name: CI (MLX / Apple Silicon)
 #
 # Runner requirements (see docs/ci.md for full registration guide):
 #   • Apple Silicon Mac (M-series) running macOS 26
-#   • Xcode 26 (or a Swift 6.2+ toolchain) installed and selected via
-#     `sudo xcode-select -s /Applications/Xcode_26.app/Contents/Developer`
+#   • Xcode 26 (or a Swift 6.2+ toolchain) installed at /Applications/Xcode*.app
+#     (the job steers via DEVELOPER_DIR — no sudo/xcode-select needed on the host)
 #   • Runner labels: self-hosted, macOS, ARM64
 #   • The runner user must be able to call `xcrun metal` (no extra setup needed
 #     if Xcode Command Line Tools are installed alongside Xcode 26)
@@ -74,7 +74,15 @@ jobs:
             echo "$xcode: $version"
             # Accept Swift 6.2 or later (needed for #if compiler(>=6.2) branch)
             if "$swift_bin" --version | grep -qE 'version 6\.[2-9]|version [7-9]\.'; then
-              sudo xcode-select -s "$xcode/Contents/Developer"
+              # The runner runs as a user LaunchAgent with no TTY and no
+              # passwordless sudo, so `sudo xcode-select -s` cannot work here.
+              # DEVELOPER_DIR steers swift/xcrun for the rest of the job
+              # without touching system state (and is a no-op burden-wise
+              # when the host's xcode-select already points at this Xcode).
+              if [ "$(xcode-select -p)" != "$xcode/Contents/Developer" ]; then
+                echo "DEVELOPER_DIR=$xcode/Contents/Developer" >> "$GITHUB_ENV"
+                export DEVELOPER_DIR="$xcode/Contents/Developer"
+              fi
               swift --version
               exit 0
             fi

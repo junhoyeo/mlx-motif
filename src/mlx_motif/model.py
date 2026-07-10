@@ -363,13 +363,21 @@ class MotifAttention(nn.Module):
         #     (softmax(QaKa^T) − λ·softmax(QbKb^T)) · V
         # equals
         #     SDPA(Qa, Ka, V) − λ · SDPA(Qb, Kb, V).
-        # V is stored in the cache at the same head granularity as K (so
-        # `n_kv_heads = num_key_value_heads`) but in *slab* head order
+        # INVARIANT: V is stored in the cache at the same head granularity as K
+        # (so `n_kv_heads = num_key_value_heads`) but in *slab* head order
         # [va_0..va_{Hk-1}, vb_0..vb_{Hk-1}] instead of the projection's
         # paired order [v0_a, v0_b, v1_a, v1_b, ..]. That makes the two
         # d-wide value slabs contiguous head-axis slices after fetch — the
         # old paired layout needed a reshape→transpose→reshape that
         # materialized a copy of the ENTIRE cached V every forward step.
+        #
+        # This slab ordering is a TRAP for any code reading the raw V cache
+        # expecting HF head order. `Model.make_cache` therefore hands the
+        # vanilla path a `MotifVanillaKVCache`, which carries the ordering
+        # marker in `meta_state` (loud failure on mismatched restore) and
+        # exposes `hf_ordered_values()` for consumers that need HF order. The
+        # reorder itself is `vanilla_v_paired_to_slab_perm` applied on the head
+        # axis, expressed here as a fused reshape/transpose on the new tokens.
         B, S, _ = x.shape
         d = self.head_dim
         H = self.num_heads  # halved (effective DiffAttn heads)
@@ -405,6 +413,13 @@ class MotifAttention(nn.Module):
         # kernels/attention.py). K/V are passed at Hk heads: `mx.fast`
         # SDPA's native GQA broadcast maps q head i -> kv head i // n_rep,
         # identical to the explicit `_repeat` (repeat_interleave) it replaces.
+        #
+        # Memory note: these four fast-template calls are O(S) in prefill
+        # memory (no S×S score buffer). The old generic v=2d path was O(S²);
+        # it is ~119 MB cheaper e2e at a 3.5k prompt but +369 MB at 6k and
+        # +755 MB at 8k, and it loses the decode-speed win — so the fast path
+        # is kept despite a measured +131 MB e2e peak at 3.5k. Full attribution
+        # + crossover table: docs/experiments/experiment-vanilla-prefill-peak-memory.md
         o1a = mx.fast.scaled_dot_product_attention(q1, k1, va, scale=self.scale, mask=mask)
         o1b = mx.fast.scaled_dot_product_attention(q1, k1, vb, scale=self.scale, mask=mask)
         o2a = mx.fast.scaled_dot_product_attention(q2, k2, va, scale=self.scale, mask=mask)
@@ -794,7 +809,11 @@ class Model(nn.Module):
         """
         from mlx_lm.models.cache import KVCache
 
-        from mlx_motif.cache import MotifGroupedKVCache, MotifGroupedQuantizedKVCache
+        from mlx_motif.cache import (
+            MotifGroupedKVCache,
+            MotifGroupedQuantizedKVCache,
+            MotifVanillaKVCache,
+        )
 
         env = os.environ.get("MLX_MOTIF_4SLOT_CACHE", "0").lower()
         use_4slot = env not in ("0", "", "false", "off")
@@ -822,7 +841,18 @@ class Model(nn.Module):
                     caches.append(MotifGroupedQuantizedKVCache(group_size=64, bits=8))
                 else:
                     caches.append(MotifGroupedKVCache())
+            elif not self.args.is_grouped:
+                # Vanilla (2.6B) path stores V in *slab* head order (see
+                # _forward_vanilla and MotifVanillaKVCache). Use the marked
+                # cache so the non-standard V ordering is self-describing and
+                # cannot silently leak to a consumer expecting HF head order.
+                # Runtime behaviour is identical to KVCache (it inherits
+                # update_and_fetch); only meta_state / accessors differ.
+                caches.append(MotifVanillaKVCache())
             else:
+                # Grouped model without the 4-slot cache: V is stored in its
+                # projected order (no slab reorder happens on this path), so
+                # the stock KVCache head ordering is correct here.
                 caches.append(KVCache())
         return caches
 

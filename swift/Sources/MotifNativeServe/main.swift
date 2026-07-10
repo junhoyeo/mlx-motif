@@ -156,10 +156,25 @@ private final class NativeOpenAIServer: @unchecked Sendable {
                 connection.cancel()
                 return
             }
+            // OpenAI-style prompt-based tool calling (parity with the Python
+            // server): the raw `tools` array and `tool_choice` are re-read from
+            // the body (ChatCompletionRequest omits them for brevity). When
+            // tools are declared and not suppressed, we inject the same
+            // deterministic preamble MotifToolCalling.buildToolsPreamble
+            // produces (byte-identical to Python) as a leading system message.
+            // Execution stays CLIENT-SIDE, matching OpenAI semantics — the
+            // server only surfaces the parsed tool_calls.
+            let tools = Self.extractTools(from: request.body)
+            var messages = chat.motifMessages
+            if !tools.isEmpty {
+                let preamble = MotifToolCalling.buildToolsPreamble(tools)
+                messages.insert(MotifChatMessage(role: .system, content: preamble), at: 0)
+            }
+            let parameters = chat.parameters(defaultThinkMode: defaultThinkMode)
             if chat.stream == true {
-                try await streamChat(chat, connection: connection)
+                try await streamChat(messages: messages, parameters: parameters, tools: tools, includeUsage: chat.includeUsage, connection: connection)
             } else {
-                try await completeChat(chat, connection: connection)
+                try await completeChat(messages: messages, parameters: parameters, tools: tools, connection: connection)
             }
             connection.cancel()
         } catch {
@@ -168,11 +183,27 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         }
     }
 
-    private func streamChat(_ chat: ChatCompletionRequest, connection: NWConnection) async throws {
+    /// Extract the OpenAI `tools` array from the raw request body, honouring
+    /// `tool_choice: "none"` (which suppresses tools entirely, matching the
+    /// Python server). Returns the tool dictionaries as `[[String: Any]]`.
+    private static func extractTools(from body: Data) -> [Any] {
+        guard let root = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return [] }
+        if let choice = root["tool_choice"] as? String, choice == "none" { return [] }
+        guard let tools = root["tools"] as? [Any] else { return [] }
+        return tools
+    }
+
+    private func streamChat(messages: [MotifChatMessage], parameters: MotifGenerationParameters, tools: [Any], includeUsage: Bool, connection: NWConnection) async throws {
         try await sendHeader(connection, status: 200, contentType: "text/event-stream", extraHeaders: ["Cache-Control": "no-cache"])
         let requestID = "chatcmpl-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24)
         let created = Int(Date().timeIntervalSince1970)
-        let stream = runtime.streamResponse(messages: chat.motifMessages, parameters: chat.parameters(defaultThinkMode: defaultThinkMode))
+        let stream = runtime.streamResponse(messages: messages, parameters: parameters)
+        // Prompt-based tool calling needs the FULL output to extract the first
+        // JSON tool-call (the small model loops), so when tools are declared we
+        // buffer instead of streaming content deltas, then emit a single
+        // tool_calls chunk at the end (parity with the Python server).
+        let toolNames = MotifToolCalling.toolNames(from: tools)
+        var toolBuffer: String? = tools.isEmpty ? nil : ""
         // Parity with the Python server: captured reasoning is attached to the
         // terminal stop chunk rather than emitted as a separate intermediate
         // SSE event. We buffer it here and merge it into the `.completed` chunk.
@@ -187,6 +218,12 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         for try await event in stream {
             switch event {
             case .text(let text):
+                if toolBuffer != nil {
+                    // Buffer instead of streaming: we need the full text to
+                    // extract the first tool call.
+                    toolBuffer! += text
+                    continue
+                }
                 let payload: [String: Any] = [
                     "id": String(requestID), "object": "chat.completion.chunk", "created": created, "model": modelID,
                     "choices": [["index": 0, "delta": ["content": text], "finish_reason": NSNull()]],
@@ -196,9 +233,39 @@ private final class NativeOpenAIServer: @unchecked Sendable {
                 capturedReasoning = reasoning
             case .completed(let usage):
                 terminalUsage = usage
+                // Tools declared: parse the buffered output. If a tool call is
+                // found, emit a tool_calls delta chunk and finish with
+                // finish_reason "tool_calls"; otherwise flush the buffered text.
+                var finishReason = "stop"
+                if let buffered = toolBuffer {
+                    if let call = MotifToolCalling.parseToolCall(text: buffered, toolNames: toolNames) {
+                        let arguments = argumentsJSONString(call.arguments)
+                        let toolChunk: [String: Any] = [
+                            "id": String(requestID), "object": "chat.completion.chunk", "created": created, "model": modelID,
+                            "choices": [[
+                                "index": 0,
+                                "delta": ["tool_calls": [[
+                                    "index": 0,
+                                    "id": "call_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24),
+                                    "type": "function",
+                                    "function": ["name": call.name, "arguments": arguments],
+                                ]]],
+                                "finish_reason": NSNull(),
+                            ]],
+                        ]
+                        try await sendSSE(connection, payload: toolChunk)
+                        finishReason = "tool_calls"
+                    } else if !buffered.isEmpty {
+                        let payload: [String: Any] = [
+                            "id": String(requestID), "object": "chat.completion.chunk", "created": created, "model": modelID,
+                            "choices": [["index": 0, "delta": ["content": buffered], "finish_reason": NSNull()]],
+                        ]
+                        try await sendSSE(connection, payload: payload)
+                    }
+                }
                 var final: [String: Any] = [
                     "id": String(requestID), "object": "chat.completion.chunk", "created": created, "model": modelID,
-                    "choices": [["index": 0, "delta": [:], "finish_reason": "stop"]],
+                    "choices": [["index": 0, "delta": [:], "finish_reason": finishReason]],
                 ]
                 if let capturedReasoning, !capturedReasoning.isEmpty {
                     final["reasoning"] = capturedReasoning
@@ -212,7 +279,7 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         // authoritative terminal `MotifGenerationUsage` surfaced by the runtime
         // — the same source used by the non-streaming response. If a backend
         // cannot report usage, omit the chunk instead of emitting wrong counts.
-        if chat.includeUsage, let usage = terminalUsage {
+        if includeUsage, let usage = terminalUsage {
             let usageChunk: [String: Any] = [
                 "id": String(requestID), "object": "chat.completion.chunk", "created": created, "model": modelID,
                 "choices": [],
@@ -227,11 +294,11 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         try await sendRaw(connection, Data("data: [DONE]\n\n".utf8))
     }
 
-    private func completeChat(_ chat: ChatCompletionRequest, connection: NWConnection) async throws {
+    private func completeChat(messages: [MotifChatMessage], parameters: MotifGenerationParameters, tools: [Any], connection: NWConnection) async throws {
         var content = ""
         var reasoning: String?
         var usage: MotifGenerationUsage?
-        let stream = runtime.streamResponse(messages: chat.motifMessages, parameters: chat.parameters(defaultThinkMode: defaultThinkMode))
+        let stream = runtime.streamResponse(messages: messages, parameters: parameters)
         for try await event in stream {
             switch event {
             case .text(let text): content += text
@@ -246,12 +313,33 @@ private final class NativeOpenAIServer: @unchecked Sendable {
             }
         }
         let resolvedUsage = usage ?? MotifGenerationUsage(promptTokens: 0, completionTokens: 0)
+
+        // Prompt-based tool calling (parity with Python): when tools were
+        // declared, try to extract the first JSON tool-call from the (possibly
+        // looping) output and shape it as OpenAI `tool_calls` with
+        // finish_reason "tool_calls". Falls back to a normal content response.
+        var message: [String: Any] = ["role": "assistant", "content": content]
+        var finishReason = "stop"
+        if !tools.isEmpty,
+           let call = MotifToolCalling.parseToolCall(text: content, toolNames: MotifToolCalling.toolNames(from: tools)) {
+            message = [
+                "role": "assistant",
+                "content": NSNull(),
+                "tool_calls": [[
+                    "id": "call_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24),
+                    "type": "function",
+                    "function": ["name": call.name, "arguments": argumentsJSONString(call.arguments)],
+                ]],
+            ]
+            finishReason = "tool_calls"
+        }
+
         var payload: [String: Any] = [
             "id": "chatcmpl-" + UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(24),
             "object": "chat.completion",
             "created": Int(Date().timeIntervalSince1970),
             "model": modelID,
-            "choices": [["index": 0, "message": ["role": "assistant", "content": content], "finish_reason": "stop"]],
+            "choices": [["index": 0, "message": message, "finish_reason": finishReason]],
             "usage": [
                 "prompt_tokens": resolvedUsage.promptTokens,
                 "completion_tokens": resolvedUsage.completionTokens,
@@ -261,6 +349,17 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         if let reasoning { payload["reasoning"] = reasoning }
         try await sendJSON(connection, status: 200, payload: payload)
     }
+}
+
+/// Serialize parsed tool-call arguments back into a JSON string (OpenAI places
+/// `arguments` as a JSON-encoded string). Keys are sorted for determinism.
+private func argumentsJSONString(_ arguments: [String: MotifJSONValue]) -> String {
+    let object: [String: Any] = arguments.mapValues { $0.anyValue }
+    if let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+       let string = String(data: data, encoding: .utf8) {
+        return string
+    }
+    return "{}"
 }
 
 private struct HTTPRequest {

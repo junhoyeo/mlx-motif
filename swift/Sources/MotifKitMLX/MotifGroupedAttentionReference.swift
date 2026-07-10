@@ -302,6 +302,16 @@ public final class MotifGroupedKVCache: KVCache, CustomDebugStringConvertible {
         fatalError(MotifGroupedKVCacheError.unsupportedSingleSlotUpdate.localizedDescription)
     }
 
+    /// Append the four incoming slices and return the FULL step-padded capacity
+    /// buffers (axis-2 length is the allocated capacity, a multiple of `step`,
+    /// NOT the live length `offset`). The buffers are row-contiguous, so feeding
+    /// them straight to the `sdpa_dual_v` decode kernel (with `kvLen = offset`)
+    /// avoids the per-step `ensure_row_contiguous` copy of the live KV region
+    /// that an exact-length `[..., :offset, :]` view would force before every
+    /// custom-kernel launch. Consumers that cannot take a runtime length bound
+    /// (the reference / fallback path) must slice back to `[..., :offset, :]`.
+    /// Mirrors the Python `MotifGroupedKVCache.update_and_fetch_4`
+    /// (src/mlx_motif/cache.py).
     public func updateAndFetch4(
         kOrigin newKOrigin: MLXArray,
         kNoise newKNoise: MLXArray,
@@ -325,10 +335,10 @@ public final class MotifGroupedKVCache: KVCache, CustomDebugStringConvertible {
         value2![.ellipsis, previous ..< offset, 0...] = newValue2
 
         return MotifGroupedKVCachedSlices(
-            kOrigin: kOrigin![.ellipsis, ..<offset, 0...],
-            kNoise: kNoise![.ellipsis, ..<offset, 0...],
-            value1: value1![.ellipsis, ..<offset, 0...],
-            value2: value2![.ellipsis, ..<offset, 0...]
+            kOrigin: kOrigin!,
+            kNoise: kNoise!,
+            value1: value1!,
+            value2: value2!
         )
     }
 
@@ -450,6 +460,12 @@ public final class MotifGroupedQuantizedKVCache: KVCache, CustomDebugStringConve
         fatalError(MotifGroupedKVCacheError.unsupportedSingleSlotUpdate.localizedDescription)
     }
 
+    /// Dequantizing bridge for the fp16/bf16 attention fallbacks. Returns
+    /// EXACT-length (`[..., :offset, :]`) dequantized slices, since those
+    /// consumers (the reference / prefill path) have no runtime length bound.
+    /// The bandwidth-saving `sdpa_dual_v_q4` decode path uses
+    /// `updateAndFetch4Quantized` instead. Mirrors the Python
+    /// `MotifGroupedQuantizedKVCache.update_and_fetch_4` dequant bridge.
     public func updateAndFetch4(
         kOrigin newKOrigin: MLXArray,
         kNoise newKNoise: MLXArray,
@@ -462,14 +478,24 @@ public final class MotifGroupedQuantizedKVCache: KVCache, CustomDebugStringConve
             value1: newValue1,
             value2: newValue2
         )
+        // `updateAndFetch4Quantized` now returns FULL step-padded capacity
+        // triples, so bound each to the live region (`live(...)`) before
+        // dequantizing for the exact-length fp16 fallback consumers.
         return MotifGroupedKVCachedSlices(
-            kOrigin: dequantize(packed.kOrigin, dtype: newKOrigin.dtype),
-            kNoise: dequantize(packed.kNoise, dtype: newKNoise.dtype),
-            value1: dequantize(packed.value1, dtype: newValue1.dtype),
-            value2: dequantize(packed.value2, dtype: newValue2.dtype)
+            kOrigin: dequantize(live(packed.kOrigin), dtype: newKOrigin.dtype),
+            kNoise: dequantize(live(packed.kNoise), dtype: newKNoise.dtype),
+            value1: dequantize(live(packed.value1), dtype: newValue1.dtype),
+            value2: dequantize(live(packed.value2), dtype: newValue2.dtype)
         )
     }
 
+    /// Append the four incoming slices and return each slot's FULL step-padded
+    /// capacity triple `(data, scales, biases)` — axis-2 length is the allocated
+    /// capacity, NOT the live length `offset`. The triples are row-contiguous so
+    /// `sdpa_dual_v_q4` can read packed memory directly (with `kvLen = offset`)
+    /// without the per-step `ensure_row_contiguous` copy of all nine live-region
+    /// buffers that exact-length `[..., :offset, :]` views would force. Mirrors
+    /// the Python `MotifGroupedQuantizedKVCache.update_and_fetch_4_quantized`.
     public func updateAndFetch4Quantized(
         kOrigin newKOrigin: MLXArray,
         kNoise newKNoise: MLXArray,
@@ -498,10 +524,10 @@ public final class MotifGroupedQuantizedKVCache: KVCache, CustomDebugStringConve
         writeQuantized(newValue2, into: &value2, range: previous ..< offset)
 
         return (
-            live(kOrigin!),
-            live(kNoise!),
-            live(value1!),
-            live(value2!)
+            kOrigin!,
+            kNoise!,
+            value1!,
+            value2!
         )
     }
 

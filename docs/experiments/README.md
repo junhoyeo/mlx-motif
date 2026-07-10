@@ -34,6 +34,12 @@ Each entry is structured the same way:
 |---|---|
 | [experiment-not-landed.md](experiment-not-landed.md) | `mx.compile` MLP, fuse gate+up matmuls (4096→32768), concat-qk for joint RoPE, single-call 40-head dual_v, composable q4 chain, mx.fast.SDPA with quantized KV via dequant bridge |
 
+### Measured trade-offs we accepted (kept the "worse" number on purpose)
+
+| Doc | Idea | Status |
+|---|---|---|
+| [experiment-vanilla-prefill-peak-memory.md](experiment-vanilla-prefill-peak-memory.md) | 2.6B vanilla prefill peak rose 3.760→3.891 GB (+131 MB) at 3.5k after the per-slab fast SDPA rework | **wontfix** — the rise is O(S)-vs-O(S²): reverting saves 119 MB at 3.5k but regresses +369 MB@6k / +755 MB@8k and loses the decode-speed win. |
+
 ## Provenance standard
 
 For removed experiments, each page names the deleted production symbols and

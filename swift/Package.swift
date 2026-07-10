@@ -92,6 +92,7 @@ if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {
             dependencies: [
                 "MotifKitMLX",
                 .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXRandom", package: "mlx-swift"),
             ],
             path: "Tests/MotifKitMLXTests"
         )

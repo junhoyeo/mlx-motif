@@ -94,7 +94,7 @@ MOTIFKIT_ENABLE_MLX=1 swift run --package-path swift MotifNativeGenerate \
   --temperature 0
 ```
 
-Use `--speculative --speculative-draft-model <dir> --speculative-draft-tokens 4 --json` to run the Swift target/draft speculative decoder and emit acceptance metrics.
+Use `--speculative --speculative-draft-model <dir> --speculative-draft-tokens 4 --json` to run the Swift target/draft speculative decoder and emit acceptance metrics. The decoder is greedy-only (`--temperature 0`): the draft proposes K tokens from a persistent draft KV cache and the target verifies each block with a single batched `[1, K+1]` forward against a persistent target KV cache, trimming rejected rows, so accepted blocks advance up to K+1 tokens per target forward (`targetModelSteps` < `targetTokens` in the metrics). Output follows the greedy accept rule (draft token accepted iff it equals the target argmax), i.e. it is the target model's own greedy continuation; wall-clock speedup additionally requires a draft model meaningfully cheaper than the target.
 
 ## Native eval/bench CLI
 

@@ -1,6 +1,6 @@
 [project]
 name = "mlx-motif"
-version = "0.0.1"
+version = "0.1.0"
 description = "The canonical MLX port of Motif models on Apple Silicon."
 readme = "README.md"
 license = { file = "LICENSE" }

@@ -23,12 +23,17 @@ src/mlx_motif/
   quant.py           # mixed-precision quantization presets
   server.py          # OpenAI-compatible HTTP server + ThinkFilter for
                      # <think> stream handling (visible|hidden|captured)
+  tool_calls.py      # pure prompt-based tool/function calling: build_tools_preamble
+                     # + parse_tool_call (importable without MLX/weights)
 
 tests/
   test_model.py                    # smoke: forward shapes, sanitize, AttnPath resolution
   test_quant.py                    # quantization predicates
-  test_parity.py                   # numerical parity vs HF reference
+  test_parity.py                   # numerical parity vs HF reference (opt-in via MLX_MOTIF_PARITY*)
+  test_convert_config.py           # converted-checkpoint config emission
   test_think_filter.py             # server <think>-stream filter
+  test_tool_calls.py               # prompt-based tool-call parser (build_preamble / parse)
+  test_server_contract.py          # OpenAI-compatible server HTTP-contract structure
   test_kernels.py                  # polynorm correctness
   test_kernels_gda.py              # gda_post correctness
   test_kernels_gda_post_split.py   # gda_post_split correctness
@@ -36,6 +41,13 @@ tests/
   test_kernels_sdpa_dual_v_q4.py   # quantized-input dual-V SDPA (+ GQA)
   test_dequant_probe.py            # standalone 4/8-bit unpack probe
   test_grouped_cache.py            # 4-slot cache correctness
+  test_eval_smoke.py               # eval_smoke.py pure-logic helpers (no MLX/model)
+  test_benchmark_sweep.py          # bench_sweep.py harness logic
+  test_benchmark_certification.py  # certification validator for benchmark sweep JSONs
+  test_swift_parity_fixtures.py    # shared lightweight Swift-port parity fixtures
+  test_swift_hard_parity_evidence.py    # required Swift<->Python parity evidence gates
+  test_swift_python_perf_regression.py  # Swift-vs-Python q4 throughput floor sentinel
+  test_swift_chat_app_package_verify.py # SwiftUI app packaging metadata verify
 
 scripts/
   bench_decode_e2e.py  # end-to-end decode benchmark (the headline-numbers harness)

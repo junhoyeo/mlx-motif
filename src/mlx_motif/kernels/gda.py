@@ -29,6 +29,10 @@ _GDA_POST_SRC = r"""
     uint row     = threadgroup_position_in_grid.x;
     uint tid     = thread_position_in_threadgroup.x;
 
+    // Sequence length arrives at runtime (prefill S varies per prompt/chunk;
+    // a template constant would force a Metal recompile per distinct length).
+    uint S = uint(s_in[0]);
+
     // Decompose row into (b, h_o, s) using contiguous (B, q_origin, S) layout.
     uint hs    = (Q_ORIGIN * S);
     uint b     = row / hs;
@@ -92,7 +96,7 @@ _GDA_POST_SRC = r"""
 def _make_gda_post_kernel():
     return mx.fast.metal_kernel(
         name="motif_gda_post",
-        input_names=["merged", "subln_w", "lambda_full", "scale_in", "eps_in"],
+        input_names=["merged", "subln_w", "lambda_full", "scale_in", "eps_in", "s_in"],
         output_names=["y"],
         source=_GDA_POST_SRC,
     )
@@ -130,6 +134,9 @@ _GDA_POST_SPLIT_SRC = r"""
     // (B, q_origin+q_groups, S, 2d) concat allocation upstream.
     uint row     = threadgroup_position_in_grid.x;
     uint tid     = thread_position_in_threadgroup.x;
+
+    // Runtime sequence length (see gda_post: avoids per-length recompiles).
+    uint S = uint(s_in[0]);
 
     uint hs    = (Q_ORIGIN * S);
     uint b     = row / hs;
@@ -188,7 +195,7 @@ _GDA_POST_SPLIT_SRC = r"""
 def _make_gda_post_split_kernel():
     return mx.fast.metal_kernel(
         name="motif_gda_post_split",
-        input_names=["attn_o", "attn_n", "subln_w", "lambda_full", "scale_in", "eps_in"],
+        input_names=["attn_o", "attn_n", "subln_w", "lambda_full", "scale_in", "eps_in", "s_in"],
         output_names=["y"],
         source=_GDA_POST_SPLIT_SRC,
     )
@@ -247,6 +254,7 @@ def gda_post_split(
 
     scale = _scalar_f32(1.0 - lambda_init)
     eps_arr = _scalar_f32(eps)
+    s_arr = mx.array([S], dtype=mx.int32)
 
     out = _gda_post_split_kernel(
         inputs=[
@@ -256,13 +264,13 @@ def gda_post_split(
             lambda_full.astype(mx.float32),
             scale,
             eps_arr,
+            s_arr,
         ],
         template=[
             ("T", attn_o.dtype),
             ("Q_ORIGIN", q_origin),
             ("Q_GROUPS", q_groups),
             ("GR", gr),
-            ("S", S),
             ("CHANNELS", channels),
             ("TG", tg),
         ],
@@ -306,6 +314,7 @@ def gda_post(
 
     scale = _scalar_f32(1.0 - lambda_init)
     eps_arr = _scalar_f32(eps)
+    s_arr = mx.array([S], dtype=mx.int32)
 
     out = _gda_post_kernel(
         inputs=[
@@ -314,13 +323,13 @@ def gda_post(
             lambda_full.astype(mx.float32),
             scale,
             eps_arr,
+            s_arr,
         ],
         template=[
             ("T", merged.dtype),
             ("Q_ORIGIN", q_origin),
             ("Q_GROUPS", q_groups),
             ("GR", gr),
-            ("S", S),
             ("CHANNELS", channels),
             ("TG", tg),
         ],

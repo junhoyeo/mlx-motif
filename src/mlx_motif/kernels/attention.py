@@ -38,6 +38,17 @@ from ._common import _DISABLE, _scalar_f32
 # Channel coverage: each simdgroup g produces v_per_thread=D/BD=4 channels
 # at output offsets `[g*4, g*4+4)` (V1 slab) and `[D + g*4, D + g*4+4)`
 # (V2 slab). 32 simdgroups × 4 channels × 2 slabs = 2D ✓.
+#
+# KV length handling: the live KV length and the buffer row capacity arrive
+# at RUNTIME via the `kv_params` int32 buffer ([kv_len, kv_cap]) instead of a
+# template constant. Two reasons (measured, see PR for numbers):
+#   1. A template KV_SEQ forces a fresh ~40-100 ms Metal JIT compile for every
+#      previously-unseen context length — i.e. every decode token.
+#   2. Taking the FULL capacity buffer (row-contiguous) plus a runtime length
+#      avoids the `ensure_row_contiguous` copy of the whole live KV region
+#      that exact-length `[..., :offset, :]` slices trigger per call.
+# Row strides use kv_cap (the buffer's axis-2 capacity); the KV loop is
+# bounded by kv_len, so padded rows past the live region are never read.
 
 _SDPA_DUAL_V_SRC = r"""
     constexpr int BN = 32;
@@ -55,10 +66,15 @@ _SDPA_DUAL_V_SRC = r"""
     // For GQA_FACTOR=1 this is the standard one-to-one mapping.
     uint kv_head_idx = head_idx / uint(GQA_FACTOR);
 
+    // Runtime KV geometry: kv_len = live rows to attend over, kv_cap = the
+    // buffer's axis-2 row capacity (used for the per-head stride).
+    int  kv_len = kv_params[0];
+    uint kv_cap = uint(kv_params[1]);
+
     const device T* q_p  = q  + head_idx    * D                       + sg_lid * qk_per_thread;
-    const device T* k_p  = k  + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * qk_per_thread;
-    const device T* v1_p = v1 + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
-    const device T* v2_p = v2 + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
+    const device T* k_p  = k  + kv_head_idx * (kv_cap * uint(D)) + sg_gid * D + sg_lid * qk_per_thread;
+    const device T* v1_p = v1 + kv_head_idx * (kv_cap * uint(D)) + sg_gid * D + sg_lid * v_per_thread;
+    const device T* v2_p = v2 + kv_head_idx * (kv_cap * uint(D)) + sg_gid * D + sg_lid * v_per_thread;
     device T*       y_p  = y  + head_idx    * (2 * D);
 
     float scale = float(scale_in[0]);
@@ -80,7 +96,7 @@ _SDPA_DUAL_V_SRC = r"""
     U sum_exp_score = U(0);
 
     int kv_stride = BN * D;
-    for (int p = sg_gid; p < KV_SEQ; p += BN) {
+    for (int p = sg_gid; p < kv_len; p += BN) {
         // Load this lane's K slice.
         thread U k_r[qk_per_thread];
         for (int j = 0; j < qk_per_thread; ++j) k_r[j] = U(k_p[j]);
@@ -153,7 +169,7 @@ _SDPA_DUAL_V_SRC = r"""
 def _make_sdpa_dual_v_kernel():
     return mx.fast.metal_kernel(
         name="motif_sdpa_dual_v",
-        input_names=["q", "k", "v1", "v2", "scale_in"],
+        input_names=["q", "k", "v1", "v2", "scale_in", "kv_params"],
         output_names=["y"],
         source=_SDPA_DUAL_V_SRC,
     )
@@ -171,18 +187,38 @@ def sdpa_dual_v_reference(
     return mx.concatenate([a1, a2], axis=-1)
 
 
-def sdpa_dual_v(q: mx.array, k: mx.array, v1: mx.array, v2: mx.array, scale: float) -> mx.array:
+def sdpa_dual_v(
+    q: mx.array,
+    k: mx.array,
+    v1: mx.array,
+    v2: mx.array,
+    scale: float,
+    kv_len: int | None = None,
+) -> mx.array:
     """
     Shared-QK, dual-V SDPA with native GQA broadcast.
 
-    `q` shape (B, H_q, 1, D); `k, v1, v2` shape (B, H_kv, K, D).
+    `q` shape (B, H_q, 1, D); `k, v1, v2` shape (B, H_kv, KV_cap, D).
     Each gqa_factor=H_q/H_kv consecutive Q heads share one (K, V*) head.
     Returns (B, H_q, 1, 2·D) = cat([SDPA(q,k,v1), SDPA(q,k,v2)], axis=-1).
 
+    `kv_len` is the number of live KV rows to attend over (defaults to the
+    full buffer length `k.shape[2]`). Pass the FULL row-contiguous cache
+    buffers plus `kv_len=cache.offset` — rows past `kv_len` are never read.
+    This avoids both the per-length Metal recompile (KV length is a runtime
+    input, not a template constant) and the `ensure_row_contiguous` copy
+    that exact-length cache slices would trigger on every call.
+
     Decode-only (S=1). For GQA_FACTOR=1 this is plain dual-V SDPA.
     """
+    if kv_len is None:
+        kv_len = k.shape[2]
+
     if _DISABLE:
-        # Reference path: explicit repeat then 2 SDPAs.
+        # Reference path: slice to the live region, explicit repeat, 2 SDPAs.
+        k = k[..., :kv_len, :]
+        v1 = v1[..., :kv_len, :]
+        v2 = v2[..., :kv_len, :]
         H_q = q.shape[1]
         H_kv = k.shape[1]
         gqa = H_q // H_kv
@@ -197,13 +233,14 @@ def sdpa_dual_v(q: mx.array, k: mx.array, v1: mx.array, v2: mx.array, scale: flo
         _sdpa_dual_v_kernel = _make_sdpa_dual_v_kernel()
 
     B, H_q, S_q, D = q.shape
-    _, H_kv, KV, _ = k.shape
+    _, H_kv, KV_cap, _ = k.shape
     assert S_q == 1, "sdpa_dual_v is decode-only"
     assert D % 32 == 0, f"D={D} must be a multiple of 32"
     assert H_q % H_kv == 0, f"H_q={H_q} must be a multiple of H_kv={H_kv}"
     gqa_factor = H_q // H_kv
-    assert v1.shape == v2.shape == (B, H_kv, KV, D), "v1,v2 must match (B, H_kv, K, D)"
+    assert v1.shape == v2.shape == (B, H_kv, KV_cap, D), "v1,v2 must match (B, H_kv, KV_cap, D)"
     assert k.shape[-1] == D, "K head_dim must match Q"
+    assert 0 <= kv_len <= KV_cap, f"kv_len={kv_len} must be in [0, {KV_cap}]"
 
     rows = B * H_q
     tg = 32 * 32  # BN * BD = 1024
@@ -211,9 +248,10 @@ def sdpa_dual_v(q: mx.array, k: mx.array, v1: mx.array, v2: mx.array, scale: flo
     threadgroup = (tg, 1, 1)
 
     scale_arr = _scalar_f32(scale)
+    kv_params = mx.array([kv_len, KV_cap], dtype=mx.int32)
     out = _sdpa_dual_v_kernel(
-        inputs=[q, k, v1, v2, scale_arr],
-        template=[("T", q.dtype), ("D", D), ("KV_SEQ", KV), ("GQA_FACTOR", gqa_factor)],
+        inputs=[q, k, v1, v2, scale_arr, kv_params],
+        template=[("T", q.dtype), ("D", D), ("GQA_FACTOR", gqa_factor)],
         grid=grid,
         threadgroup=threadgroup,
         output_shapes=[(B, H_q, 1, 2 * D)],
@@ -269,6 +307,13 @@ _SDPA_DUAL_V_Q4_SRC = r"""
     uint sg_lid   = thread_index_in_simdgroup;
     uint kv_head_idx = head_idx / uint(GQA_FACTOR);
 
+    // Runtime KV geometry: kv_len = live rows to attend over, kv_cap = the
+    // buffer's axis-2 row capacity (used for the per-head stride). Runtime
+    // inputs (not template constants) so decode never recompiles and the
+    // full row-contiguous cache buffers can be passed without slicing.
+    int  kv_len = kv_params[0];
+    uint kv_cap = uint(kv_params[1]);
+
     // Per-lane channel slice — same uint32_idx, shift, group_idx for K, V1, V2.
     uint base         = uint(sg_lid) * uint(qk_per_thread);
     uint u32_idx_base = base / uint(EL_PER_INT);
@@ -276,8 +321,8 @@ _SDPA_DUAL_V_Q4_SRC = r"""
     uint group_idx    = base / uint(GROUP_SIZE);
 
     // Per-tensor row offset for this kv_head (computed once).
-    uint head_row_u32 = kv_head_idx * uint(KV_SEQ) * uint(U32_PER_ROW);
-    uint head_row_scb = kv_head_idx * uint(KV_SEQ) * uint(SCB_PER_ROW);
+    uint head_row_u32 = kv_head_idx * kv_cap * uint(U32_PER_ROW);
+    uint head_row_scb = kv_head_idx * kv_cap * uint(SCB_PER_ROW);
 
     // Q (fp16/bf16): same indexing as sdpa_dual_v.
     const device T* q_p = q + head_idx * uint(D) + sg_lid * uint(qk_per_thread);
@@ -314,7 +359,7 @@ _SDPA_DUAL_V_Q4_SRC = r"""
     U max_score = U(-1e30f);
     U sum_exp_score = U(0);
 
-    for (int p = sg_gid; p < KV_SEQ; p += BN) {
+    for (int p = sg_gid; p < kv_len; p += BN) {
         uint row_u32 = head_row_u32 + uint(p) * uint(U32_PER_ROW) + u32_idx_base;
         uint row_scb = head_row_scb + uint(p) * uint(SCB_PER_ROW) + group_idx;
 
@@ -415,6 +460,7 @@ def _make_sdpa_dual_v_q4_kernel():
             "v2_scales",
             "v2_biases",
             "scale_in",
+            "kv_params",
         ],
         output_names=["y"],
         source=_SDPA_DUAL_V_Q4_SRC,
@@ -432,14 +478,22 @@ def sdpa_dual_v_q4_reference(
     scale: float,
     group_size: int = 64,
     bits: int = 4,
+    kv_len: int | None = None,
 ) -> mx.array:
     """Pure-MLX reference: dequantize K, V1, V2 and run `sdpa_dual_v_reference`.
+
+    `kv_len` bounds the live KV region (defaults to the full buffer length),
+    mirroring the kernel's runtime-length contract.
 
     Tolerance for kernel-vs-reference comparisons must absorb the small
     roundoff from the kernel's fp32 accumulator vs the reference's fp16
     accumulator. The quantization noise itself is shared (both paths
     consume the exact same packed bits), so it does NOT enter the diff.
     """
+    if kv_len is not None:
+        k_q = tuple(x[..., :kv_len, :] for x in k_q)
+        v1_q = tuple(x[..., :kv_len, :] for x in v1_q)
+        v2_q = tuple(x[..., :kv_len, :] for x in v2_q)
     k = mx.dequantize(*k_q, group_size=group_size, bits=bits)
     v1 = mx.dequantize(*v1_q, group_size=group_size, bits=bits)
     v2 = mx.dequantize(*v2_q, group_size=group_size, bits=bits)
@@ -461,23 +515,30 @@ def sdpa_dual_v_q4(
     scale: float,
     group_size: int = 64,
     bits: int = 4,
+    kv_len: int | None = None,
 ) -> mx.array:
     """Quantized-input shared-QK, dual-V SDPA decode kernel.
 
     Args:
         q: (B, H_q, 1, D), bf16/fp16/fp32.
         k_q: `(data, scales, biases)` triple from `mx.quantize` of a
-             (B, H_kv, KV, D) tensor.
+             (B, H_kv, KV_cap, D) tensor.
         v1_q, v2_q: same triple format as `k_q`, two independent V tensors.
         scale: softmax scaling factor (1/sqrt(d_head)).
         group_size: quantization group size — must divide D.
         bits: 4 or 8.
+        kv_len: number of live KV rows to attend over (defaults to the full
+            buffer length). Pass the FULL row-contiguous cache triples plus
+            `kv_len=cache.offset`; rows past `kv_len` are never read. The
+            length is a runtime input, not a template constant, so decode
+            never triggers a Metal recompile and no `ensure_row_contiguous`
+            copy is inserted.
 
     Returns:
         (B, H_q, 1, 2*D) — `cat([attn(q,k,v1), attn(q,k,v2)], axis=-1)`.
     """
     if _DISABLE:
-        return sdpa_dual_v_q4_reference(q, k_q, v1_q, v2_q, scale, group_size, bits)
+        return sdpa_dual_v_q4_reference(q, k_q, v1_q, v2_q, scale, group_size, bits, kv_len)
 
     global _sdpa_dual_v_q4_kernel
     if _sdpa_dual_v_q4_kernel is None:
@@ -488,7 +549,9 @@ def sdpa_dual_v_q4(
     v2_data, v2_scales, v2_biases = v2_q
 
     B, H_q, S_q, D = q.shape
-    _, H_kv, KV, n_uint = k_data.shape
+    _, H_kv, KV_cap, n_uint = k_data.shape
+    if kv_len is None:
+        kv_len = KV_cap
     el_per_int = 32 // bits
     assert n_uint * el_per_int == D, (
         f"k_data last axis = {n_uint} ⇒ packed D = {n_uint * el_per_int}, expected {D}"
@@ -498,6 +561,19 @@ def sdpa_dual_v_q4(
     assert D % group_size == 0
     assert H_q % H_kv == 0
     assert bits in (4, 8)
+    assert 0 <= kv_len <= KV_cap, f"kv_len={kv_len} must be in [0, {KV_cap}]"
+    # Packed-SDPA word contract: each lane loads exactly ONE packed uint32 per
+    # tensor per step (attention.py: `k_pkd = k_data[row_u32]`) and unpacks
+    # qk_per_thread = D/32 channels from it. That is only valid when all of a
+    # lane's channels live in that single word, i.e. qk_per_thread <= EL_PER_INT
+    # (equivalently D/32 <= 32/bits). For e.g. D=256/bits=8 the shifts reach 56
+    # bits (UB on uint32 in Metal) and half the channels are never read, so the
+    # kernel would return silent garbage — fail loudly instead. See the design
+    # note at attention.py:246-249. Ships only with D=128, which satisfies this.
+    assert D // 32 <= 32 // bits, (
+        f"sdpa_dual_v_q4 requires D/32 <= 32/bits (packed word contract "
+        f"qk_per_thread <= EL_PER_INT); got D={D}, bits={bits}"
+    )
     gqa_factor = H_q // H_kv
 
     rows = B * H_q
@@ -506,6 +582,7 @@ def sdpa_dual_v_q4(
     threadgroup = (tg, 1, 1)
 
     scale_arr = _scalar_f32(scale)
+    kv_params = mx.array([kv_len, KV_cap], dtype=mx.int32)
     out = _sdpa_dual_v_q4_kernel(
         inputs=[
             q,
@@ -519,11 +596,11 @@ def sdpa_dual_v_q4(
             v2_scales,
             v2_biases,
             scale_arr,
+            kv_params,
         ],
         template=[
             ("T", q.dtype),
             ("D", D),
-            ("KV_SEQ", KV),
             ("GQA_FACTOR", gqa_factor),
             ("BITS", bits),
             ("GROUP_SIZE", group_size),

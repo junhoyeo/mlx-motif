@@ -23,7 +23,7 @@ Output is **byte-identical** between the in-tree kernel and reference paths (`ML
 
 ## Status
 
-**Shipped:** package + HF→MLX converter, mixed-precision quantization (`--quant-preset uniform|mixed|mlp_lowbit`), fused PolyNorm + GDA-post Metal kernels, shared-QK dual-V SDPA, 4-slot KV cache (fp16 / q4 / q8) with in-kernel quant-input SDPA (`sdpa_dual_v_q4`), OpenAI-compatible server with `<think>` streaming toggle, speculative-decoding wiring.
+**Shipped:** package + HF→MLX converter, mixed-precision quantization (`--quant-preset uniform|mixed|mlp_lowbit`), fused PolyNorm + GDA-post Metal kernels, shared-QK dual-V SDPA, 4-slot KV cache (fp16 / q4 / q8) with in-kernel quant-input SDPA (`sdpa_dual_v_q4`), OpenAI-compatible server with `<think>` streaming toggle and prompt-based tool calling, speculative-decoding wiring, and a native Swift/macOS stack (SwiftUI chat app + MLX-Swift runtime — see [`swift/`](swift/README.md)).
 
 **Open:** HF Hub release of converted checkpoints, multi-chip validation (M2/M3/M4), long-context end-to-end bench (16k+), prefill-path kernels.
 
@@ -31,7 +31,7 @@ Output is **byte-identical** between the in-tree kernel and reference paths (`ML
 
 ```bash
 git clone …/mlx-motif && cd mlx-motif
-uv pip install -e ".[dev]"
+uv pip install -e ".[dev]"   # or: uv sync --extra dev  (uses the committed uv.lock)
 ```
 
 Requires Python ≥ 3.11, MLX ≥ 0.21, Apple Silicon (only M1 Max validated end-to-end so far).
@@ -47,6 +47,9 @@ mlx-motif convert \
 
 # 2. Generate
 mlx-motif generate --model ./out/motif-12.7b-q4 --prompt "Hello, world."
+
+# 3. Serve (OpenAI-compatible HTTP)
+mlx-motif serve --model ./out/motif-12.7b-q4 --port 8080
 ```
 
 Programmatically:
@@ -59,7 +62,69 @@ model, tokenizer = load("./out/motif-12.7b-q4")
 print(generate(model, tokenizer, prompt="…", max_tokens=128))
 ```
 
-`mlx_motif.load` wires our `Model` into mlx-lm's loader (default: with QKV projection fusion). Everything downstream — `mlx_lm.generate`, `mlx_lm.server`, speculative decoding — works the same as for stock mlx-lm models.
+`mlx_motif.load` wires our `Model` into mlx-lm's loader (default: with QKV projection fusion). Everything downstream — `mlx_lm.generate`, `mlx_lm.server`, speculative decoding — works the same as for stock mlx-lm models. Runnable end-to-end scripts live in [`examples/`](examples/) (`examples/convert.py`, `examples/generate.py`).
+
+### Conversion presets
+
+`mlx-motif convert` defaults to bf16; `--quantize` enables quantization. The `--quant-preset` flag selects the precision policy (see [`quant.py`](src/mlx_motif/quant.py)):
+
+```bash
+# Uniform q4 (default preset when --quantize is set)
+mlx-motif convert --hf-path … --out ./out/u-q4 --quantize --bits 4 --group-size 64
+
+# Mixed: keep q_proj higher-precision (--q-proj-bits), everything else at --bits
+mlx-motif convert --hf-path … --out ./out/mixed --quantize --quant-preset mixed --q-proj-bits 6 --bits 4
+
+# mlp_lowbit: push MLP projections to --mlp-bits/--mlp-group-size, rest at --bits/--group-size
+#   (memory ↓25%, speed −31%, PPL +10% — see docs/experiments/experiment-mlp-lowbit.md)
+mlx-motif convert --hf-path … --out ./out/lowbit --quantize --quant-preset mlp_lowbit --mlp-bits 3 --mlp-group-size 32
+```
+
+## OpenAI-compatible server
+
+`mlx-motif serve` exposes `POST /v1/chat/completions` (SSE streaming when `stream: true`) and `GET /v1/models`, wrapping `mlx_lm.generate.stream_generate`:
+
+```bash
+mlx-motif serve \
+  --model ./out/motif-12.7b-q4 \
+  --host 127.0.0.1 --port 8080 \
+  --model-id motif \
+  --think-mode visible   # visible | hidden | captured
+```
+
+**`--think-mode`** controls Motif's `<think>…</think>` reasoning trace (overridable per-request via an `extra_body={"think_mode": …}` field):
+
+| Mode | Behavior |
+|---|---|
+| `visible` (default) | reasoning trace streams as-is |
+| `hidden` | tokens between `<think>` and `</think>` are dropped from the output |
+| `captured` | trace dropped from the visible stream but returned separately (e.g. a `reasoning` field) |
+
+Motif's reasoning chat template pre-opens the think block (`<|assistant|><think>`), so the filter is primed to start *inside* a think block when the prompt ends that way — there's no opening tag in the stream, only the closing `</think>`.
+
+### Tool calling (prompt-based)
+
+The server accepts the OpenAI `tools` / `tool_choice` fields, implemented as **prompt-injected** tool calling — Motif's chat template has no native tool tokens (see [`tool_calls.py`](src/mlx_motif/tool_calls.py)). When `tools` are present:
+
+1. A deterministic system preamble is prepended describing each tool and instructing the model to emit a single `{"tool_call": {"name", "arguments"}}` JSON object.
+2. The output is buffered (not streamed delta-by-delta, since the small model tends to loop the object), and the **first** valid balanced-JSON tool call is extracted and returned as an OpenAI `tool_calls` chunk. If no tool call is emitted, the buffered text is flushed as normal content.
+
+`tool_choice: "none"` suppresses tools; `auto`/`required` behave like the default prompt. This is a pragmatic compatibility shim, not model-native function calling — treat it accordingly.
+
+## Swift / native macOS app
+
+A native macOS stack lives under [`swift/`](swift/README.md): a SwiftUI **chat app** (`MotifChatApp`), a `MotifKit` runtime layer with an OpenAI-compatible bridge and `<think>` filtering that mirrors the Python server, and an optional `MotifKitMLX` overlay (gated by `MOTIFKIT_ENABLE_MLX=1`) that ports the Motif decoder and the custom Metal kernels to MLX-Swift. It also ships native CLIs (`MotifNativeGenerate`, `MotifNativeEvaluate`, `MotifNativeServe`, `MotifDecodeBench`).
+
+```bash
+# Default lightweight build (talks to `mlx-motif serve` over /v1)
+swift test --package-path swift
+swift build --package-path swift --target MotifChatApp
+
+# Native MLX overlay (Swift 6.1+ recommended; see swift/README.md for toolchain pins)
+MOTIFKIT_ENABLE_MLX=1 swift run --package-path swift MotifChatApp
+```
+
+The Swift MLX path reads the same `MLX_MOTIF_*` feature flags as the Python path. See [`swift/README.md`](swift/README.md) for the full workflow and [`docs/server-parity.md`](docs/server-parity.md) for how the two servers line up.
 
 ## Architecture
 
@@ -198,9 +263,29 @@ xlong prompt (3204)    14 tok/s (estimate)    24.02 ± 0.17 tok/s         +71%
 
 Note: isolated microbench ≠ in-chain time. MLX's lazy graph fuses many of these; chained per-layer time is roughly half the sum.
 
+## Development & tests
+
+```bash
+uv pip install -e ".[dev]"   # pytest, pytest-cov, ruff, torch
+pytest                       # kernel correctness, cache, tool-calls, think-filter
+ruff check .                 # lint
+```
+
+Most tests run anywhere (the kernel tests compare against pure-MLX references). The numerical **parity** test against the HF PyTorch reference is opt-in: set `MLX_MOTIF_PARITY=<hf-checkpoint>` and `MLX_MOTIF_PARITY_MLX=<converted-mlx-checkpoint>` before running `pytest`. Swift tests run via `swift test --package-path swift` (add `MOTIFKIT_ENABLE_MLX=1 --filter MotifKitMLXTests` for the MLX overlay). CI layout is documented in [`docs/ci.md`](docs/ci.md).
+
 ## Codebase layout
 
 For where each module/test/script lives and what it does, see [`docs/codebase-tour.md`](docs/codebase-tour.md).
+
+**More docs:**
+
+- [`docs/blog-quantized-attention-on-m1-max.md`](docs/blog-quantized-attention-on-m1-max.md) — design narrative for the q4 attention path
+- [`docs/sdpa_dual_v_q4_design.md`](docs/sdpa_dual_v_q4_design.md) — kernel-level design notes for `sdpa_dual_v_q4`
+- [`docs/server-parity.md`](docs/server-parity.md) — Python vs Swift OpenAI-compatible server parity
+- [`docs/experiments/`](docs/experiments/README.md) — negative-result kernels (writeups + benches)
+- [`docs/benchmarks/`](docs/benchmarks/README.md) — certified benchmark sweeps and raw captures
+- [`docs/ci.md`](docs/ci.md) — CI lanes
+- Swift: [`swift/README.md`](swift/README.md), [`docs/swift-motif-roadmap.md`](docs/swift-motif-roadmap.md), [`docs/swift-app-smoke.md`](docs/swift-app-smoke.md), [`docs/swift-full-parity-followup.md`](docs/swift-full-parity-followup.md)
 
 ## Environment variables
 

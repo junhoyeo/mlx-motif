@@ -241,6 +241,144 @@ final class MotifMetalKernelsTests: XCTestCase {
         XCTAssertTrue(allClose(reference, candidate, rtol: 1e-3, atol: 1e-3).item(Bool.self))
     }
 
+    /// Item 1 acceptance: exercise `kvLen < capacity` through the PUBLIC fp16
+    /// wrapper. Full step-padded capacity buffers whose padding rows are POISON
+    /// (values large enough to blow up an unbounded softmax) must, when the live
+    /// length is passed as `kvLen`, produce output bit-close to the exact-length
+    /// reference computed over only the live region — proving the kernel indexes
+    /// by capacity stride but never reads past `kvLen`.
+    func testDualVApplyBoundsPaddedCapacityBuffersByKVLen() throws {
+        try requireMLXRuntime()
+        let scale: Float = 0.17677669
+        let liveLength = 3
+        let paddingRows = 5  // capacity = liveLength + paddingRows = 8 > liveLength
+        let q = MotifMetalKernelHarness.deterministicInput(shape: [1, 4, 1, 32])
+        let kLive = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, liveLength, 32])
+        let v1Live = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, liveLength, 32]) * 0.5
+        let v2Live = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, liveLength, 32]) * -0.25
+
+        // Poison the padding region: the padding KEYS repeat a real live key
+        // row (so they attend with an ordinary, finite softmax weight rather
+        // than being pushed to ~0 by an extreme score), while the padding VALUES
+        // are huge — so any unbounded read swamps the accumulator with poison V.
+        let keyPoison = repeated(kLive[.ellipsis, 0 ..< 1, 0...], count: paddingRows, axis: 2)
+        let valuePoison = MLXArray.ones([1, 2, paddingRows, 32]) * 1e3
+        let kFull = concatenated([kLive, keyPoison], axis: 2)
+        let v1Full = concatenated([v1Live, valuePoison], axis: 2)
+        let v2Full = concatenated([v2Live, valuePoison], axis: 2)
+
+        let reference = MotifSDPADualV.reference(
+            queries: q, keys: kLive, value1: v1Live, value2: v2Live, scale: scale
+        )
+        let bounded = MotifSDPADualV.apply(
+            queries: q,
+            keys: kFull,
+            value1: v1Full,
+            value2: v2Full,
+            scale: scale,
+            kvLen: liveLength,
+            executionMode: .metalPreferred
+        )
+        let unbounded = MotifSDPADualV.apply(
+            queries: q,
+            keys: kFull,
+            value1: v1Full,
+            value2: v2Full,
+            scale: scale,
+            executionMode: .metalPreferred
+        )
+        eval(reference, bounded, unbounded)
+
+        XCTAssertEqual(bounded.shape, reference.shape)
+        XCTAssertTrue(
+            allClose(reference, bounded, rtol: 1e-3, atol: 1e-3).item(Bool.self),
+            "kvLen must bound the kernel to the live region; poisoned padding must be ignored"
+        )
+        XCTAssertGreaterThan(
+            abs(unbounded - reference).max().item(Float.self),
+            1e-2,
+            "without the kvLen bound the poisoned padding must corrupt the output"
+        )
+    }
+
+    /// Item 1 acceptance for the packed q4 wrapper: full step-padded capacity
+    /// triples whose padding rows are poison must, when bounded by `kvLen`,
+    /// match the exact-length reference over only the live region.
+    func testPackedQ4DualVApplyBoundsPaddedCapacityTriplesByKVLen() throws {
+        try requireMLXRuntime()
+        let scale: Float = 0.17677669
+        let liveLength = 3
+        let paddingRows = 5
+        let q = MotifMetalKernelHarness.deterministicInput(shape: [1, 4, 1, 32])
+        let kLive = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, liveLength, 32])
+        let v1Live = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, liveLength, 32]) * 0.25
+        let v2Live = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, liveLength, 32]) * -0.125
+        // Padding keys repeat a real live key row (ordinary softmax weight);
+        // padding values are huge, so any unbounded read is swamped by poison V.
+        let keyPoison = repeated(kLive[.ellipsis, 0 ..< 1, 0...], count: paddingRows, axis: 2)
+        let valuePoison = MLXArray.ones([1, 2, paddingRows, 32]) * 1e3
+        let kFull = concatenated([kLive, keyPoison], axis: 2)
+        let v1Full = concatenated([v1Live, valuePoison], axis: 2)
+        let v2Full = concatenated([v2Live, valuePoison], axis: 2)
+
+        // Quantization groups along the last (channel) axis per row, so the live
+        // rows quantize bit-identically whether or not padding is appended.
+        func packed(_ x: MLXArray) -> MotifQuantizedTuple {
+            let q = quantized(x, groupSize: 32, bits: 4, mode: .affine)
+            return (q.wq, q.scales, q.biases)
+        }
+
+        // Exact-length reference: dequant + dual-V SDPA over the live rows only.
+        let reference = MotifSDPADualVQ4.reference(
+            queries: q,
+            quantizedKeys: packed(kLive),
+            quantizedValue1: packed(v1Live),
+            quantizedValue2: packed(v2Live),
+            scale: scale,
+            groupSize: 32,
+            bits: 4,
+            mode: .affine,
+            dtype: q.dtype
+        )
+        let bounded = MotifSDPADualVQ4.apply(
+            queries: q,
+            quantizedKeys: packed(kFull),
+            quantizedValue1: packed(v1Full),
+            quantizedValue2: packed(v2Full),
+            scale: scale,
+            groupSize: 32,
+            bits: 4,
+            mode: .affine,
+            dtype: q.dtype,
+            kvLen: liveLength,
+            executionMode: .metalPreferred
+        )
+        let unbounded = MotifSDPADualVQ4.apply(
+            queries: q,
+            quantizedKeys: packed(kFull),
+            quantizedValue1: packed(v1Full),
+            quantizedValue2: packed(v2Full),
+            scale: scale,
+            groupSize: 32,
+            bits: 4,
+            mode: .affine,
+            dtype: q.dtype,
+            executionMode: .metalPreferred
+        )
+        eval(reference, bounded, unbounded)
+
+        XCTAssertEqual(bounded.shape, reference.shape)
+        XCTAssertTrue(
+            allClose(reference, bounded, rtol: 1e-3, atol: 1e-3).item(Bool.self),
+            "kvLen must bound the packed kernel to the live region; poisoned padding must be ignored"
+        )
+        XCTAssertGreaterThan(
+            abs(unbounded - reference).max().item(Float.self),
+            1e-2,
+            "without the kvLen bound the poisoned padding must corrupt the packed output"
+        )
+    }
+
     func testPolynormBenchmarkHarnessRunsWithDefaultMetal() throws {
         try requireMLXRuntime()
         let benchmarkCase = try XCTUnwrap(

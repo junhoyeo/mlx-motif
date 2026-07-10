@@ -233,6 +233,13 @@ public final class MotifMLXAttentionScaffold: Module {
         let sequenceLength = x.dim(1)
         let keyGroups = layout.keyNoiseHeads ?? layout.keyValueHeads
         let offset = cache?.offset ?? 0
+        // Live KV length after this step's append (== cache.offset post-update
+        // for the 4-slot caches, and == the returned buffer length for the
+        // standard/dequant-bridge paths). The 4-slot update-and-fetch paths now
+        // return FULL step-padded capacity buffers, so the decode kernels are
+        // handed this as their runtime `kvLen` bound; reference/fallback
+        // consumers slice back to it. Mirrors Python `kv_seq = cache.offset`.
+        let liveKVLength = offset + sequenceLength
         let cacheKind = groupedCacheKind(cache)
         let attentionPath = MotifAttentionPathResolver.resolve(
             cacheKind: cacheKind,
@@ -343,14 +350,32 @@ public final class MotifMLXAttentionScaffold: Module {
                 value1: prepared.value1,
                 value2: prepared.value2
             )
-            slices = MotifGroupedProjectionSlices(
-                qOrigin: prepared.qOrigin,
-                qNoise: prepared.qNoise,
-                kOrigin: cached.kOrigin,
-                kNoise: cached.kNoise,
-                value1: cached.value1,
-                value2: cached.value2
-            )
+            // updateAndFetch4 now returns FULL step-padded capacity buffers. The
+            // .dualV decode kernel consumes them directly (bounded by
+            // kvLen == liveKVLength below), which skips the per-step
+            // ensure_row_contiguous copy of the live KV region. Every other
+            // consumer (the reference / fallback path) has no runtime length
+            // bound, so slice back to the live region for it. Mirrors Python
+            // _forward_grouped (src/mlx_motif/model.py).
+            if attentionPath == .dualV {
+                slices = MotifGroupedProjectionSlices(
+                    qOrigin: prepared.qOrigin,
+                    qNoise: prepared.qNoise,
+                    kOrigin: cached.kOrigin,
+                    kNoise: cached.kNoise,
+                    value1: cached.value1,
+                    value2: cached.value2
+                )
+            } else {
+                slices = MotifGroupedProjectionSlices(
+                    qOrigin: prepared.qOrigin,
+                    qNoise: prepared.qNoise,
+                    kOrigin: cached.kOrigin[.ellipsis, ..<liveKVLength, 0...],
+                    kNoise: cached.kNoise[.ellipsis, ..<liveKVLength, 0...],
+                    value1: cached.value1[.ellipsis, ..<liveKVLength, 0...],
+                    value2: cached.value2[.ellipsis, ..<liveKVLength, 0...]
+                )
+            }
         } else {
             k = rope(k, offset: offset)
             if let cache {
@@ -384,6 +409,7 @@ public final class MotifMLXAttentionScaffold: Module {
                 bits: grouped.bits,
                 mode: grouped.mode,
                 dtype: x.dtype,
+                kvLen: liveKVLength,
                 executionMode: kernelExecutionMode
             )
             let attnNoise = MotifSDPADualVQ4.apply(
@@ -396,6 +422,7 @@ public final class MotifMLXAttentionScaffold: Module {
                 bits: grouped.bits,
                 mode: grouped.mode,
                 dtype: x.dtype,
+                kvLen: liveKVLength,
                 executionMode: kernelExecutionMode
             )
             out = MotifGDAPostSplit.apply(
@@ -421,6 +448,7 @@ public final class MotifMLXAttentionScaffold: Module {
                 value2: slices.value2,
                 scale: scale,
                 mask: mask,
+                kvLen: liveKVLength,
                 executionMode: kernelExecutionMode
             )
             let attnNoise = MotifSDPADualV.apply(
@@ -430,6 +458,7 @@ public final class MotifMLXAttentionScaffold: Module {
                 value2: slices.value2,
                 scale: scale,
                 mask: mask,
+                kvLen: liveKVLength,
                 executionMode: kernelExecutionMode
             )
             out = MotifGDAPostSplit.apply(

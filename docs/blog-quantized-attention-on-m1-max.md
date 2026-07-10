@@ -30,9 +30,11 @@ The new path skips that:
 ```
 cache.update_and_fetch_4_quantized(...)
   → returns raw quantized triples (data: uint32, scales: T, biases: T)
-sdpa_dual_v_q4(q, k_q, v1_q, v2_q, scale, group_size, bits)
+sdpa_dual_v_q4(q, k_q, v1_q, v2_q, scale, group_size, bits, kv_len)
   → bit-extract + dequant inline in registers, never materialized
 ```
+
+*(Snippet shows the current shipped signature: `kv_len` and the full-capacity buffer contract were added in a later dispatch rework — see the July 2026 update at the end of this post. Everything else in this section is as originally shipped.)*
 
 ## The path was straight, the surprises weren't
 
@@ -258,7 +260,7 @@ Decode-time MLP at the Motif 12.7B shape (4096↔16384) appears to be **Pareto-o
 
 The remaining doors that *might* still open:
 - **Architectural changes**: smaller `intermediate_size` with more layers, mixture-of-experts, etc. — out of scope for an inference port.
-- **Speculative decoding with a tiny draft model**: if the draft is fast enough, the target's MLP cost matters less per accepted token. The 2.6B → 12.7B draft already wires up but accept rate isn't high enough. Sub-1B Motif draft would help.
+- **Speculative decoding with a tiny draft model**: if the draft is fast enough, the target's MLP cost matters less per accepted token. The 2.6B → 12.7B draft already wires up but accept rate isn't high enough. Sub-1B Motif draft would help. *(Update, July 2026: the Swift speculative decoder was later reimplemented with real batched verification — see the update at the end of this post. The sub-1B-draft conclusion stands.)*
 - **Different chips**: M3/M4 with shifted compute/bandwidth ratios may flip both directions back to wins. Worth re-running both negative-result kernels on a different chip before considering them dead.
 
 So the candid update is: the MLP didn't have an easy lever on this hardware. The earlier "+6-10% from gate+up fusion" estimate was wrong because L1 was already doing the work the fusion was supposed to do.
@@ -266,3 +268,19 @@ So the candid update is: the MLP didn't have an easy lever on this hardware. The
 That itself is the lesson — **on a well-tuned modern matmul library, the obvious shared-resource fusions often don't win because the cache is already eating that reuse for free.** The wins on attention were in places MLX *wasn't* covering (the dual-V shape, the quantized-input reads). For MLP, MLX covers the obvious shapes, so wins require either non-obvious tricks (still searching) or stepping outside the kernel-only design space (architecture, draft models, hardware).
 
 The lesson stands, but with an addendum: on Apple Silicon, **attention is the loud part, MLP is the heavy part — but the heavy part is also tighter to optimize because MLX has been tuned for it.**
+
+## Update (July 2026)
+
+Everything above is preserved as written; the benchmark numbers are historical measurements of the code as it existed then. A later optimization round changed how these kernels are *dispatched and fed* — the kernel math is untouched, but two systematic costs around it were found and removed, plus one embarrassing confession about methodology.
+
+**1. The per-token Metal recompile the microbench couldn't see.** The original kernels baked the KV length into the Metal template (`KV_SEQ` as a compile-time constant). `mx.fast.metal_kernel` JIT-compiles one variant per unique template tuple — and decode grows KV by one every token, so *every generated token* presented a never-before-seen template and paid a fresh Metal compile. Measured on M1 Max (mlx 0.31.2): a call at a previously-unseen KV length cost 53–99 ms; the same call at a seen length, ~0.35 ms. The microbench methodology in this post — "min of 10 trials × 64 batched calls" at a *fixed* KV — reuses the compiled variant after the first call, so this cost was structurally invisible to every table above. The per-call ratios (q4 vs dequant-bridge) remain valid; the absolute per-token production cost was dominated by compiles the tables never measured. The fix moved the KV length to a runtime `int32` input (only dtype/D/GQA/bits/group-size stay as template parameters); a previously-unseen length now costs ~1.7 ms median, statistically identical to a zero-compile control. Add this to the "what I'd do differently" list: **bench the dispatch path with the access pattern production has (a new KV length every call), not just steady-state repeats.**
+
+**2. The hidden copy in `ensure_row_contiguous`.** The kernels were fed exact-length slices of the step-padded cache (`[..., :offset, :]`), which are not row-contiguous — so MLX inserted a contiguous copy of K, V1, and V2 before every launch (V slabs twice, since the origin and noise calls are separate). That's O(live-context) copy traffic per layer per token, paid in exactly the packed bytes this kernel exists to keep small. The caches now return their full row-contiguous capacity buffers and the kernels bound their KV loop by the runtime `kv_len` (hence the signature change flagged in the snippet above).
+
+**3. The shape contract is now enforced.** The "per-lane group_idx is correct only if `qk_per_thread ≤ EL_PER_INT`" assumption documented in the design notes was a comment, not a check — a D=256/q8 input would have shifted a `uint32` by up to 56 bits (undefined in Metal) and returned silent garbage. It's now an assert in the Python wrapper and a guard in the Swift port (which falls back to its reference path).
+
+**4. Quantized cache writes are batched.** The write side used to issue four separate `mx.quantize` dispatches (one per K/V slot) plus twelve tiny slice-writes per layer per token. The four same-shape slots are now concatenated along the head axis and quantized in a single dispatch — bit-identical per head, since MLX quantization groups run along the channel axis.
+
+**5. Speculative decoding got its real implementation.** The "already wires up but accept rate isn't high enough" line above described a version that still ran one target forward per token. The Swift decoder now does real batched verification: persistent draft KV cache, one `[1, K+1]` target forward per cycle, longest-matching-prefix acceptance, `trim()` rollback. Measured on the real 2.6B q4 checkpoint (self-draft): 46 tokens in 10 target forwards. Greedy-only, and no wall-clock speedup is claimed — with draft == target the draft cost cancels the win. The conclusion in the survey section is unchanged: the sub-1B draft model is still the missing piece.
+
+None of this changes the post's central claim — the win lives in reading packed bytes and in shapes MLX doesn't cover — but items 1 and 2 are a sharper version of the same lesson: **on this stack, the costs around the kernel (JIT dispatch, layout-driven copies) can dwarf the costs inside it, and a microbench that holds the access pattern fixed will hide exactly those.**

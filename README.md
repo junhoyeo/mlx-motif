@@ -6,35 +6,55 @@ The canonical [MLX](https://github.com/ml-explore/mlx) port of [Motif Technologi
 
 Motif's flagship LLMs combine **Grouped Differential Attention** ([2510.06949](https://arxiv.org/abs/2510.06949) / [2410.05258](https://arxiv.org/abs/2410.05258)) with the **PolyNorm** activation ([2411.03884](https://arxiv.org/abs/2411.03884)). Neither primitive ships in mlx-lm. This repo implements both natively in MLX, with a stack of custom Metal kernels that beats `mx.fast.scaled_dot_product_attention` on the differential-attention path — plus a full native Swift/macOS port (chat app, servers, CLIs) that runs the same kernels through MLX-Swift.
 
+**Contents:**
+[Headline numbers](#headline-numbers) ·
+[Status](#status) ·
+[Install](#install) ·
+[Quickstart](#quickstart) ·
+[Server](#openai-compatible-server) ·
+[Swift app](#swift--native-macos-app) ·
+[Architecture](#architecture) ·
+[Metal kernels](#the-custom-metal-kernels) ·
+[Prefill fast path](#prefill--vanilla-fast-path) ·
+[Speculative decoding](#speculative-decoding) ·
+[Development](#development--tests) ·
+[Env vars](#environment-variables) ·
+[Negative results](#what-we-tried-that-didnt-work-negative-results) ·
+[Limitations & roadmap](#limitations--roadmap)
+
 ## Headline numbers
 
-Motif-2-12.7B-Reasoning at 4-bit, M1 Max (32-core GPU, 64 GB), 5-run mean ± stdev:
+Motif-2-12.7B-Reasoning at 4-bit, M1 Max (32-core GPU, 64 GB), 5 measurement runs after 3 warmup runs, same Python session for A/B fairness, mean ± stdev:
 
 | Prompt length | mlx-lm-only baseline¹ | with custom kernels | speedup |
 |---|---|---|---|
 | 5 tokens (short)   | 34.70 ± 0.06 tok/s | **40.64 ± 0.15 tok/s** | **+17%** |
+| 164 tokens (med)   | ~30 tok/s          | ~37 tok/s              | ~+23% |
 | 800 tokens (long)  | 21.56 ± 0.05 tok/s | **34.71 ± 0.08 tok/s** | **+61%** |
 | 3.2k tokens (xlong)| ~14 tok/s²         | **24.02 ± 0.17 tok/s** | **+71%** |
 
 ¹ With `MLX_MOTIF_DUAL_V=0` (stacked-SDPA fallback path).
 ² Estimated; full A/B at 3.2k took prohibitively long with the slow path.
 
-These are the certified sweeps from [`docs/benchmarks/`](docs/benchmarks/README.md); they predate the July 2026 dispatch/cache-fetch rework described below, which removes further fixed overhead from the decode hot path.
+**The win compounds with context length.** Attention is ~10% of decode time at 64 KV tokens but grows linearly while MLP stays fixed; the custom path saves attention time specifically. These are the certified sweeps from [`docs/benchmarks/`](docs/benchmarks/README.md); they predate the July 2026 dispatch/cache-fetch rework described below, which removes further fixed overhead from the decode hot path.
 
 On the grouped-differential **Motif-2-12.7B-Reasoning q4** checkpoint, greedy output is **byte-identical** between the in-tree kernel and reference (`MLX_MOTIF_DISABLE_KERNELS=1`) decode paths — verified end-to-end on real Motif weights (prompt `"Once upon a time"`, 32 tokens; also checked at 48/96 tokens). This parity is **checkpoint-specific**, not universal: on the smaller **2.6B** vanilla-attention checkpoint the two paths diverge within a couple of greedy tokens (default `"in a small village, there was…"` vs kernels-off `"there was a little girl…"`), because the custom kernels and the stock reference path accumulate their float reductions in different orders and the low-order-bit differences can flip the argmax on that architecture. Both comparisons use the default fp16 KV cache; the lossy q4/q8 4-slot cache is expected to differ and is out of scope for this claim. Numerical parity against the HuggingFace PyTorch reference is **not** independently verified; the 12.7B-q4 quality is checked via perplexity (`scripts/perplexity.py`) instead — see [`docs/benchmarks/`](docs/benchmarks/README.md#127b-reasoning-q4-perplexity).
 
 ## Status
 
-**Shipped:**
+Shipped and tested on `main`:
+
 - HF→MLX converter with mixed-precision quantization presets (`uniform | mixed | mlp_lowbit`)
 - Custom Metal kernels: fused PolyNorm, GDA-post, shared-QK dual-V SDPA (`sdpa_dual_v`), and a quantized-input variant (`sdpa_dual_v_q4`) that reads the packed q4/q8 KV cache directly — all with runtime-length dispatch (no per-token Metal recompiles) and full-capacity contiguous cache fetches (no per-step copy of the live KV region)
 - 4-slot KV cache (fp16 / q4 / q8) with single-dispatch batched quantized writes
-- Fast-path prefill and vanilla attention via per-slab native-GQA SDPA (no head-repeat materialization, hits MLX's fast attention templates)
-- Speculative decoding with real batched verification (persistent draft KV cache, one `[1, K+1]` target forward per cycle, greedy-lossless)
-- OpenAI-compatible server with `<think>` streaming modes and prompt-based tool calling
-- Native Swift/macOS stack: SwiftUI chat app with cross-turn KV-cache reuse (EOS-reconciled), `MotifKit` runtime layer, `MotifKitMLX` overlay porting the decoder + Metal kernels to MLX-Swift, and native CLIs (`MotifNativeGenerate`, `MotifNativeEvaluate`, `MotifNativeServe`, `MotifDecodeBench`) — see [`swift/`](swift/README.md)
+- Fast-path prefill and vanilla attention via per-slab native-GQA SDPA (no head-repeat materialization)
+- Speculative decoding with real batched verification (persistent draft KV cache, one `[1, K+1]` target forward per cycle) — lossless for greedy *and* sampled decoding (rejection sampling)
+- OpenAI-compatible server with `<think>` streaming modes and prompt-based tool calling, plus a bounded tool-**execution** loop (`run_tool_loop` + CLI demo with AST-whitelisted builtin tools)
+- Native Swift/macOS stack: SwiftUI chat app with cross-turn KV-cache reuse (EOS-reconciled), `MotifKit` runtime layer, `MotifKitMLX` overlay porting the decoder + Metal kernels to MLX-Swift, and native CLIs (`MotifNativeGenerate`, `MotifNativeEvaluate`, `MotifNativeServe` with OpenAI `tools` parity, `MotifDecodeBench`)
+- Both shipped checkpoints validated end-to-end at q4: 12.7B-Reasoning (kernels-on == kernels-off byte-identical, perplexity 12.365 recorded) and 2.6B
+- Self-hosted Apple-Silicon CI lane (build + GPU kernel tests on a registered M-series runner)
 
-**Open:** HF Hub release of converted checkpoints, multi-chip validation (M2/M3/M4), long-context end-to-end bench (16k+), Swift-side full-capacity cache fetch (kernels are ready; cache wiring pending), a sub-1B draft model to make speculative decoding win on wall-clock.
+What's *not* done lives in one place: [Limitations & roadmap](#limitations--roadmap).
 
 ## Install
 
@@ -85,7 +105,7 @@ mlx-motif convert --hf-path … --out ./out/u-q4 --quantize --bits 4 --group-siz
 mlx-motif convert --hf-path … --out ./out/mixed --quantize --quant-preset mixed --q-proj-bits 6 --bits 4
 
 # mlp_lowbit: push MLP projections to --mlp-bits/--mlp-group-size, rest at --bits/--group-size
-#   (memory ↓25%, speed −31%, PPL +10% — see docs/experiments/experiment-mlp-lowbit.md)
+#   (memory ↓25%, speed −31%, PPL +10% — a documented trade-off, opt-in only)
 mlx-motif convert --hf-path … --out ./out/lowbit --quantize --quant-preset mlp_lowbit --mlp-bits 3 --mlp-group-size 32
 ```
 
@@ -118,16 +138,18 @@ The server accepts the OpenAI `tools` / `tool_choice` fields, implemented as **p
 1. A deterministic system preamble is prepended describing each tool and instructing the model to emit a single `{"tool_call": {"name", "arguments"}}` JSON object.
 2. The output is buffered (not streamed delta-by-delta, since the small model tends to loop the object), and the **first** valid balanced-JSON tool call is extracted and returned as an OpenAI `tool_calls` chunk. If no tool call is emitted, the buffered text is flushed as normal content.
 
-`tool_choice: "none"` suppresses tools; `auto`/`required` behave like the default prompt. This is a pragmatic compatibility shim, not model-native function calling — treat it accordingly. Tool **execution** is the client's job, matching OpenAI semantics.
+`tool_choice: "none"` suppresses tools; `auto`/`required` behave like the default prompt. This is a pragmatic compatibility shim, not model-native function calling — treat it accordingly. For the **server**, tool execution is the client's job, matching OpenAI semantics; the native Swift server (`MotifNativeServe`) accepts the same `tools` field, injects a byte-identical preamble (locked by a cross-language golden fixture), and returns OpenAI-shaped `tool_calls` with `finish_reason: "tool_calls"`.
+
+For local use there is also a bounded tool-**execution** loop: `run_tool_loop(...)` in [`tool_calls.py`](src/mlx_motif/tool_calls.py) generates → parses the tool call → invokes a caller-supplied executor → appends the result as a `tool` turn → regenerates, capped at `max_rounds`, with executor exceptions surfaced as tool error messages rather than crashes. The CLI demo (`mlx-motif tools-demo`) ships two safe builtins — current time and an AST-whitelisted arithmetic evaluator (no `eval`/`exec`, numeric literals and operators only, capped exponents).
 
 ## Swift / native macOS app
 
-A native macOS stack lives under [`swift/`](swift/README.md):
+A native macOS stack lives under [`swift/`](swift/):
 
 - **`MotifChatApp`** — SwiftUI chat app with markdown rendering, conversation history, context-budget trimming, Liquid Glass chrome (macOS 26), and **cross-turn KV-cache reuse**: the backend and its KV cache persist across turns, re-prefilling only the token suffix that changed (reuse is reconciled after EOS-terminated turns so cache offsets always match the recorded tokens).
 - **`MotifKit`** — runtime layer with an OpenAI-compatible bridge and `<think>` filtering that mirrors the Python server.
-- **`MotifKitMLX`** (gated by `MOTIFKIT_ENABLE_MLX=1`) — the Motif decoder and custom Metal kernels ported to MLX-Swift, including QKV fusion (originals released after fusing), native-GQA kernel dispatch, runtime-length kernels, generation-loop cancellation, and GPU cache-limit configuration.
-- Native CLIs: `MotifNativeGenerate` (incl. `--speculative`), `MotifNativeEvaluate` (perplexity via fused log-softmax), `MotifNativeServe`, `MotifDecodeBench`.
+- **`MotifKitMLX`** (gated by `MOTIFKIT_ENABLE_MLX=1`) — the Motif decoder and custom Metal kernels ported to MLX-Swift, including QKV fusion (originals released after fusing), native-GQA kernel dispatch, runtime-length kernels with full-capacity cache fetches, generation-loop cancellation, and GPU cache-limit configuration.
+- Native CLIs: `MotifNativeGenerate` (incl. `--speculative`), `MotifNativeEvaluate` (perplexity via fused log-softmax), `MotifNativeServe` (OpenAI-compatible, incl. `tools`), `MotifDecodeBench`.
 
 ```bash
 # Default lightweight build (talks to `mlx-motif serve` over /v1)
@@ -138,7 +160,7 @@ swift build --package-path swift --target MotifChatApp
 MOTIFKIT_ENABLE_MLX=1 swift run --package-path swift MotifChatApp
 ```
 
-The Swift MLX path reads the same `MLX_MOTIF_*` feature flags as the Python path. See [`swift/README.md`](swift/README.md) for the full workflow and [`docs/server-parity.md`](docs/server-parity.md) for how the two servers line up.
+The Swift MLX path reads the same `MLX_MOTIF_*` feature flags as the Python path.
 
 ## Architecture
 
@@ -175,7 +197,7 @@ x  ─→  RMSNorm  ─→  qkv_proj  ─→  split (q | k | v)
                        └─→  o_proj  ─→  + residual  ─→  RMSNorm  ─→  MLP  ─→  + residual
 ```
 
-The cache hands the kernels its **full step-padded capacity buffers** plus the live length (`kv_len = cache.offset`); the kernels bound their KV loop at `kv_len` and stride rows by the buffer capacity. Prefill (S > 1) takes a separate fast path — see below.
+The cache hands the kernels its **full step-padded capacity buffers** plus the live length (`kv_len = cache.offset`); the kernels bound their KV loop at `kv_len` and stride rows by the buffer capacity. Prefill (S > 1) takes a separate fast path — see [Prefill & vanilla fast path](#prefill--vanilla-fast-path).
 
 ## The custom Metal kernels
 
@@ -188,7 +210,7 @@ Two properties of the decode hot path (landed July 2026) matter as much as the k
 - **Runtime KV length, static templates.** The kernels take the live KV length as a runtime `int32` input, not a Metal template constant. Template parameters are only the genuinely-static ones (dtype, head dim, GQA factor, bits, group size). This matters because `mx.fast.metal_kernel` JIT-compiles one Metal variant per unique template tuple — and decode grows the KV length by 1 every token. With the length baked into the template, **every generated token paid a fresh ~50–100 ms Metal compile**; with runtime length, the same call is ~1.7 ms (kernel microbench, M1 Max, mlx 0.31.2: fresh-KV-length call 53–99 ms before vs 1.7 ms median after, statistically identical to a zero-compile control).
 - **Full-capacity contiguous fetches.** `mx.fast.metal_kernel` defaults to `ensure_row_contiguous=True`, and an exact-length slice `[..., :offset, :]` of a step-padded cache buffer is *not* row-contiguous — so every kernel launch silently copied the entire live KV region (V slabs twice, since origin and noise calls are separate). The caches therefore return their full row-contiguous capacity buffers, and consumers bound reads by `cache.offset` (kernels via `kv_len`; non-kernel paths by slicing back).
 
-The Swift kernels implement the same runtime-length contract; wiring the Swift *caches* to full-capacity fetches is the one remaining piece (tracked in **Open** above).
+The Swift port implements the same contract end-to-end: its kernels take the runtime KV length and its caches return full-capacity buffers, with the `kv_len < capacity` path locked by poisoned-padding tests through the public wrappers.
 
 ### `sdpa_dual_v` — the headline kernel
 
@@ -222,12 +244,14 @@ Same algorithm and threadgroup layout as `sdpa_dual_v`, but `K`, `V1`, `V2` are 
 
 (At KV ≤ 800 the dispatch overhead from 9 input buffers makes it borderline-or-slower than the dequant path; only the long-context regime wins.)
 
-**Key implementation tricks** (see `docs/sdpa_dual_v_q4_design.md` and the `_SDPA_DUAL_V_Q4_SRC` source):
+**Key implementation tricks** (see the `_SDPA_DUAL_V_Q4_SRC` source):
 - **MLX qdot trick** for the QK side: precompute `q_pre[j] = scale * q[j] / 2^(shift_base + j*BITS)` once per lane, then in the kv loop the K nibble at position `j` — appearing in the packed word as `nibble * 2^(shift_base + j*BITS)` after a mask-without-shift — multiplied by `q_pre[j]` gives the correctly-weighted partial dot. Saves one shift per channel per kv step (the K side is shift-free in the inner loop). Borrowed from MLX's `qdot` helper in `mlx/backend/metal/kernels/quantized.h`.
 - **Per-lane K mask LUT** computed once outside the loop: 4 `uint32` masks → in-place mask + cast-to-float + multiply-and-add, no shifts.
 - **Enforced shape contract**: a lane's channels must all live in the single packed word it loads (`qk_per_thread ≤ group_size` and `qk_per_thread ≤ EL_PER_INT`, i.e. `D/32 ≤ 32/bits`). This is asserted in the Python wrapper and guarded in the Swift dispatcher (out-of-contract shapes fall back to the reference path) — shapes like D=256/q8 would otherwise shift a `uint32` by ≥ 32 bits (UB in Metal) and return silent garbage. Ships with `D=128, group_size ∈ {32, 64, 128}, bits ∈ {4, 8}`, which satisfy it.
 - **Same -1e30f sentinel** as `sdpa_dual_v` — `metal::fast::exp(-INF − finite) = NaN` on Apple GPUs.
 - **Bit-extract probe** (`tests/test_dequant_probe.py`) locks down the 4/8-bit unpack against `mx.dequantize` standalone, so a future correctness regression in the full kernel can be triaged in isolation.
+
+The quantized cache this kernel reads saves ~15% peak memory at 3.2k context and originally cost 12% decode speed via dequant-bridge fetch — with the kernel reading it directly it's net-positive on both axes (per-call 27-43% faster than dequant→fp16 at KV ∈ [1024, 16384]; e2e on real Motif: +18% at 3k prompt vs the same cache's dequant path). Its write path batches all four slots into a **single `mx.quantize` dispatch per token** (head-axis concat, bit-identical to per-slot quantization).
 
 ### `gda_post_split` — fused post-attention reduction
 
@@ -237,11 +261,40 @@ Reads `attn_origin` and `attn_noise` as **separate** buffers, broadcasts noise v
 
 Single-pass `polynorm(x) = w0·norm(x³) + w1·norm(x²) + w2·norm(x) + b`. Each threadgroup processes one row, computes the three power-means via simdgroup reductions, then writes the linear combination.
 
+### Load-time model surgeries
+
+Two weight transforms applied by `Model.fuse_qkv()` (called by `mlx_motif.load(..., fuse_qkv=True)`; the Swift port applies the same fusion and **releases the original q/k/v projections afterwards** so attention-projection memory isn't doubled):
+
+**QKV projection fusion (+10% on the matmul).** Concatenates `q_proj`, `k_proj`, `v_proj` weights along the output axis into one `qkv_proj` of shape `(in=4096, out=q+k+v=9216)`. Hits MLX's quantized matmul sweet spot — a single fused matmul is faster than three smaller ones:
+
+| Path | Per-layer matmul cost (M1 Max, q4) |
+|---|---|
+| 3 separate q4 linears (q + k + v) | 320 µs |
+| 1 fused q4 linear + 3-way `mx.split` | **287 µs** (-10%) |
+
+On the Swift side, fused-vs-unfused logit equivalence (including the q4 path) is gated by `MotifQKVFusionParityTests`. Speed evidence: the synthetic decode micro-benchmark (`MotifDecodeBench`, q4 gs=64, B=1, S=1) shows ~12-20% lower median ms/step at the 12.7B per-layer shape with fusion ON — a synthetic-weights per-decode-step measurement on one machine, **not** an end-to-end tok/s number. Corroborated by an earlier real-checkpoint sweep (1.05×@p500 / 1.20×@p3000 on a converted 12.7B q4); end-to-end re-validation on the target checkpoint is still recommended before release.
+
+**Origin-first Q row permutation.** The HF stripe layout `[g0_o1, g0_o2, ..., g0_o4, g0_n, g1_o1, ...]` forces the per-step `q1`/`q2` split into a stride-pattern reshape that materializes a copy. `fuse_qkv()` permutes Q rows to `[origin..origin | noise..noise]` so the split becomes a contiguous-axis slice (zero-copy view). Architecturally cleaner; no measurable end-to-end delta because MLX's lazy graph absorbs the strided-reshape copy in the chain.
+
+### Per-op decode profile
+
+Where a decode step's time goes after all of the above (M1 Max, 12.7B-q4, isolated microbench):
+
+| Op | Cost | Share |
+|---|---|---|
+| qkv_proj 4096→9216 (q4, fused) | 287 µs | 9% |
+| sdpa_dual_v (KV=256, 32+8 split) | ~282 µs | 9% |
+| o_proj 8192→4096 (q4) | 437 µs | 14% |
+| mlp gate 4096→16384 (q4) | 522 µs | 17% |
+| mlp up   4096→16384 (q4) | 522 µs | 17% |
+| mlp down 16384→4096 (q4) | 584 µs | 18% |
+| RMSNorm × 2, polynorm, gda_post_split, residuals | rest | ~16% |
+
+Note: isolated microbench ≠ in-chain time. MLX's lazy graph fuses many of these; chained per-layer time is roughly half the sum. The MLP block dominates (~52%), which is why further attention-side kernel work has diminishing end-to-end returns — and why the MLP fusion attempts below were worth trying (and worth documenting when they lost).
+
 ### Variants we tried and removed
 
-Several kernels and design alternatives were built, measured, and ultimately did not ship — single-pass dual-V beat 2-pass at every tested KV, `polynorm_mul` lost to the lazy-graph chain fusion, `qmv_dual_q4` lost because `x` was already in L1, and `gda_decode` flash hit the M1 Max register-pressure cap. They're all written up with snippets + benches + "when this might win" notes in [`docs/experiments/`](docs/experiments/) — useful priors before re-trying any of them on different hardware.
-
-The one variant that's still wired up (with a documented trade-off) is the 4-bit quantized KV cache: `MotifGroupedQuantizedKVCache` saves ~15% peak memory at 3.2k context, originally cost 12% decode speed via dequant-bridge fetch, and is now net-positive on both axes thanks to the **`sdpa_dual_v_q4` kernel reading it directly** — beats the dequant→fp16 path by 27-43% per-call at KV ∈ [1024, 16384] (e2e on real Motif: +18% at 3k prompt vs the same cache's dequant path). Its write path batches all four slots into a **single `mx.quantize` dispatch per token** (head-axis concat, bit-identical to per-slot quantization).
+Several kernels and design alternatives were built, measured, and ultimately did not ship — single-pass dual-V beat 2-pass at every tested KV, `polynorm_mul` lost to the lazy-graph chain fusion, `qmv_dual_q4` lost because `x` was already in L1, and `gda_decode` flash hit the M1 Max register-pressure cap. See [the negative-results table](#what-we-tried-that-didnt-work-negative-results) — useful priors before re-trying any of them on different hardware.
 
 ## Prefill & vanilla fast path
 
@@ -263,54 +316,9 @@ End-to-end on the real 2.6B q4 checkpoint, greedy output is token-identical to t
 
 `MotifSpeculativeEngine` (Swift, `MotifNativeGenerate --speculative`) implements real speculative decoding: a persistent draft KV cache proposes K tokens per cycle, the target verifies them in a **single batched `[1, K+1]` forward** against its own persistent cache, the longest matching prefix is accepted, and both caches `trim()` past the first mismatch. Greedy output is exactly the target's greedy continuation (gated by an exact-equivalence test against plain decode).
 
-Measured on the real 2.6B q4 checkpoint (self-draft, debug build): 46 tokens generated in **10 target forwards** (37/40 drafts accepted). That proves the forward-count reduction; **no wall-clock speedup is claimed** — with draft == target the draft cost cancels the win, and the 2.6B→12.7B pairing isn't aggressive enough on M1 Max. A sub-1B Motif draft model is the missing piece. Temperature > 0 currently throws (`greedyOnly`) rather than silently sampling non-losslessly.
+Sampled decoding (temperature > 0) is supported **losslessly** via standard rejection sampling (Leviathan/Chen): a draft token `x` is accepted with probability `min(1, p(x)/q(x))`; on rejection the token is resampled from the normalized residual `max(0, p − q)`, so the output distribution equals plain target sampling exactly. Self-draft acceptance ≈ 1 (38/38 in the gate test, since `p == q`) and seeded runs are deterministic.
 
-## Model surgeries
-
-Two transforms applied at load time (in `Model.fuse_qkv()`, called by `mlx_motif.load(..., fuse_qkv=True)`; the Swift port applies the same fusion and **releases the original q/k/v projections afterwards** so attention-projection memory isn't doubled):
-
-### QKV projection fusion (+10% on the matmul)
-
-Concatenates `q_proj`, `k_proj`, `v_proj` weights along the output axis into one `qkv_proj` of shape `(in=4096, out=q+k+v=9216)`. Hits MLX's quantized matmul sweet spot — single fused matmul is faster than three smaller ones.
-
-| Path | Per-layer matmul cost (M1 Max, q4) |
-|---|---|
-| 3 separate q4 linears (q + k + v) | 320 µs |
-| 1 fused q4 linear + 3-way `mx.split` | **287 µs** (-10%) |
-
-### Origin-first Q row permutation
-
-The HF stripe layout `[g0_o1, g0_o2, ..., g0_o4, g0_n, g1_o1, ...]` forces the per-step `q1`/`q2` split into a stride-pattern reshape that materializes a copy. `fuse_qkv()` permutes Q rows to `[origin..origin | noise..noise]` so the split becomes a contiguous-axis slice (zero-copy view). Architecturally cleaner; no measurable end-to-end delta because MLX's lazy graph absorbs the strided-reshape copy in the chain.
-
-## Benchmarks
-
-All numbers from M1 Max, 64 GB, 12.7B-Reasoning q4, 5 measurement runs after 3 warmup runs, same Python session for A/B fairness:
-
-```
-                      MLX-only baseline        with custom kernels       speedup
-short prompt (5 tok)   34.70 ± 0.06 tok/s     40.64 ± 0.15 tok/s         +17%
-med   prompt (164)     ~30 tok/s              ~37 tok/s                  ~+23%
-long  prompt (800)     21.56 ± 0.05 tok/s     34.71 ± 0.08 tok/s         +61%
-xlong prompt (3204)    14 tok/s (estimate)    24.02 ± 0.17 tok/s         +71%
-```
-
-**The win compounds with context length.** Attention is ~10% of decode time at 64 KV tokens but grows linearly while MLP stays fixed. Our custom path saves attention time specifically.
-
-### Per-op profile after all optimizations (M1 Max, isolated microbench)
-
-| Op | Cost | Share |
-|---|---|---|
-| qkv_proj 4096→9216 (q4, fused) | 287 µs | 9% |
-| sdpa_dual_v (KV=256, 32+8 split) | ~282 µs | 9% |
-| o_proj 8192→4096 (q4) | 437 µs | 14% |
-| mlp gate 4096→16384 (q4) | 522 µs | 17% |
-| mlp up   4096→16384 (q4) | 522 µs | 17% |
-| mlp down 16384→4096 (q4) | 584 µs | 18% |
-| RMSNorm × 2, polynorm, gda_post_split, residuals | rest | ~16% |
-
-Note: isolated microbench ≠ in-chain time. MLX's lazy graph fuses many of these; chained per-layer time is roughly half the sum.
-
-There's also a one-command end-to-end harness — `scripts/eval_smoke.py` — that runs generation + perplexity against a converted checkpoint and prints a compact report.
+Measured on the real 2.6B q4 checkpoint (self-draft, debug build): 46 tokens generated in **10 target forwards** (37/40 drafts accepted). That proves the forward-count reduction; **no wall-clock speedup is claimed** — with draft == target the draft cost cancels the win. A small (sub-1B) Motif draft model is the missing piece for a wall-clock win.
 
 ## Development & tests
 
@@ -320,33 +328,19 @@ pytest                       # kernel correctness, cache, attention equivalence,
 ruff check .                 # lint
 ```
 
-Most tests run anywhere (the kernel tests compare against pure-MLX references; the attention-equivalence suite locks the fast paths against verbatim reproductions of the previous implementations). The numerical **parity** test against the HF PyTorch reference is opt-in: set `MLX_MOTIF_PARITY=<hf-checkpoint>` and `MLX_MOTIF_PARITY_MLX=<converted-mlx-checkpoint>` before running `pytest`.
+Most tests run anywhere (the kernel tests compare against pure-MLX references; the attention-equivalence suite locks the fast paths against verbatim reproductions of the previous implementations). The numerical **parity** test against the HF PyTorch reference is opt-in: set `MLX_MOTIF_PARITY=<hf-checkpoint>` and `MLX_MOTIF_PARITY_MLX=<converted-mlx-checkpoint>` before running `pytest`. `scripts/eval_smoke.py` is the one-command end-to-end harness (generation + perplexity against a converted checkpoint).
 
-Swift tests run via `swift test --package-path swift`. The MLX overlay's GPU suites (Metal-vs-reference kernel equivalence, QKV fusion parity, cache-reuse gates against a real checkpoint) need `MOTIFKIT_ENABLE_MLX=1 MOTIFKIT_RUN_MLX_RUNTIME_TESTS=1` plus the mlx metallib installed into the xctest bundle (`scripts/build_mlx_swift_metallib.sh`). CI layout is documented in [`docs/ci.md`](docs/ci.md).
-
-## Codebase layout
-
-For where each module/test/script lives and what it does, see [`docs/codebase-tour.md`](docs/codebase-tour.md).
-
-**More docs:**
-
-- [`docs/blog-quantized-attention-on-m1-max.md`](docs/blog-quantized-attention-on-m1-max.md) — design narrative for the q4 attention path
-- [`docs/sdpa_dual_v_q4_design.md`](docs/sdpa_dual_v_q4_design.md) — kernel-level design notes for `sdpa_dual_v_q4`
-- [`docs/server-parity.md`](docs/server-parity.md) — Python vs Swift OpenAI-compatible server parity
-- [`docs/experiments/`](docs/experiments/README.md) — negative-result kernels (writeups + benches)
-- [`docs/benchmarks/`](docs/benchmarks/README.md) — certified benchmark sweeps and raw captures
-- [`docs/ci.md`](docs/ci.md) — CI lanes
-- Swift: [`swift/README.md`](swift/README.md), [`docs/swift-motif-roadmap.md`](docs/swift-motif-roadmap.md), [`docs/swift-app-smoke.md`](docs/swift-app-smoke.md), [`docs/swift-full-parity-followup.md`](docs/swift-full-parity-followup.md)
+Swift tests run via `swift test --package-path swift`. The MLX overlay's GPU suites (Metal-vs-reference kernel equivalence, QKV fusion parity, cache-reuse gates against a real checkpoint) need `MOTIFKIT_ENABLE_MLX=1 MOTIFKIT_RUN_MLX_RUNTIME_TESTS=1` plus the mlx metallib installed into the xctest bundle (`scripts/build_mlx_swift_metallib.sh`).
 
 ## Environment variables
 
 | Variable | Default | Effect |
 |---|---|---|
-| `MLX_MOTIF_DUAL_V` | `1` | `0` disables `sdpa_dual_v` and uses the per-slab SDPA fallback (the kernel A/B baseline) |
-| `MLX_MOTIF_4SLOT_CACHE` | `0` | `1` = unquantized 4-slot cache; `q4` / `q8` = quantized 4-slot cache (single-dispatch batched writes). Combined with `MLX_MOTIF_QUANT_SDPA=1` (default) the q4/q8 path delivers per-call attention 27-43% faster than dequant→fp16 at KV ∈ [1024, 16384] (e2e on Motif 12.7B: +18% at 3k prompt vs same cache's dequant path). |
-| `MLX_MOTIF_QUANT_SDPA` | `1` | `0` disables `sdpa_dual_v_q4` and falls back to dequant-bridge fetch + `sdpa_dual_v` even when the cache is quantized |
-| `MLX_MOTIF_DISABLE_KERNELS` | `0` | `1` falls back to pure-MLX references for all kernels (correctness-only mode) |
-| `MLX_MOTIF_FUSE_QKV` (Swift) | `1` | QKV-projection fusion for the grouped q4 decode path. Defaults ON; `0`/`off` opts out. Numerical equivalence (fused == unfused logits, incl. the q4 path) is gated by `MotifQKVFusionParityTests` under `MOTIFKIT_RUN_MLX_RUNTIME_TESTS=1`. Speed: the synthetic decode micro-benchmark (`MotifDecodeBench`, q4 gs=64, B=1, S=1) shows ~12-20% lower median ms/step at the 12.7B per-layer shape with fusion ON — a synthetic-weights per-decode-step measurement on one machine, **not** an end-to-end tok/s number. This is corroborated by the earlier real-checkpoint sweep `docs/benchmarks/benchmark-sweep-qkv-fusion-20260527T112300Z.json` (1.05x@p500 / 1.20x@p3000 on a converted 12.7B q4); end-to-end re-validation on the target checkpoint is still recommended before release. |
+| `MLX_MOTIF_DUAL_V` | `1` | `0` disables `sdpa_dual_v`, using the per-slab SDPA fallback (the kernel A/B baseline) |
+| `MLX_MOTIF_4SLOT_CACHE` | `0` | `1` = fp16 4-slot cache; `q4` / `q8` = quantized 4-slot cache (see [the q4 kernel section](#sdpa_dual_v_q4--quantized-input-variant) for measured wins) |
+| `MLX_MOTIF_QUANT_SDPA` | `1` | `0` disables `sdpa_dual_v_q4`, falling back to dequant-bridge fetch + `sdpa_dual_v` even on a quantized cache |
+| `MLX_MOTIF_DISABLE_KERNELS` | `0` | `1` = pure-MLX reference paths for all kernels (correctness-only mode) |
+| `MLX_MOTIF_FUSE_QKV` (Swift) | `1` | `0`/`off` disables QKV-projection fusion (see [Load-time model surgeries](#load-time-model-surgeries) for the equivalence gate and speed evidence) |
 | `MLX_MOTIF_PARITY` | unset | path to HF checkpoint to enable the parity test |
 | `MLX_MOTIF_PARITY_MLX` | unset | path to converted MLX checkpoint for the parity test |
 
@@ -356,44 +350,41 @@ Every experiment — code snippet, bench numbers, root cause, and "when this mig
 
 | Idea | Status |
 |---|---|
-| `polynorm_mul` fused kernel | -7% e2e — [doc](docs/experiments/experiment-polynorm-mul.md) |
-| 2-pass dual-V SDPA | slower at every KV — [doc](docs/experiments/experiment-sdpa-dual-v-2pass.md) |
-| `qmv_dual_q4` fused gate+up GEMV | -9% to -77% — [doc](docs/experiments/experiment-qmv-dual-q4.md) |
-| `gda_decode` single-pass flash | ~2.7× slower (M1 Max register cap) — [doc](docs/experiments/experiment-gda-decode-flash.md) |
-| `mlp_lowbit` q3/gs=32 MLP preset | **kept** — memory ↓25%, speed -31%, PPL +10% — [doc](docs/experiments/experiment-mlp-lowbit.md) |
-| 4-slot quantized cache via dequant bridge | **superseded** by `sdpa_dual_v_q4` — [doc](docs/experiments/experiment-quant-kv-dequant-bridge.md) |
-| `mx.compile` MLP, fuse gate+up matmuls, concat q+k RoPE, single-call 40-head dual_v, composable q4 chain | [combined writeup](docs/experiments/experiment-not-landed.md) |
+| `polynorm_mul` fused kernel | -7% e2e |
+| 2-pass dual-V SDPA | slower at every KV |
+| `qmv_dual_q4` fused gate+up GEMV | -9% to -77% |
+| `gda_decode` single-pass flash | ~2.7× slower (M1 Max register cap) |
+| `mlp_lowbit` q3/gs=32 MLP preset | **kept** — memory ↓25%, speed -31%, PPL +10% |
+| 4-slot quantized cache via dequant bridge | **superseded** by `sdpa_dual_v_q4` |
+| `mx.compile` MLP, fuse gate+up matmuls, concat q+k RoPE, single-call 40-head dual_v, composable q4 chain | combined writeup in `docs/experiments/` |
 
 Negative-result code itself is **not in the codebase** — only the writeups, exact deleted-symbol provenance, and commit pointers. The docs keep the load-bearing snippets inline; full removed implementations are recoverable from git history with the file/symbol references in each experiment page.
 
-## Limitations / known issues
+## Limitations & roadmap
 
-- **Tested on M1 Max only.** The kernel constants (BN, BD, register footprint) are tuned for Apple7 / M1 Max. M2/M3/M4 may need re-tuning; haven't validated.
-- **Custom Metal kernels are decode-only (S=1).** Prefill uses the per-slab fast-path SDPA (MLX's stock fast templates with native GQA), which is a large improvement over the old stacked fallback but still not a bespoke prefill kernel.
-- **Swift caches still fetch exact-length slices.** The Swift kernels accept runtime `kv_len` + full-capacity buffers, but the cache wiring hasn't landed, so the Swift decode path still pays the per-step contiguity copy that Python eliminated.
-- **One model class verified end-to-end at q4.** bf16 unquantized path passes structural tests but no end-to-end generation bench.
-- **Parity verified at bf16, not q4.** Quantization adds noise that hasn't been numerically diffed against HF.
+Everything known-incomplete, in one list — caveats first, then planned work. (Each item appears only here.)
+
+**Caveats to know:**
+
+- **Tested on M1 Max only.** The kernel constants (BN, BD, register footprint) are tuned for Apple7 / M1 Max. M2/M3/M4 may need re-tuning; not validated.
+- **Custom Metal kernels are decode-only (S=1).** Prefill uses the per-slab fast-path SDPA (MLX's stock fast templates with native GQA) — a large improvement over the old stacked fallback, but not a bespoke prefill kernel.
+- **bf16 has no end-to-end bench, and HF parity is verified at bf16, not q4.** Both shipped checkpoints are validated end-to-end at q4 (the 12.7B additionally kernels-on == kernels-off byte-identical with recorded perplexity), but quantization noise hasn't been numerically diffed against the HF PyTorch reference.
 - **q4 KV-cache reuse is not byte-identical to a from-scratch prefill.** The `[1,1]` decode and `[1,n]` prefill kernels round differently in quantized arithmetic, so reused turns can diverge from a hypothetical fresh re-prefill in low-order bits. This is a property of batched-vs-incremental quantized kernels (present in every inference stack with prefix caching), not a bug; the achievable invariant — reuse == fresh *batched* reconstruction, bit-exact — is enforced by tests, including after EOS-terminated turns.
-- **Speculative decoding is greedy-only and wins on forward count, not (yet) wall clock.** Real batched verification is implemented and gated by exact-equivalence tests, but without a sub-1B draft model the draft cost eats the gain on M1 Max. Temperature > 0 throws rather than sampling non-losslessly.
-- **2.6B e2e peak memory rose ~130 MB** (3.76 → 3.89 GB at a 3.5k prompt) with the per-slab rework even though layer-level decode is much faster — cause not yet attributed.
+- **2.6B e2e peak memory rose ~130 MB** (3.76 → 3.89 GB at a 3.5k prompt) with the per-slab rework. Attributed and kept as a documented trade-off: reverting would save 119 MB at 3.5k but cost +369 MB at 6k and +755 MB at 8k context (bisection and crossover table in `docs/experiments/`).
+- **The vanilla V cache is slab-ordered** (`[a-heads | b-heads]`) — the ordering is stamped into the cache's `meta_state`, so restoring a slab-ordered state into code expecting HF order fails loudly, and an inverse-permutation helper recovers HF order when needed.
 
-## What's next
+**Roadmap, in order of expected payoff:**
 
-In order of expected payoff — contributions welcome:
+1. **HF Hub upload** of the converted MLX checkpoints (`mlx-community/Motif-2-12.7B-Reasoning-MLX-q4` etc).
+2. **Multi-chip validation** — re-tune and re-bench the Metal kernels on M2/M3/M4 (several negative results are worth re-running there too).
+3. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings end-to-end.
+4. **Sub-1B draft model** to turn speculative decoding's forward-count win into a wall-clock win (lossless sampling is already in; the draft economics are the blocker).
 
-1. **Swift full-capacity cache fetch** — mirror the Python cache rewiring so the Swift decode path stops copying the live KV region per token (kernels are already runtime-length).
-2. **HF Hub upload** of the converted MLX checkpoints (`mlx-community/Motif-2-12.7B-Reasoning-MLX-q4` etc).
-3. **Multi-chip validation** — re-tune and re-bench the Metal kernels on M2/M3/M4.
-4. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings end-to-end.
-5. **Sub-1B draft model** to turn speculative decoding's forward-count win into a wall-clock win; lossless rejection sampling for temperature > 0.
+## Further reading
 
-## Reference architecture
+For where each module/test/script lives and what it does, see [`docs/codebase-tour.md`](docs/codebase-tour.md); deeper design notes, experiment writeups, certified benchmark captures, CI layout, and the Swift roadmap live under [`docs/`](docs/), and the Swift package has its own [`swift/README.md`](swift/README.md).
 
-For ground truth on the math, see:
-
-- `/tmp/refs/sdpa_vector.h` (run `curl -sL https://raw.githubusercontent.com/ml-explore/mlx/main/mlx/backend/metal/kernels/sdpa_vector.h -o sdpa_vector.h`) — MLX's vectorized SDPA decode, the template our kernels follow.
-- HF `Motif-Technologies/Motif-2-12.7B-Reasoning/modeling_motif.py` — the PyTorch reference for Grouped Differential Attention; our kernels are validated against this layer-by-layer.
-- arXiv [2510.06949](https://arxiv.org/abs/2510.06949) (GDA), [2410.05258](https://arxiv.org/abs/2410.05258) (DiffTransformer), [2411.03884](https://arxiv.org/abs/2411.03884) (PolyNorm).
+Ground truth on the math: MLX's [`sdpa_vector.h`](https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/sdpa_vector.h) (the template our kernels follow); HF `Motif-Technologies/Motif-2-12.7B-Reasoning/modeling_motif.py` (the PyTorch reference our kernels are validated against layer-by-layer); arXiv [2510.06949](https://arxiv.org/abs/2510.06949) (GDA), [2410.05258](https://arxiv.org/abs/2410.05258) (DiffTransformer), [2411.03884](https://arxiv.org/abs/2411.03884) (PolyNorm).
 
 ## License
 

@@ -106,6 +106,102 @@ final class MotifMetalKernelsTests: XCTestCase {
         XCTAssertTrue(allClose(reference, candidate, rtol: 1e-3, atol: 1e-3).item(Bool.self))
     }
 
+    /// Locks the GQA-broadcast contract the callers now rely on: passing
+    /// unrepeated GQA-shaped K/V1/V2 must be bit-identical to the legacy
+    /// caller behavior of pre-repeating the slabs to full query-head count
+    /// (the kernel maps `kv_head_idx = head_idx / GQA_FACTOR`, which is
+    /// exactly repeat-interleave).
+    func testDualVMetalGQABroadcastMatchesPreRepeatedInputsBitExact() throws {
+        try requireMLXRuntime()
+        let q = MotifMetalKernelHarness.deterministicInput(shape: [1, 4, 1, 32])
+        let k = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 32])
+        let v1 = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 32]) * 0.5
+        let v2 = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 32]) * -0.25
+        let scale: Float = 0.17677669
+
+        let broadcast = MotifSDPADualV.apply(
+            queries: q,
+            keys: k,
+            value1: v1,
+            value2: v2,
+            scale: scale,
+            executionMode: .metalPreferred
+        )
+        let preRepeated = MotifSDPADualV.apply(
+            queries: q,
+            keys: repeated(k, count: 2, axis: 1),
+            value1: repeated(v1, count: 2, axis: 1),
+            value2: repeated(v2, count: 2, axis: 1),
+            scale: scale,
+            executionMode: .metalPreferred
+        )
+        eval(broadcast, preRepeated)
+
+        XCTAssertEqual(broadcast.shape, preRepeated.shape)
+        XCTAssertEqual(
+            abs(broadcast - preRepeated).max().item(Float.self),
+            0,
+            "native GQA broadcast must be bit-identical to pre-repeated inputs"
+        )
+    }
+
+    /// An explicit `.array` mask must be honored (via the reference fallback)
+    /// instead of being silently dropped by the mask-less Metal kernel.
+    func testDualVApplyHonorsExplicitArrayMaskAtDecode() throws {
+        try requireMLXRuntime()
+        let q = MotifMetalKernelHarness.deterministicInput(shape: [1, 4, 1, 32])
+        let k = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 32])
+        let v1 = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 32]) * 0.5
+        let v2 = MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 32]) * -0.25
+        let scale: Float = 0.17677669
+        // Additive mask blocking the final KV position — NOT a decode no-op.
+        let mask = MLXArray([Float(0), 0, -1e9], [1, 1, 1, 3])
+
+        MotifKernelFallbackTelemetry.reset()
+        let masked = MotifSDPADualV.apply(
+            queries: q,
+            keys: k,
+            value1: v1,
+            value2: v2,
+            scale: scale,
+            mask: .array(mask),
+            executionMode: .metalPreferred
+        )
+        let reference = MotifSDPADualV.reference(
+            queries: q,
+            keys: k,
+            value1: v1,
+            value2: v2,
+            scale: scale,
+            mask: .array(mask)
+        )
+        let unmasked = MotifSDPADualV.apply(
+            queries: q,
+            keys: k,
+            value1: v1,
+            value2: v2,
+            scale: scale,
+            executionMode: .metalPreferred
+        )
+        eval(masked, reference, unmasked)
+
+        XCTAssertGreaterThan(
+            MotifKernelFallbackTelemetry.fallbackCount(for: .sdpaDualV),
+            0,
+            "a non-trivial mask must route to the mask-honoring reference path"
+        )
+        XCTAssertEqual(
+            abs(masked - reference).max().item(Float.self),
+            0,
+            "masked apply must match the mask-honoring reference exactly"
+        )
+        XCTAssertGreaterThan(
+            abs(masked - unmasked).max().item(Float.self),
+            0,
+            "the mask must actually change the result for this fixture"
+        )
+    }
+
     func testPackedQ4DualVMetalMatchesDequantBridgeForDecodeFixture() throws {
         try requireMLXRuntime()
         let q = MotifMetalKernelHarness.deterministicInput(shape: [1, 4, 1, 32])
@@ -199,6 +295,66 @@ final class MotifMetalKernelsTests: XCTestCase {
             0,
             "q4 decode fixture fell back to the reference bridge instead of running the Metal kernel"
         )
+    }
+
+    /// A head dim that violates the packed word contract (qk_per_thread = D/32
+    /// must be <= EL_PER_INT = 32/bits) must route to the dequant reference
+    /// bridge, never the packed Metal kernel. For D=256/bits=8, qk_per_thread=8
+    /// > EL_PER_INT=4: the kernel would shift a uint32 by up to 56 bits (UB in
+    /// Metal) and read half the channels as garbage. This asserts the guard in
+    /// MotifSDPADualVQ4.apply forces the fallback, matching the Python assert.
+    /// Runtime-gated so `shouldUseMetal` is true — the ONLY reason to fall back
+    /// here is the head-dim/bits guard, not the absence of a Metal runtime.
+    func testPackedQ4DualVFallsBackWhenHeadDimExceedsPackedWordContract() throws {
+        try requireMLXRuntime()
+        MotifKernelFallbackTelemetry.reset()
+        XCTAssertEqual(MotifKernelFallbackTelemetry.fallbackCount(for: .sdpaDualVQ4), 0)
+
+        // D=256 with bits=8 violates D/32 <= 32/bits (8 > 4).
+        let q = MotifMetalKernelHarness.deterministicInput(shape: [1, 4, 1, 256])
+        let cache = MotifGroupedQuantizedKVCache(groupSize: 64, bits: 8)
+        let packed = cache.updateAndFetch4Quantized(
+            kOrigin: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 256]),
+            kNoise: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 256]) * -0.5,
+            value1: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 256]) * 0.25,
+            value2: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 256]) * -0.125
+        )
+
+        // reference() dequantizes and runs the generic dual-V SDPA, so the
+        // out-of-contract shape still produces a correct, evaluatable result.
+        let reference = MotifSDPADualVQ4.reference(
+            queries: q,
+            quantizedKeys: packed.kOrigin,
+            quantizedValue1: packed.value1,
+            quantizedValue2: packed.value2,
+            scale: 0.17677669,
+            groupSize: cache.groupSize,
+            bits: cache.bits,
+            mode: cache.mode,
+            dtype: q.dtype
+        )
+        let candidate = MotifSDPADualVQ4.apply(
+            queries: q,
+            quantizedKeys: packed.kOrigin,
+            quantizedValue1: packed.value1,
+            quantizedValue2: packed.value2,
+            scale: 0.17677669,
+            groupSize: cache.groupSize,
+            bits: cache.bits,
+            mode: cache.mode,
+            dtype: q.dtype,
+            executionMode: .metalPreferred
+        )
+        eval(candidate)
+
+        XCTAssertGreaterThan(
+            MotifKernelFallbackTelemetry.fallbackCount(for: .sdpaDualVQ4),
+            0,
+            "out-of-contract D=256/bits=8 shape must fall back to reference(), not run the packed kernel"
+        )
+        // The forced fallback must equal the dequant reference bridge exactly.
+        XCTAssertEqual(candidate.shape, reference.shape)
+        XCTAssertTrue(allClose(reference, candidate, rtol: 1e-3, atol: 1e-3).item(Bool.self))
     }
 
     private func requireMLXRuntime(file: StaticString = #filePath, line: UInt = #line) throws {

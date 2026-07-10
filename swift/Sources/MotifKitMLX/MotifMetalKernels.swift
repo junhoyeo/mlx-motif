@@ -247,6 +247,28 @@ public enum MotifKernelFallbackTelemetry {
     }
 }
 
+/// Process-wide cache for the tiny constant scalar inputs (attention scale,
+/// RMS eps, `1 - lambda_init`) that the kernel wrappers previously rebuilt as a
+/// fresh 1-element `MLXArray` on every launch — several allocations plus graph
+/// nodes per layer per decoded token. The values are per-model constants, so
+/// the map stays a handful of entries deep for the process lifetime.
+enum MotifKernelScalarCache {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var floatScalars: [Float: MLXArray] = [:]
+
+    /// Returns a shared `[1]`-shaped float32 array holding `value`.
+    static func scalar(_ value: Float) -> MLXArray {
+        lock.lock()
+        defer { lock.unlock() }
+        if let cached = floatScalars[value] {
+            return cached
+        }
+        let array = MLXArray([value])
+        floatScalars[value] = array
+        return array
+    }
+}
+
 public enum MotifMetalKernels {
     public static let disableEnvironmentVariable = "MLX_MOTIF_DISABLE_KERNELS"
     public static let legacyDisableEnvironmentVariable = "MOTIFKIT_DISABLE_CUSTOM_METAL_KERNELS"
@@ -483,7 +505,7 @@ public enum MotifMetalKernelHarness {
 public enum MotifSDPADualV {
     private static let metalKernel = MLXFast.metalKernel(
         name: "motif_sdpa_dual_v",
-        inputNames: ["q", "k", "v1", "v2", "scale_in"],
+        inputNames: ["q", "k", "v1", "v2", "scale_in", "kv_len_in"],
         outputNames: ["y"],
         source: motifSDPADualVMetalSource
     )
@@ -496,17 +518,12 @@ public enum MotifSDPADualV {
         scale: Float,
         mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
     ) -> MLXArray {
-        var keys = keys
-        var value1 = value1
-        var value2 = value2
-        let queryHeads = queries.dim(1)
-        let keyHeads = keys.dim(1)
-        if keyHeads > 0, queryHeads % keyHeads == 0, queryHeads != keyHeads {
-            let repeatCount = queryHeads / keyHeads
-            keys = repeated(keys, count: repeatCount, axis: 1)
-            value1 = repeated(value1, count: repeatCount, axis: 1)
-            value2 = repeated(value2, count: repeatCount, axis: 1)
-        }
+        // MLXFast SDPA broadcasts GQA natively (query head i reads kv head
+        // i / (H_q / H_kv) — exactly repeat-interleave semantics), so
+        // GQA-shaped keys/values are passed straight through instead of
+        // materializing repeated full-sequence copies. This path runs on
+        // every prefill, where the repeat used to cost three full-sequence
+        // tensor materializations per layer.
         let out1 = MLXFast.scaledDotProductAttention(
             queries: queries,
             keys: keys,
@@ -534,16 +551,40 @@ public enum MotifSDPADualV {
         executionMode: MotifMetalKernelExecutionMode = .metalPreferred
     ) -> MLXArray {
         guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode),
+              maskIsDecodeNoOp(mask),
               queries.dim(2) == 1,
               queries.dim(3) % 32 == 0,
               keys.dim(1) > 0,
               queries.dim(1) % keys.dim(1) == 0,
-              value1.shape == value2.shape
+              // Full K/V contract, mirroring the Python wrapper's asserts
+              // (`v1.shape == v2.shape == (B, H_kv, KV, D)`, `k.shape[-1] == D`):
+              // the kernel indexes K and both V slabs with strides derived from
+              // queries/keys, so a mismatched value tensor would read
+              // out-of-bounds device memory instead of falling back.
+              keys.dim(0) == queries.dim(0),
+              keys.dim(3) == queries.dim(3),
+              value1.shape == keys.shape,
+              value2.shape == keys.shape
         else {
             MotifKernelFallbackTelemetry.recordFallback(.sdpaDualV)
             return reference(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale, mask: mask)
         }
         return metal(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale)
+    }
+
+    /// The Metal kernel computes an unmasked softmax over every KV position.
+    /// That is only valid when the supplied mask is a no-op for single-token
+    /// decode: `.none`, or `.causal` with S_q == 1 (the sole query row is the
+    /// last position and may attend to all cached keys). Explicit `.array` /
+    /// `.arrays` masks must take the mask-honoring reference path instead of
+    /// being silently dropped.
+    private static func maskIsDecodeNoOp(_ mask: MLXFast.ScaledDotProductAttentionMaskMode) -> Bool {
+        switch mask {
+        case .none, .causal:
+            return true
+        default:
+            return false
+        }
     }
 
     private static func metal(
@@ -565,13 +606,16 @@ public enum MotifSDPADualV {
         let gqaFactor = queryHeads / keyHeads
         let rows = batch * queryHeads
         let threads = 32 * 32
-        let scaleArray = MLXArray([scale])
+        let scaleArray = MotifKernelScalarCache.scalar(scale)
+        // KV length is a runtime input rather than a template constant so a
+        // growing decode context does not force a fresh Metal JIT compile
+        // (one new pipeline per token) — the template set stays finite.
+        let kvLengthArray = MLXArray([Int32(kvSequenceLength)])
         let outputs = metalKernel(
-            [queries, keys, value1, value2, scaleArray],
+            [queries, keys, value1, value2, scaleArray, kvLengthArray],
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),
-                ("KV_SEQ", kvSequenceLength),
                 ("GQA_FACTOR", gqaFactor),
             ],
             grid: (rows * threads, 1, 1),
@@ -598,6 +642,7 @@ public enum MotifSDPADualVQ4 {
             "v2_scales",
             "v2_biases",
             "scale_in",
+            "kv_len_in",
         ],
         outputNames: ["y"],
         source: motifSDPADualVQ4MetalSource
@@ -662,11 +707,34 @@ public enum MotifSDPADualVQ4 {
               queries.dim(3) % 32 == 0,
               queries.dim(3) % groupSize == 0,
               bits == 4 || bits == 8,
+              // Packed word contract: each lane loads exactly one packed uint32
+              // per tensor per step and unpacks qk_per_thread = D/32 channels
+              // from it, valid only when qk_per_thread <= EL_PER_INT, i.e.
+              // headDim/32 <= 32/bits. Out-of-contract shapes (e.g. D=256/bits=8)
+              // would shift a uint32 by >=32 bits (UB in Metal) and read half the
+              // channels as garbage — route them to reference() instead. Matches
+              // the Python assert in sdpa_dual_v_q4.
+              queries.dim(3) / 32 <= 32 / bits,
               let keyBiases = quantizedKeys.biases,
               let value1Biases = quantizedValue1.biases,
               let value2Biases = quantizedValue2.biases,
               quantizedKeys.data.dim(1) > 0,
-              queries.dim(1) % quantizedKeys.data.dim(1) == 0
+              queries.dim(1) % quantizedKeys.data.dim(1) == 0,
+              // Full packed K/V contract, mirroring the fp16 wrapper and the
+              // Python asserts: the kernel indexes all three quantized slabs
+              // with strides derived from the K buffers, so mismatched value
+              // shapes would read out-of-bounds memory instead of falling back.
+              quantizedKeys.data.dim(0) == queries.dim(0),
+              quantizedValue1.data.shape == quantizedKeys.data.shape,
+              quantizedValue2.data.shape == quantizedKeys.data.shape,
+              quantizedValue1.scales.shape == quantizedKeys.scales.shape,
+              quantizedValue2.scales.shape == quantizedKeys.scales.shape,
+              keyBiases.shape == quantizedKeys.scales.shape,
+              value1Biases.shape == quantizedKeys.scales.shape,
+              value2Biases.shape == quantizedKeys.scales.shape,
+              quantizedKeys.scales.dim(0) == quantizedKeys.data.dim(0),
+              quantizedKeys.scales.dim(1) == quantizedKeys.data.dim(1),
+              quantizedKeys.scales.dim(2) == quantizedKeys.data.dim(2)
         else {
             MotifKernelFallbackTelemetry.recordFallback(.sdpaDualVQ4)
             return reference(
@@ -722,7 +790,10 @@ public enum MotifSDPADualVQ4 {
         let gqaFactor = queryHeads / keyHeads
         let rows = batch * queryHeads
         let threads = 32 * 32
-        let scaleArray = MLXArray([scale])
+        let scaleArray = MotifKernelScalarCache.scalar(scale)
+        // Runtime KV length (see MotifSDPADualV.metal): keeps the compiled
+        // pipeline set finite instead of respecializing per context length.
+        let kvLengthArray = MLXArray([Int32(kvSequenceLength)])
         let outputs = metalKernel(
             [
                 queries,
@@ -736,11 +807,11 @@ public enum MotifSDPADualVQ4 {
                 quantizedValue2.scales,
                 quantizedValue2.biases,
                 scaleArray,
+                kvLengthArray,
             ],
             template: [
                 ("T", queries.dtype),
                 ("D", headDim),
-                ("KV_SEQ", kvSequenceLength),
                 ("GQA_FACTOR", gqaFactor),
                 ("BITS", bits),
                 ("GROUP_SIZE", groupSize),
@@ -833,8 +904,8 @@ public enum MotifGDAPostSplit {
         let queryGroups = attnNoise.dim(1)
         let rows = batch * queryOrigin * sequenceLength
         let threads = min(256, max(32, ((channels + 31) / 32) * 32))
-        let scaleArray = MLXArray([Float(1.0 - lambdaInit)])
-        let epsArray = MLXArray([eps])
+        let scaleArray = MotifKernelScalarCache.scalar(Float(1.0 - lambdaInit))
+        let epsArray = MotifKernelScalarCache.scalar(eps)
         let outputs = metalKernel(
             [
                 attnOrigin,
@@ -943,8 +1014,8 @@ public enum MotifGDAPost {
         let channels = merged.dim(3)
         let rows = batch * queryOrigin * sequenceLength
         let threads = min(256, max(32, ((channels + 31) / 32) * 32))
-        let scaleArray = MLXArray([Float(1.0 - lambdaInit)])
-        let epsArray = MLXArray([eps])
+        let scaleArray = MotifKernelScalarCache.scalar(Float(1.0 - lambdaInit))
+        let epsArray = MotifKernelScalarCache.scalar(eps)
         let outputs = metalKernel(
             [
                 merged,
@@ -1033,7 +1104,7 @@ public enum MotifPolynorm {
 
         let xFlat = x.reshaped([rows, channels])
         let threadGroupSize = min(256, max(32, ((channels + 31) / 32) * 32))
-        let epsArray = MLXArray([eps])
+        let epsArray = MotifKernelScalarCache.scalar(eps)
         let outputs = metalKernel(
             [xFlat, weight.asType(x.dtype), bias.asType(x.dtype), epsArray],
             template: [
@@ -1065,10 +1136,18 @@ private let motifSDPADualVMetalSource = #"""
     // For GQA_FACTOR=1 this is the standard one-to-one mapping.
     uint kv_head_idx = head_idx / uint(GQA_FACTOR);
 
-    const device T* q_p  = q  + head_idx    * D                       + sg_lid * qk_per_thread;
-    const device T* k_p  = k  + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * qk_per_thread;
-    const device T* v1_p = v1 + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
-    const device T* v2_p = v2 + kv_head_idx * (KV_SEQ * D) + sg_gid * D + sg_lid * v_per_thread;
+    // KV length is a runtime input (not a template constant) so decode does
+    // not recompile the kernel for every new context length. Row strides are
+    // derived from each buffer's own capacity (its shape), so callers may pass
+    // padded-capacity buffers together with a smaller live kv_len.
+    const int  kv_len    = int(kv_len_in[0]);
+    const uint k_row_cap = uint(k_shape[2]);
+    const uint v_row_cap = uint(v1_shape[2]);
+
+    const device T* q_p  = q  + head_idx    * D                          + sg_lid * qk_per_thread;
+    const device T* k_p  = k  + kv_head_idx * (k_row_cap * D) + sg_gid * D + sg_lid * qk_per_thread;
+    const device T* v1_p = v1 + kv_head_idx * (v_row_cap * D) + sg_gid * D + sg_lid * v_per_thread;
+    const device T* v2_p = v2 + kv_head_idx * (v_row_cap * D) + sg_gid * D + sg_lid * v_per_thread;
     device T*       y_p  = y  + head_idx    * (2 * D);
 
     float scale = float(scale_in[0]);
@@ -1090,7 +1169,7 @@ private let motifSDPADualVMetalSource = #"""
     U sum_exp_score = U(0);
 
     int kv_stride = BN * D;
-    for (int p = sg_gid; p < KV_SEQ; p += BN) {
+    for (int p = sg_gid; p < kv_len; p += BN) {
         // Load this lane's K slice.
         thread U k_r[qk_per_thread];
         for (int j = 0; j < qk_per_thread; ++j) k_r[j] = U(k_p[j]);
@@ -1118,10 +1197,13 @@ private let motifSDPADualVMetalSource = #"""
         v2_p += kv_stride;
     }
 
-    // Cross-simdgroup max/sum reduce — exact MLX SDPA pattern.
+    // Cross-simdgroup max/sum reduce — MLX SDPA pattern, with the two V slabs
+    // staged in disjoint halves of the scratch buffer so each channel
+    // iteration needs 2 threadgroup barriers instead of 4. Reduction order per
+    // slab is unchanged, so the result is bit-identical to the serial form.
     threadgroup U max_scores[BN];
     threadgroup U sum_exp_scores[BN];
-    threadgroup U outputs[BN * BD];
+    threadgroup U outputs[2 * BN * BD];
 
     if (sg_lid == 0) {
         max_scores[sg_gid] = max_score;
@@ -1136,16 +1218,12 @@ private let motifSDPADualVMetalSource = #"""
 
     // Reduce both V slabs across simdgroups.
     for (int i = 0; i < v_per_thread; ++i) {
-        // V1 slab
         outputs[sg_lid * BD + sg_gid] = o1[i];
+        outputs[BN * BD + sg_lid * BD + sg_gid] = o2[i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
         o1[i] = simd_sum(outputs[sg_gid * BD + sg_lid] * lane_factor);
+        o2[i] = simd_sum(outputs[BN * BD + sg_gid * BD + sg_lid] * lane_factor);
         o1[i] = (lane_sum == 0) ? o1[i] : (o1[i] / lane_sum);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        // V2 slab
-        outputs[sg_lid * BD + sg_gid] = o2[i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        o2[i] = simd_sum(outputs[sg_gid * BD + sg_lid] * lane_factor);
         o2[i] = (lane_sum == 0) ? o2[i] : (o2[i] / lane_sum);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1182,9 +1260,16 @@ private let motifSDPADualVQ4MetalSource = #"""
     uint shift_base   = (base % uint(EL_PER_INT)) * uint(BITS);
     uint group_idx    = base / uint(GROUP_SIZE);
 
+    // KV length is a runtime input (not a template constant) so decode does
+    // not recompile the kernel for every new context length. Row strides use
+    // the packed K buffer's own capacity (its shape); the wrapper guard pins
+    // every quantized slab to that same shape.
+    const int  kv_len     = int(kv_len_in[0]);
+    const uint kv_row_cap = uint(k_data_shape[2]);
+
     // Per-tensor row offset for this kv_head (computed once).
-    uint head_row_u32 = kv_head_idx * uint(KV_SEQ) * uint(U32_PER_ROW);
-    uint head_row_scb = kv_head_idx * uint(KV_SEQ) * uint(SCB_PER_ROW);
+    uint head_row_u32 = kv_head_idx * kv_row_cap * uint(U32_PER_ROW);
+    uint head_row_scb = kv_head_idx * kv_row_cap * uint(SCB_PER_ROW);
 
     // Q (fp16/bf16): same indexing as sdpa_dual_v.
     const device T* q_p = q + head_idx * uint(D) + sg_lid * uint(qk_per_thread);
@@ -1221,7 +1306,7 @@ private let motifSDPADualVQ4MetalSource = #"""
     U max_score = U(-1e30f);
     U sum_exp_score = U(0);
 
-    for (int p = sg_gid; p < KV_SEQ; p += BN) {
+    for (int p = sg_gid; p < kv_len; p += BN) {
         uint row_u32 = head_row_u32 + uint(p) * uint(U32_PER_ROW) + u32_idx_base;
         uint row_scb = head_row_scb + uint(p) * uint(SCB_PER_ROW) + group_idx;
 
@@ -1268,10 +1353,13 @@ private let motifSDPADualVQ4MetalSource = #"""
 
     device T* y_p = y + head_idx * uint(2 * D);
 
-    // Cross-simdgroup max/sum reduce — exact MLX SDPA pattern.
+    // Cross-simdgroup max/sum reduce — MLX SDPA pattern, with the two V slabs
+    // staged in disjoint halves of the scratch buffer so each channel
+    // iteration needs 2 threadgroup barriers instead of 4. Reduction order per
+    // slab is unchanged, so the result is bit-identical to the serial form.
     threadgroup U max_scores[BN];
     threadgroup U sum_exp_scores[BN];
-    threadgroup U outputs[BN * BD];
+    threadgroup U outputs[2 * BN * BD];
 
     if (sg_lid == 0) {
         max_scores[sg_gid] = max_score;
@@ -1286,14 +1374,11 @@ private let motifSDPADualVQ4MetalSource = #"""
 
     for (int i = 0; i < v_per_thread; ++i) {
         outputs[sg_lid * BD + sg_gid] = o1[i];
+        outputs[BN * BD + sg_lid * BD + sg_gid] = o2[i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
         o1[i] = simd_sum(outputs[sg_gid * BD + sg_lid] * lane_factor);
+        o2[i] = simd_sum(outputs[BN * BD + sg_gid * BD + sg_lid] * lane_factor);
         o1[i] = (lane_sum == 0) ? o1[i] : (o1[i] / lane_sum);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        outputs[sg_lid * BD + sg_gid] = o2[i];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        o2[i] = simd_sum(outputs[sg_gid * BD + sg_lid] * lane_factor);
         o2[i] = (lane_sum == 0) ? o2[i] : (o2[i] / lane_sum);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

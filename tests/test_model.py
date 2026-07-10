@@ -101,6 +101,63 @@ def test_full_model_forward(variant):
     assert logits.shape == (1, 4, args.vocab_size)
 
 
+def _grouped_args_kr2(**overrides) -> ModelArgs:
+    """Grouped config with k_ratio=2 (num_key_value_heads = k_noise * 3).
+
+    Exercises the unsupported 4-slot combination: k1 carries k_groups*k_ratio
+    heads while k2/v1/v2 carry k_groups heads.
+    """
+    base = dict(
+        model_type="motif",
+        hidden_size=64,
+        num_hidden_layers=1,
+        intermediate_size=128,
+        num_attention_heads=10,
+        num_key_value_heads=6,  # = 2 noise heads * (1 + k_ratio=2)
+        num_noise_heads=2,
+        k_ratio=2,
+        vocab_size=128,
+        head_dim=16,
+        max_position_embeddings=64,
+        tie_word_embeddings=False,
+        hidden_act="poly_norm",
+    )
+    base.update(overrides)
+    return ModelArgs(**base)
+
+
+def test_make_cache_rejects_4slot_with_k_ratio_gt_1(monkeypatch):
+    """`make_cache` must fail fast when the 4-slot cache is requested for a
+    k_ratio > 1 grouped model: every slot is allocated with k1's head count,
+    which differs from k2/v1/v2 when k_ratio > 1. Without the guard the
+    mismatch surfaces as an opaque shape error mid-forward at cache-write time.
+    """
+    model = Model(_grouped_args_kr2())
+
+    monkeypatch.setenv("MLX_MOTIF_4SLOT_CACHE", "1")
+    with pytest.raises(ValueError, match="k_ratio"):
+        model.make_cache()
+
+    monkeypatch.setenv("MLX_MOTIF_4SLOT_CACHE", "q4")
+    with pytest.raises(ValueError, match="k_ratio"):
+        model.make_cache()
+
+    # With the 4-slot cache disabled the k_ratio > 1 model falls back to the
+    # stock single-slot KVCache without error.
+    monkeypatch.setenv("MLX_MOTIF_4SLOT_CACHE", "0")
+    caches = model.make_cache()
+    assert len(caches) == model.args.num_hidden_layers
+    assert type(caches[0]).__name__ == "KVCache"
+
+
+def test_make_cache_allows_4slot_with_k_ratio_1(monkeypatch):
+    """The default k_ratio == 1 grouped model still builds the 4-slot cache."""
+    model = Model(_grouped_args())
+    monkeypatch.setenv("MLX_MOTIF_4SLOT_CACHE", "1")
+    caches = model.make_cache()
+    assert type(caches[0]).__name__ == "MotifGroupedKVCache"
+
+
 def _grouped_args_d64(**overrides) -> ModelArgs:
     """Same topology as `_grouped_args` but head_dim=64 — minimum viable size
     for the q4 attention kernel (`group_size=64` requires `head_dim >= 64`)."""

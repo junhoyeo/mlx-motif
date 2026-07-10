@@ -577,11 +577,14 @@ public final class MotifMLXAttentionScaffold: Module {
         // memory for the model's lifetime. Replacing them with empty-weight
         // placeholders drops the last reference to the full buffers. Mirrors the
         // Python reference, which sets q_proj/k_proj/v_proj = Identity() after
-        // fusing (src/mlx_motif/model.py fuse_qkv()).
-        let releasedPlaceholder = { Linear(weight: MLXArray.zeros([1, 1]), bias: nil) }
-        _queryProjection.wrappedValue = releasedPlaceholder()
-        _keyProjection.wrappedValue = releasedPlaceholder()
-        _valueProjection.wrappedValue = releasedPlaceholder()
+        // fusing (src/mlx_motif/model.py fuse_qkv()). @ModuleInfo forbids direct
+        // property mutation after init, so route through update(modules:).
+        let released: [(String, Module)] = [
+            ("q_proj", Linear(weight: MLXArray.zeros([1, 1]), bias: nil)),
+            ("k_proj", Linear(weight: MLXArray.zeros([1, 1]), bias: nil)),
+            ("v_proj", Linear(weight: MLXArray.zeros([1, 1]), bias: nil)),
+        ]
+        update(modules: ModuleChildren.unflattened(released))
         return true
     }
 

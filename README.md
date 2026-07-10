@@ -68,18 +68,27 @@ Requires Python ≥ 3.11, MLX ≥ 0.21, Apple Silicon (only M1 Max validated end
 
 ## Quickstart
 
+Pre-converted 4-bit checkpoints are on the Hub — pass the ID directly and skip conversion:
+
+- [`junhoyeo/Motif-2-12.7B-Reasoning-MLX-q4`](https://huggingface.co/junhoyeo/Motif-2-12.7B-Reasoning-MLX-q4)
+- [`junhoyeo/Motif-2.6B-MLX-q4`](https://huggingface.co/junhoyeo/Motif-2.6B-MLX-q4)
+
 ```bash
-# 1. Convert an HF checkpoint (defaults to bf16; add --quantize for q4)
+# Generate straight from the Hub (downloads on first use)
+mlx-motif generate --model junhoyeo/Motif-2-12.7B-Reasoning-MLX-q4 --prompt "Hello, world."
+
+# Serve (OpenAI-compatible HTTP)
+mlx-motif serve --model junhoyeo/Motif-2-12.7B-Reasoning-MLX-q4 --port 8080
+```
+
+Or convert an HF checkpoint yourself (e.g. a different quant preset):
+
+```bash
 mlx-motif convert \
   --hf-path Motif-Technologies/Motif-2-12.7B-Reasoning \
   --out ./out/motif-12.7b-q4 \
   --quantize --bits 4
-
-# 2. Generate
 mlx-motif generate --model ./out/motif-12.7b-q4 --prompt "Hello, world."
-
-# 3. Serve (OpenAI-compatible HTTP)
-mlx-motif serve --model ./out/motif-12.7b-q4 --port 8080
 ```
 
 Programmatically:
@@ -381,10 +390,9 @@ Everything known-incomplete, in one list — caveats first, then planned work. (
 
 **Roadmap, in order of expected payoff:**
 
-1. **HF Hub upload** of the converted MLX checkpoints (`mlx-community/Motif-2-12.7B-Reasoning-MLX-q4` etc).
-2. **Multi-chip validation** — re-tune and re-bench the Metal kernels on M2/M3/M4 (several negative results are worth re-running there too).
-3. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings end-to-end.
-4. **Sub-1B draft model** to turn speculative decoding's forward-count win into a wall-clock win (lossless sampling is already in; the draft economics are the blocker).
+1. **Multi-chip validation** — re-tune and re-bench the Metal kernels on M2/M3/M4 (several negative results are worth re-running there too).
+2. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings end-to-end.
+3. **Sub-1B draft model** to turn speculative decoding's forward-count win into a wall-clock win (lossless sampling is already in; the draft economics are the blocker).
 
 ## Further reading
 

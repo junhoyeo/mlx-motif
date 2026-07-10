@@ -6,6 +6,30 @@ import MLXLMCommon
 import MLXNN
 import MotifKit
 
+/// All four grouped-cache slots (kOrigin/kNoise/value1/value2) are allocated
+/// with a single head count taken from kOrigin. With `kRatio > 1` the model
+/// produces kOrigin with `keyGroups*kRatio` heads but kNoise/value1/value2 with
+/// `keyGroups` heads, so storing them in equally-shaped slots would fail (or
+/// silently corrupt) at write time. Fail loudly here so the unsupported
+/// combination is unmistakable even when a caller constructs the cache directly
+/// (bypassing `MotifMLXModel.newCache`, which guards the same case up front).
+@inline(__always)
+func motifAssertUniformSlotHeads(
+    _ kOrigin: MLXArray,
+    _ kNoise: MLXArray,
+    _ value1: MLXArray,
+    _ value2: MLXArray
+) {
+    let h = kOrigin.dim(1)
+    precondition(
+        kNoise.dim(1) == h && value1.dim(1) == h && value2.dim(1) == h,
+        "4-slot grouped KV cache requires kOrigin/kNoise/value1/value2 to share a "
+            + "head count; got kOrigin=\(h), kNoise=\(kNoise.dim(1)), "
+            + "value1=\(value1.dim(1)), value2=\(value2.dim(1)). This happens with "
+            + "kRatio > 1, which the 4-slot cache does not support."
+    )
+}
+
 public enum MotifGroupedAttentionReferenceError: Error, LocalizedError, Equatable, Sendable {
     case requiresGroupedDifferentialAttention
     case invalidShape(String)
@@ -284,6 +308,7 @@ public final class MotifGroupedKVCache: KVCache, CustomDebugStringConvertible {
         value1 newValue1: MLXArray,
         value2 newValue2: MLXArray
     ) -> MotifGroupedKVCachedSlices {
+        motifAssertUniformSlotHeads(newKOrigin, newKNoise, newValue1, newValue2)
         let previous = offset
         growIfNeeded(
             batch: newKOrigin.dim(0),
@@ -456,6 +481,7 @@ public final class MotifGroupedQuantizedKVCache: KVCache, CustomDebugStringConve
         value1: MotifQuantizedTuple,
         value2: MotifQuantizedTuple
     ) {
+        motifAssertUniformSlotHeads(newKOrigin, newKNoise, newValue1, newValue2)
         let previous = offset
         growIfNeeded(
             batch: newKOrigin.dim(0),

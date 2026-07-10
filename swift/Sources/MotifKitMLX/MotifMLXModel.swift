@@ -730,6 +730,20 @@ public final class MotifMLXModel: Module, LLMModel, KVCacheDimensionProvider {
         guard configuration.isGroupedDifferentialAttention else {
             return Self.defaultCaches(count: configuration.numHiddenLayers, parameters: parameters)
         }
+        // Fail-fast: the 4-slot grouped caches (MotifGroupedKVCache /
+        // MotifGroupedQuantizedKVCache) allocate all four slots with a single
+        // head count taken from kOrigin, but with kRatio > 1 the kOrigin slot
+        // has keyGroups*kRatio heads while kNoise/value1/value2 have keyGroups
+        // heads — the mismatched slot writes fail (or silently corrupt)
+        // mid-forward at cache-write time. No shipped config uses kRatio > 1, so
+        // guard the unsupported combination loudly here. (Python mirror:
+        // Model.make_cache.)
+        if let reason = Self.fourSlotCacheUnsupportedReason(
+            mode: runtimeFeatures.fourSlotCacheMode,
+            kRatio: configuration.kRatio
+        ) {
+            preconditionFailure(reason)
+        }
         switch runtimeFeatures.fourSlotCacheMode {
         case .disabled:
             return Self.defaultCaches(count: configuration.numHiddenLayers, parameters: parameters)
@@ -744,6 +758,25 @@ public final class MotifMLXModel: Module, LLMModel, KVCacheDimensionProvider {
                 MotifGroupedQuantizedKVCache(groupSize: parameters?.kvGroupSize ?? 64, bits: 8)
             }
         }
+    }
+
+    /// Returns a human-readable reason when the requested four-slot cache
+    /// configuration is unsupported, or `nil` when it is fine. Exposed
+    /// (non-crashing) so the fail-fast guard in `newCache` is unit-testable.
+    ///
+    /// The four-slot grouped caches allocate every slot with kOrigin's head
+    /// count; with `kRatio > 1` the kOrigin slot has `keyGroups*kRatio` heads
+    /// while kNoise/value1/value2 have `keyGroups` heads, so the combination is
+    /// unsupported. (Python mirror: `Model.make_cache`.)
+    static func fourSlotCacheUnsupportedReason(
+        mode: MotifRuntimeFeatureFlags.FourSlotCacheMode,
+        kRatio: Int
+    ) -> String? {
+        guard mode != .disabled, kRatio != 1 else { return nil }
+        return "Four-slot grouped KV cache is not supported with kRatio > 1 "
+            + "(got kRatio=\(kRatio)): every slot is allocated with kOrigin's head "
+            + "count, which differs from kNoise/value1/value2 when kRatio > 1. "
+            + "Disable the four-slot cache for this configuration."
     }
 
     private static func defaultCaches(count: Int, parameters: GenerateParameters?) -> [KVCache] {

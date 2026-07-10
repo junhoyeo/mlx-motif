@@ -13,6 +13,59 @@ def _rand(shape, dtype=mx.bfloat16):
     return (mx.random.normal(shape) * 0.1).astype(dtype)
 
 
+def test_make_mask_matches_mlx_lm_contract():
+    """`make_mask` must accept the mlx-lm call signature
+    `cache.make_mask(N, return_array=..., window_size=...)` and forward the
+    cache offset. Regression guard: the previous import pulled the base-module
+    `create_attention_mask` (no `offset` kwarg), so any invocation raised
+    TypeError. The bug was dormant only because the model passes the whole
+    cache list to `create_attention_mask`, never routing through `make_mask`.
+    """
+    cache = MotifGroupedKVCache()
+    cache.offset = 3
+
+    # N == 1 short-circuits to no mask.
+    assert cache.make_mask(1, return_array=False, window_size=None) is None
+
+    # N > 1 without return_array is the string "causal" fast path.
+    assert cache.make_mask(4, return_array=False, window_size=None) == "causal"
+
+    # return_array builds an explicit (N, offset + N) causal mask array.
+    mask = cache.make_mask(4, return_array=True, window_size=None)
+    assert mask is not None
+    assert mask.shape == (4, cache.offset + 4)
+
+    # Quantized variant shares the same base implementation.
+    qcache = MotifGroupedQuantizedKVCache(group_size=64, bits=8)
+    qcache.offset = 2
+    assert qcache.make_mask(1, return_array=False, window_size=None) is None
+    assert qcache.make_mask(5, return_array=False, window_size=None) == "causal"
+
+
+@pytest.mark.parametrize(
+    "cache_factory",
+    [
+        MotifGroupedKVCache,
+        lambda: MotifGroupedQuantizedKVCache(group_size=64, bits=8),
+    ],
+    ids=["fp16", "quantized"],
+)
+def test_mismatched_slot_heads_fail_fast(cache_factory):
+    """The 4-slot caches allocate every slot with k1's head count, so a
+    k_ratio > 1 write (k1 has more heads than k2/v1/v2) must fail loudly at
+    write time rather than raising an opaque shape error or silently
+    corrupting. Regression guard for the k_ratio > 1 latent bug.
+    """
+    cache = cache_factory()
+    B, D = 1, 128
+    k1 = _rand((B, 4, 1, D))  # k_groups * k_ratio heads (k_ratio = 2)
+    k2 = _rand((B, 2, 1, D))  # k_groups heads
+    v1 = _rand((B, 2, 1, D))
+    v2 = _rand((B, 2, 1, D))
+    with pytest.raises(ValueError, match="share a head count"):
+        cache.update_and_fetch_4(k1, k2, v1, v2)
+
+
 def test_unquantized_cache_roundtrip():
     mx.random.seed(0)
     B, H, D = 1, 8, 128

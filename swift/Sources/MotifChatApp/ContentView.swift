@@ -31,7 +31,9 @@ struct ContentView: View {
         // Translucent window: the desktop behind the window shows through and
         // blurs (NSVisualEffectView .behindWindow), giving the Liquid Glass
         // chrome real, live content to refract — no fake gradient.
-        .background(VisualEffectBackground().ignoresSafeArea())
+        // `.hudWindow` reads more translucent than `.underWindowBackground`, so
+        // the desktop shows through the chrome (the glass has content to refract).
+        .background(VisualEffectBackground(material: .hudWindow).ignoresSafeArea())
         .onReceive(NotificationCenter.default.publisher(for: .newMotifChatRequested)) { _ in
             store.newChat()
             selectedPanel = .chat
@@ -139,17 +141,41 @@ private struct ConversationRow: View {
 
 private struct ChatView: View {
     @ObservedObject var store: ChatStore
+    @State private var showingModelDirImporter = false
 
     private var visibleMessages: [MotifChatMessage] {
         store.messages.filter { $0.role != .system }
     }
 
     var body: some View {
+        VStack(spacing: 0) {
+            ChatHeaderBar(store: store, showingImporter: $showingModelDirImporter)
+            chatSurface
+        }
+        .navigationTitle("Motif Chat")
+        .fileImporter(
+            isPresented: $showingModelDirImporter,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            switch result {
+            case .success(let urls):
+                guard let url = urls.first else { return }
+                let scoped = url.startAccessingSecurityScopedResource()
+                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                store.selectNativeModelDirectory(url)
+            case .failure(let error):
+                store.lastError = error.localizedDescription
+            }
+        }
+    }
+
+    private var chatSurface: some View {
         ZStack(alignment: .bottom) {
             ScrollViewReader { proxy in
                 ScrollView {
                     if visibleMessages.isEmpty {
-                        EmptyChatState()
+                        EmptyChatState(store: store)
                             .frame(maxWidth: .infinity, minHeight: 420)
                     } else {
                         LazyVStack(alignment: .leading, spacing: 16) {
@@ -196,6 +222,14 @@ private struct ChatView: View {
 }
 
 private struct EmptyChatState: View {
+    @ObservedObject var store: ChatStore
+
+    private let examples = [
+        "Think step by step: why is the sky blue?",
+        "What is 37 × 41?",
+        "Write a Swift function that reverses a linked list.",
+    ]
+
     var body: some View {
         VStack(spacing: 12) {
             Image(systemName: "sparkles")
@@ -208,6 +242,27 @@ private struct EmptyChatState: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
+
+            VStack(spacing: 8) {
+                ForEach(examples, id: \.self) { example in
+                    Button {
+                        store.prompt = example
+                        store.send()
+                    } label: {
+                        HStack {
+                            Text(example).lineLimit(1)
+                            Spacer(minLength: 0)
+                            Image(systemName: "arrow.up.right").font(.caption2).foregroundStyle(.tertiary)
+                        }
+                        .frame(maxWidth: 380, alignment: .leading)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .disabled(store.isGenerating)
+                }
+            }
+            .padding(.top, 10)
+            .accessibilityIdentifier("motif.chat.examples")
         }
         .padding()
     }
@@ -268,7 +323,10 @@ private struct InputBar: View {
                     .foregroundStyle(.red)
             }
 
-            HStack(alignment: .bottom, spacing: 10) {
+            HStack(alignment: .bottom, spacing: 8) {
+                ThinkModeMenu(store: store)
+                ToolsToggle(store: store)
+
                 TextField("Ask Motif…", text: $store.prompt, axis: .vertical)
                     .textFieldStyle(.plain)
                     .lineLimit(2...8)
@@ -344,7 +402,17 @@ private struct MessageBubble: View {
                     }
                 }
 
-                if message.content.isEmpty && !isStreaming {
+                if let call = store.toolCalls[message.id] {
+                    ToolCallCard(call: call)
+                } else if isStreaming && message.content.contains("\"tool_call\"") {
+                    HStack(spacing: 6) {
+                        Image(systemName: "wrench.and.screwdriver.fill")
+                            .foregroundStyle(.orange)
+                        Text("calling a tool…")
+                            .foregroundStyle(.secondary)
+                    }
+                    .font(.callout)
+                } else if message.content.isEmpty && !isStreaming {
                     Text("…")
                         .foregroundStyle(.secondary)
                 } else {
@@ -354,6 +422,11 @@ private struct MessageBubble: View {
                         }
                         MarkdownMessageView(content: message.content)
                     }
+                }
+
+                // Dev-tool decode metrics under finished assistant turns.
+                if isAssistant, let m = store.metrics[message.id] {
+                    MetricsLine(metrics: m)
                 }
 
                 // Per-message actions on assistant turns. Revealed on hover (kept
@@ -569,5 +642,260 @@ private struct RuntimeView: View {
         default:
             "hourglass"
         }
+    }
+}
+
+// MARK: - Dev-tool chrome (header selector, meters, tool cards)
+
+/// Header above the transcript: backend/model selector on the left (dev-tool —
+/// which model you're talking to is never hidden), live decode readout and the
+/// context meter on the right.
+private struct ChatHeaderBar: View {
+    @ObservedObject var store: ChatStore
+    @Binding var showingImporter: Bool
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Menu {
+                Section("Backend") {
+                    Button {
+                        store.backendMode = .nativeMLX
+                    } label: {
+                        Label(
+                            "Native MLX checkpoint",
+                            systemImage: store.backendMode == .nativeMLX ? "checkmark" : "cpu"
+                        )
+                    }
+                    Button {
+                        store.backendMode = .openAICompatible
+                    } label: {
+                        Label(
+                            "Endpoint · \(store.endpoint)",
+                            systemImage: store.backendMode == .openAICompatible ? "checkmark" : "network"
+                        )
+                    }
+                }
+                if store.backendMode == .nativeMLX {
+                    Section("Checkpoint") {
+                        ForEach(store.discoveredModelDirectories, id: \.self) { dir in
+                            Button {
+                                store.nativeModelDirectory = dir
+                            } label: {
+                                Label(
+                                    (dir as NSString).lastPathComponent,
+                                    systemImage: dir == store.nativeModelDirectory ? "checkmark" : "folder"
+                                )
+                            }
+                        }
+                        Button {
+                            showingImporter = true
+                        } label: {
+                            Label("Choose…", systemImage: "folder.badge.plus")
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 8) {
+                    StatusDot(store: store)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(store.backendDisplayName)
+                            .font(.subheadline).fontWeight(.semibold).lineLimit(1)
+                        Text(store.backendMode == .nativeMLX ? "native MLX" : "endpoint")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    Image(systemName: "chevron.down").font(.caption2).foregroundStyle(.secondary)
+                }
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityIdentifier("motif.chat.model")
+
+            Spacer()
+
+            if store.isGenerating {
+                HStack(spacing: 5) {
+                    Image(systemName: "bolt.fill").font(.caption2).foregroundStyle(.yellow)
+                    Text("\(store.liveTokensPerSecond, specifier: "%.0f") tok/s · \(store.liveTokenEstimate) tok")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityIdentifier("motif.chat.tokrate")
+            }
+
+            ContextMeter(store: store)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(.ultraThinMaterial)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+}
+
+/// Green idle / yellow generating / red on error.
+private struct StatusDot: View {
+    @ObservedObject var store: ChatStore
+    var body: some View {
+        Circle().fill(color).frame(width: 8, height: 8)
+            .help(store.runtimeStatus)
+    }
+    private var color: Color {
+        if store.lastError != nil { return .red }
+        if store.isGenerating { return .yellow }
+        return .green
+    }
+}
+
+/// Thin context-usage bar: estimated transcript tokens vs the budget; amber ≥80%.
+private struct ContextMeter: View {
+    @ObservedObject var store: ChatStore
+    var body: some View {
+        let fraction = min(store.contextUsageFraction, 1.0)
+        let amber = store.contextUsageFraction >= 0.8
+        HStack(spacing: 6) {
+            Image(systemName: "gauge.with.dots.needle.33percent")
+                .font(.caption2).foregroundStyle(.secondary)
+            ProgressView(value: fraction)
+                .progressViewStyle(.linear)
+                .frame(width: 56)
+                .tint(amber ? .orange : .accentColor)
+            Text("\(compact(store.currentContextTokens)) / \(compact(store.contextTokenBudget))")
+                .font(.system(.caption2, design: .monospaced))
+                .foregroundStyle(amber ? .orange : .secondary)
+        }
+        .help("Context usage (estimated tokens) vs budget")
+        .accessibilityIdentifier("motif.chat.context")
+    }
+    private func compact(_ n: Int) -> String {
+        n >= 1000 ? String(format: "%.1fk", Double(n) / 1000) : "\(n)"
+    }
+}
+
+/// Brain-icon menu that picks the reasoning-trace mode (visible/hidden/captured).
+private struct ThinkModeMenu: View {
+    @ObservedObject var store: ChatStore
+    var body: some View {
+        Menu {
+            Picker("Thinking", selection: $store.thinkMode) {
+                ForEach(MotifThinkMode.allCases, id: \.self) { mode in
+                    Text(mode.rawValue.capitalized).tag(mode)
+                }
+            }
+        } label: {
+            Image(systemName: "brain")
+                .foregroundStyle(store.thinkMode == .hidden ? Color.secondary : Color.accentColor)
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Reasoning trace: \(store.thinkMode.rawValue)")
+        .accessibilityIdentifier("motif.chat.thinkmode")
+    }
+}
+
+/// Toggles the two safe demo tools (get_current_time, calculator) for the turn.
+private struct ToolsToggle: View {
+    @ObservedObject var store: ChatStore
+    var body: some View {
+        Button {
+            store.toolsEnabled.toggle()
+        } label: {
+            Image(systemName: "wrench.and.screwdriver")
+                .foregroundStyle(store.toolsEnabled ? Color.accentColor : Color.secondary)
+        }
+        .buttonStyle(.borderless)
+        .help(store.toolsEnabled
+            ? "Demo tools ON (get_current_time, calculator)"
+            : "Enable demo tools")
+        .accessibilityIdentifier("motif.chat.tools")
+    }
+}
+
+/// One-line decode readout under a finished assistant turn.
+private struct MetricsLine: View {
+    let metrics: MessageMetrics
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "gauge.with.needle").font(.caption2)
+            Text("\(metrics.tokensPerSecond, specifier: "%.1f") tok/s")
+            Text("·")
+            Text("\(metrics.completionTokens) tok")
+            Text("·")
+            Text("TTFT \(metrics.timeToFirstToken, specifier: "%.2f")s")
+            if metrics.estimated {
+                Text("(est.)").foregroundStyle(.tertiary)
+            }
+        }
+        .font(.system(.caption2, design: .monospaced))
+        .foregroundStyle(.secondary)
+        .accessibilityIdentifier("motif.chat.metrics")
+    }
+}
+
+/// Renders a parsed tool call as a distinct card (dev-tool: name + args + raw JSON).
+private struct ToolCallCard: View {
+    let call: MotifToolCalling.ParsedToolCall
+    @State private var showRaw = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "wrench.and.screwdriver.fill").foregroundStyle(.orange)
+                Text("Tool call").font(.caption).foregroundStyle(.secondary)
+                Text(call.name).font(.system(.callout, design: .monospaced)).fontWeight(.semibold)
+            }
+            ForEach(call.arguments.keys.sorted(), id: \.self) { key in
+                HStack(alignment: .top, spacing: 6) {
+                    Text(key + ":")
+                        .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                    Text(displayValue(call.arguments[key]))
+                        .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
+                }
+            }
+            DisclosureGroup(isExpanded: $showRaw) {
+                Text(rawJSON)
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.top, 4)
+            } label: {
+                Text("raw JSON").font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: 420, alignment: .leading)
+        .background(.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(.orange.opacity(0.35), lineWidth: 1)
+        )
+        .accessibilityIdentifier("motif.chat.toolcard")
+    }
+
+    private func displayValue(_ value: MotifJSONValue?) -> String {
+        guard let value else { return "" }
+        switch value {
+        case .string(let s): return s
+        case .int(let i): return String(i)
+        case .double(let d): return String(d)
+        case .bool(let b): return String(b)
+        case .null: return "null"
+        default:
+            if let data = try? JSONSerialization.data(withJSONObject: value.anyValue),
+               let s = String(data: data, encoding: .utf8) { return s }
+            return ""
+        }
+    }
+
+    private var rawJSON: String {
+        var args: [String: Any] = [:]
+        for (key, value) in call.arguments { args[key] = value.anyValue }
+        let object: [String: Any] = ["tool_call": ["name": call.name, "arguments": args]]
+        if let data = try? JSONSerialization.data(
+            withJSONObject: object, options: [.prettyPrinted, .sortedKeys]
+        ), let s = String(data: data, encoding: .utf8) {
+            return s
+        }
+        return ""
     }
 }

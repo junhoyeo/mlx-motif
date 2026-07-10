@@ -45,6 +45,58 @@ enum MotifCompactionMode: String, CaseIterable, Identifiable {
     }
 }
 
+/// Per-assistant-turn decode metrics, surfaced in the UI (dev-tool readout).
+/// Populated from the terminal `.completed(usage:)` event when the backend
+/// reports real token counts (the native MLX runtime does); the completion
+/// count falls back to a char-based estimate for backends that omit usage.
+struct MessageMetrics: Equatable {
+    var promptTokens: Int
+    var completionTokens: Int
+    var tokensPerSecond: Double
+    var timeToFirstToken: Double
+    var elapsed: Double
+    /// True when completionTokens came from the char-based estimate rather than
+    /// the backend's real usage counts (so the UI can mark it as approximate).
+    var estimated: Bool
+}
+
+/// Two SAFE built-in demo tools, described as OpenAI-style tool dicts, used to
+/// exercise the prompt-based tool-calling path in the app. No tool is executed
+/// here — the app renders the model's emitted `{"tool_call": …}` as a card.
+enum MotifChatDemoTools {
+    static var tools: [Any] {
+        [
+        [
+            "type": "function",
+            "function": [
+                "name": "get_current_time",
+                "description": "Get the current date and time.",
+                "parameters": ["type": "object", "properties": [String: Any]()],
+            ] as [String: Any],
+        ] as [String: Any],
+        [
+            "type": "function",
+            "function": [
+                "name": "calculator",
+                "description": "Evaluate a basic arithmetic expression.",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "expression": [
+                            "type": "string",
+                            "description": "e.g. 37 * 41",
+                        ] as [String: Any]
+                    ] as [String: Any],
+                    "required": ["expression"],
+                ] as [String: Any],
+            ] as [String: Any],
+        ] as [String: Any],
+        ]
+    }
+
+    static let names: Set<String> = MotifToolCalling.toolNames(from: tools) ?? []
+}
+
 @MainActor
 final class ChatStore: ObservableObject {
     @Published var backendMode: MotifChatBackendMode = ChatStore.storedBackendMode() {
@@ -87,7 +139,23 @@ final class ChatStore: ObservableObject {
     @Published var conversations: [MotifConversation] = []
     @Published var activeConversationID: UUID?
 
+    // Dev-tool surfaces --------------------------------------------------------
+    /// Per-assistant-message decode metrics (tok/s, token counts, TTFT).
+    @Published var metrics: [UUID: MessageMetrics] = [:]
+    /// Parsed tool call per assistant message id, when the turn emitted one.
+    @Published var toolCalls: [UUID: MotifToolCalling.ParsedToolCall] = [:]
+    /// When enabled, the demo tools preamble is injected for each turn.
+    @Published var toolsEnabled: Bool = ChatStore.storedBool(.toolsEnabled, defaultValue: false) {
+        didSet { ChatStore.defaults.set(toolsEnabled, forKey: DefaultsKey.toolsEnabled.rawValue) }
+    }
+    /// Live decode readout while a turn streams (updated as text arrives).
+    @Published var liveTokensPerSecond: Double = 0
+    @Published var liveTokenEstimate: Int = 0
+
     private var generationTask: Task<Void, Never>?
+    // Streaming-metrics scratch (reset per turn).
+    private var genFirstTokenAt: Date?
+    private var genCharCount: Int = 0
     private var nativeDirectoryAccess: NativeDirectoryAccessGrant?
     /// Backend reused across turns so the native runtime (and its KV-cache) is
     /// not rebuilt every message — that reuse is what lets the runtime skip
@@ -107,6 +175,47 @@ final class ChatStore: ObservableObject {
         #else
         false
         #endif
+    }
+
+    /// Estimated token count of the full current transcript (context meter).
+    var currentContextTokens: Int {
+        messages.reduce(0) { $0 + motifEstimatedTokenCount($1.content) }
+    }
+
+    /// Fraction of the context budget currently used (0…1+).
+    var contextUsageFraction: Double {
+        guard contextTokenBudget > 0 else { return 0 }
+        return Double(currentContextTokens) / Double(contextTokenBudget)
+    }
+
+    /// Checkpoint directories under ~/.models (folders containing config.json),
+    /// plus the current selection — seeds the header's native-model picker.
+    var discoveredModelDirectories: [String] {
+        var dirs: [String] = []
+        let fm = FileManager.default
+        let root = fm.homeDirectoryForCurrentUser.appendingPathComponent(".models")
+        if let entries = try? fm.contentsOfDirectory(
+            at: root, includingPropertiesForKeys: [.isDirectoryKey]
+        ) {
+            for url in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+            where fm.fileExists(atPath: url.appendingPathComponent("config.json").path) {
+                dirs.append(url.path)
+            }
+        }
+        let current = nativeModelDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !current.isEmpty, !dirs.contains(current) { dirs.insert(current, at: 0) }
+        return dirs
+    }
+
+    /// Short label for the active backend, shown in the header selector.
+    var backendDisplayName: String {
+        switch backendMode {
+        case .nativeMLX:
+            let name = (nativeModelDirectory as NSString).lastPathComponent
+            return name.isEmpty ? "native MLX" : name
+        case .openAICompatible:
+            return model
+        }
     }
 
     init() {
@@ -272,11 +381,29 @@ final class ChatStore: ObservableObject {
         lastError = nil
         runtimeStatus = backendMode == .nativeMLX ? "Loading native checkpoint…" : "Connecting to endpoint…"
         // Build the request transcript before adding the streaming placeholder,
-        // applying the context-budget guard so long chats don't overflow.
-        let requestMessages = messagesWithinBudget()
+        // applying the context-budget guard so long chats don't overflow. When
+        // tools are enabled, inject the demo-tools preamble into the leading
+        // system message for this turn only (the stored transcript is untouched).
+        var requestMessages = messagesWithinBudget()
+        if toolsEnabled {
+            let preamble = MotifToolCalling.buildToolsPreamble(MotifChatDemoTools.tools)
+            if let first = requestMessages.first, first.role == .system {
+                requestMessages[0].content += "\n\n" + preamble
+            } else {
+                requestMessages.insert(.system(preamble), at: 0)
+            }
+        }
         messages.append(.assistant(""))
         let assistantID = messages[messages.count - 1].id
         isGenerating = true
+
+        // Reset per-turn decode-metrics scratch.
+        let started = Date()
+        genFirstTokenAt = nil
+        genCharCount = 0
+        liveTokensPerSecond = 0
+        liveTokenEstimate = 0
+        let promptEstimate = requestMessages.reduce(0) { $0 + motifEstimatedTokenCount($1.content) }
 
         let parameters = MotifGenerationParameters(
             model: model,
@@ -299,11 +426,30 @@ final class ChatStore: ObservableObject {
                         }
                         switch event {
                         case .text(let text):
+                            if self.genFirstTokenAt == nil { self.genFirstTokenAt = Date() }
+                            self.genCharCount += text.count
+                            self.liveTokenEstimate = (self.genCharCount + 3) / 4
+                            if let first = self.genFirstTokenAt {
+                                let dt = Date().timeIntervalSince(first)
+                                if dt > 0 { self.liveTokensPerSecond = Double(self.liveTokenEstimate) / dt }
+                            }
                             self.append(text, toAssistantMessage: assistantID)
                         case .reasoning(let reasoning):
                             self.capturedReasoning += reasoning
-                        case .completed:
-                            break
+                        case .completed(let usage):
+                            let now = Date()
+                            let content = self.messages.first(where: { $0.id == assistantID })?.content ?? ""
+                            let completion = usage?.completionTokens ?? motifEstimatedTokenCount(content)
+                            let decodeStart = self.genFirstTokenAt ?? started
+                            let decodeElapsed = max(now.timeIntervalSince(decodeStart), 1e-6)
+                            self.metrics[assistantID] = MessageMetrics(
+                                promptTokens: usage?.promptTokens ?? promptEstimate,
+                                completionTokens: completion,
+                                tokensPerSecond: Double(completion) / decodeElapsed,
+                                timeToFirstToken: (self.genFirstTokenAt ?? now).timeIntervalSince(started),
+                                elapsed: now.timeIntervalSince(started),
+                                estimated: usage == nil
+                            )
                         }
                     }
                 }
@@ -329,6 +475,14 @@ final class ChatStore: ObservableObject {
                 self.releaseNativeDirectoryAccess()
                 self.isGenerating = false
                 self.generationTask = nil
+                self.liveTokensPerSecond = 0
+                self.liveTokenEstimate = 0
+                // If this turn emitted a tool call, capture it so the transcript
+                // renders it as a card instead of raw JSON.
+                let content = self.messages.first(where: { $0.id == assistantID })?.content ?? ""
+                if let call = MotifToolCalling.parseToolCall(text: content, toolNames: MotifChatDemoTools.names) {
+                    self.toolCalls[assistantID] = call
+                }
                 if self.lastError == nil, self.runtimeStatus != "Cancelled" {
                     self.runtimeStatus = "Idle"
                 }
@@ -383,6 +537,7 @@ final class ChatStore: ObservableObject {
         maxTokens = 512
         temperature = 0.6
         contextTokenBudget = 12000
+        toolsEnabled = false
         runtimeStatus = "Settings reset"
         lastError = nil
     }
@@ -557,6 +712,11 @@ final class ChatStore: ObservableObject {
         if defaults.object(forKey: key.rawValue) == nil { return defaultValue }
         return defaults.double(forKey: key.rawValue)
     }
+
+    private static func storedBool(_ key: DefaultsKey, defaultValue: Bool) -> Bool {
+        if defaults.object(forKey: key.rawValue) == nil { return defaultValue }
+        return defaults.bool(forKey: key.rawValue)
+    }
 }
 
 private enum DefaultsKey: String, CaseIterable {
@@ -569,6 +729,7 @@ private enum DefaultsKey: String, CaseIterable {
     case maxTokens = "motif.chat.maxTokens"
     case temperature = "motif.chat.temperature"
     case contextTokenBudget = "motif.chat.contextTokenBudget"
+    case toolsEnabled = "motif.chat.toolsEnabled"
     case conversations = "motif.chat.conversations"
 }
 

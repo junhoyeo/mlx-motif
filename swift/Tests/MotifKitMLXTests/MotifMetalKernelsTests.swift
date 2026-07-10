@@ -357,6 +357,104 @@ final class MotifMetalKernelsTests: XCTestCase {
         XCTAssertTrue(allClose(reference, candidate, rtol: 1e-3, atol: 1e-3).item(Bool.self))
     }
 
+    /// A head dim that PASSES the old necessary-only guard (D/32 <= 32/bits) but
+    /// whose lane block straddles a packed uint32 word must still fall back. For
+    /// D=96/bits=8: qk_per_thread=3 <= EL_PER_INT=4 (old guard OK), yet 3 does not
+    /// divide 4 — lane 1's channels {3,4,5} cross the word boundary, so channels
+    /// 4,5 would be read from a never-loaded word with shifts 32/40 (>= 32, UB in
+    /// Metal). The sufficient guard (qk_per_thread | EL_PER_INT) must route this
+    /// to reference(), matching the Python `qk_per_thread | EL_PER_INT` assert.
+    /// Runtime-gated so `shouldUseMetal` is true — the only reason to fall back
+    /// here is the word-straddle guard, not the absence of a Metal runtime.
+    func testPackedQ4DualVFallsBackWhenLaneBlockStraddlesPackedWord() throws {
+        try requireMLXRuntime()
+        MotifKernelFallbackTelemetry.reset()
+        XCTAssertEqual(MotifKernelFallbackTelemetry.fallbackCount(for: .sdpaDualVQ4), 0)
+
+        // D=96, bits=8, group_size=32: qk_per_thread=3, EL_PER_INT=4. 3<=4 passes
+        // the old guard but 3 does not divide 4 -> word straddle.
+        let q = MotifMetalKernelHarness.deterministicInput(shape: [1, 4, 1, 96])
+        let cache = MotifGroupedQuantizedKVCache(groupSize: 32, bits: 8)
+        let packed = cache.updateAndFetch4Quantized(
+            kOrigin: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 96]),
+            kNoise: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 96]) * -0.5,
+            value1: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 96]) * 0.25,
+            value2: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 96]) * -0.125
+        )
+
+        let reference = MotifSDPADualVQ4.reference(
+            queries: q,
+            quantizedKeys: packed.kOrigin,
+            quantizedValue1: packed.value1,
+            quantizedValue2: packed.value2,
+            scale: 0.10206207,
+            groupSize: cache.groupSize,
+            bits: cache.bits,
+            mode: cache.mode,
+            dtype: q.dtype
+        )
+        let candidate = MotifSDPADualVQ4.apply(
+            queries: q,
+            quantizedKeys: packed.kOrigin,
+            quantizedValue1: packed.value1,
+            quantizedValue2: packed.value2,
+            scale: 0.10206207,
+            groupSize: cache.groupSize,
+            bits: cache.bits,
+            mode: cache.mode,
+            dtype: q.dtype,
+            executionMode: .metalPreferred
+        )
+        eval(candidate)
+
+        XCTAssertGreaterThan(
+            MotifKernelFallbackTelemetry.fallbackCount(for: .sdpaDualVQ4),
+            0,
+            "word-straddling D=96/bits=8 shape must fall back to reference(), not run the packed kernel"
+        )
+        XCTAssertEqual(candidate.shape, reference.shape)
+        XCTAssertTrue(allClose(reference, candidate, rtol: 1e-3, atol: 1e-3).item(Bool.self))
+    }
+
+    /// D=128 (the shipped head dim) must PASS the sufficient guard and run the
+    /// Metal kernel — no fallback — for every supported group_size (32/64/128)
+    /// and bits (4/8). qk_per_thread=4 divides EL_PER_INT in {4,8} and every
+    /// group_size in {32,64,128}. Complements the negative straddle test above.
+    func testPackedQ4DualVRunsMetalAcrossShippedGroupSizesAndBits() throws {
+        try requireMLXRuntime()
+        for bits in [4, 8] {
+            for groupSize in [32, 64, 128] {
+                MotifKernelFallbackTelemetry.reset()
+                let q = MotifMetalKernelHarness.deterministicInput(shape: [1, 4, 1, 128])
+                let cache = MotifGroupedQuantizedKVCache(groupSize: groupSize, bits: bits)
+                let packed = cache.updateAndFetch4Quantized(
+                    kOrigin: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 128]),
+                    kNoise: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 128]) * -0.5,
+                    value1: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 128]) * 0.25,
+                    value2: MotifMetalKernelHarness.deterministicInput(shape: [1, 2, 3, 128]) * -0.125
+                )
+                let candidate = MotifSDPADualVQ4.apply(
+                    queries: q,
+                    quantizedKeys: packed.kOrigin,
+                    quantizedValue1: packed.value1,
+                    quantizedValue2: packed.value2,
+                    scale: 0.08838835,
+                    groupSize: cache.groupSize,
+                    bits: cache.bits,
+                    mode: cache.mode,
+                    dtype: q.dtype,
+                    executionMode: .metalPreferred
+                )
+                eval(candidate)
+                XCTAssertEqual(
+                    MotifKernelFallbackTelemetry.fallbackCount(for: .sdpaDualVQ4),
+                    0,
+                    "D=128 group_size=\(groupSize) bits=\(bits) must run the packed kernel, not fall back"
+                )
+            }
+        }
+    }
+
     private func requireMLXRuntime(file: StaticString = #filePath, line: UInt = #line) throws {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["MOTIFKIT_RUN_MLX_RUNTIME_TESTS"] == "1",

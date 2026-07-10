@@ -15,6 +15,16 @@ Both classes implement the mlx-lm `_BaseCache` contract (`offset`,
 `update_and_fetch`, `state`, `meta_state`, `is_trimmable`, `trim`,
 `make_mask`) plus a 4-slot `update_and_fetch_4(k1, k2, v1, v2)` helper
 that the model uses when it detects the cache type.
+
+Fetch contract: the hot-path fetches (`MotifGroupedKVCache.update_and_fetch_4`
+and `update_and_fetch_4_quantized`) return the FULL row-contiguous capacity
+buffers — axis-2 length is the step-padded capacity, NOT the live length.
+Consumers must bound reads by `cache.offset` (the decode kernels take it as a
+runtime `kv_len` input; other consumers slice `[..., :offset, :]`). This keeps
+the buffers contiguous so no per-step `ensure_row_contiguous` copy of the live
+KV region is inserted before custom-kernel launches. The quantized dequant
+bridge (`MotifGroupedQuantizedKVCache.update_and_fetch_4`) still returns
+exact-length dequantized slices.
 """
 
 from __future__ import annotations
@@ -165,6 +175,19 @@ class MotifGroupedKVCache(MotifGroupedKVCacheBase):
     # ------------------------------------------------------------------
 
     def update_and_fetch_4(self, k1, k2, v1, v2):
+        """Append the 4 incoming slices and return the FULL capacity buffers.
+
+        The returned buffers are row-contiguous and step-padded: their axis-2
+        length is the allocated capacity (a multiple of `step`), not the live
+        length. Consumers must bound reads by `self.offset` — either by
+        passing `kv_len=self.offset` to a runtime-length kernel
+        (`sdpa_dual_v`) or by slicing `[..., :self.offset, :]`.
+
+        Returning full buffers (instead of exact-length `[..., :o, :]`
+        slices) keeps the tensors row-contiguous so `mx.fast.metal_kernel`'s
+        `ensure_row_contiguous` does not copy the whole live KV region on
+        every decode step.
+        """
         B, H, S, D = k1.shape
         prev = self.offset
         self._grow(B, H, S, D, k1.dtype)
@@ -173,8 +196,7 @@ class MotifGroupedKVCache(MotifGroupedKVCacheBase):
         self.v1[..., prev : prev + S, :] = v1
         self.v2[..., prev : prev + S, :] = v2
         self.offset += S
-        o = self.offset
-        return self.k1[..., :o, :], self.k2[..., :o, :], self.v1[..., :o, :], self.v2[..., :o, :]
+        return self.k1, self.k2, self.v1, self.v2
 
     # ------------------------------------------------------------------
     # mlx-lm _BaseCache contract: state / meta_state
@@ -282,24 +304,22 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
         return _deq(self.k1), _deq(self.k2), _deq(self.v1), _deq(self.v2)
 
     def update_and_fetch_4_quantized(self, k1, k2, v1, v2):
-        """Quantize the 4 incoming slices and append; return live-region
-        slices of each slot as raw quantized triples `(data, scales, biases)`.
+        """Quantize the 4 incoming slices and append; return each slot's FULL
+        capacity buffers as raw quantized triples `(data, scales, biases)`.
 
         This is the bandwidth-saving path: the consumer (a quant-input
         attention kernel like `sdpa_dual_v_q4`) reads packed 4/8-bit
         memory directly without paying the per-step `mx.dequantize` cost.
+
+        The triples are row-contiguous and step-padded (axis-2 length is the
+        allocated capacity, not the live length); consumers must bound reads
+        by `self.offset` (pass `kv_len=self.offset` to `sdpa_dual_v_q4`).
+        Exact-length `[..., :o, :]` slices would be non-contiguous views and
+        force `ensure_row_contiguous` to copy all 9 live-region buffers on
+        every decode step.
         """
         self._update_4(k1, k2, v1, v2)
-        o = self.offset
-
-        def _live(slot):
-            return (
-                slot[0][..., :o, :],
-                slot[1][..., :o, :],
-                slot[2][..., :o, :],
-            )
-
-        return _live(self.k1), _live(self.k2), _live(self.v1), _live(self.v2)
+        return self.k1, self.k2, self.v1, self.v2
 
     def _update_4(self, k1, k2, v1, v2):
         B, H, S, D = k1.shape

@@ -87,3 +87,73 @@ def test_sdpa_dual_v_q4_returns_concatenated_layout():
     v_other_q = mx.quantize(v_other, group_size=64, bits=4)
     out_diff = sdpa_dual_v_q4(q, k_q, v_q, v_other_q, scale, group_size=64, bits=4)
     assert not mx.allclose(out_diff[..., :D], out_diff[..., D:], atol=1e-3).item()
+
+
+@pytest.mark.parametrize(
+    "B,H_q,H_kv,cap,kv_len,d",
+    [
+        (1, 8, 8, 256, 1, 128),  # decode step 1 into a step-padded buffer
+        (1, 8, 8, 256, 100, 128),  # unaligned live length
+        (1, 32, 8, 256, 100, 128),  # 12.7B GQA origin call shape
+        (1, 40, 8, 512, 385, 128),  # capacity > one step
+    ],
+)
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+def test_sdpa_dual_v_q4_runtime_kv_len_matches_sliced_reference(
+    B, H_q, H_kv, cap, kv_len, d, bits, dtype
+):
+    """Full-capacity quantized triples + runtime kv_len must equal the
+    reference computed on the exact-length live slice of the same packed
+    bits (quantized-cache decode contract: full buffers + kv_len=offset)."""
+    group_size = 64
+    mx.random.seed(9)
+    scale = 1.0 / (d**0.5)
+    q = mx.random.normal((B, H_q, 1, d)).astype(dtype)
+    # Poison the padding region so any read past kv_len diverges loudly.
+    live = mx.random.normal((B, H_kv, kv_len, d)).astype(dtype)
+    poison = mx.ones((B, H_kv, cap - kv_len, d), dtype=dtype) * 1e3
+    full = mx.concatenate([live, poison], axis=2)
+
+    k_q = mx.quantize(full, group_size=group_size, bits=bits)
+    v1_q = mx.quantize(full * 0.5, group_size=group_size, bits=bits)
+    v2_q = mx.quantize(full * -0.25, group_size=group_size, bits=bits)
+
+    a = sdpa_dual_v_q4(q, k_q, v1_q, v2_q, scale, group_size=group_size, bits=bits, kv_len=kv_len)
+    b = sdpa_dual_v_q4_reference(
+        q, k_q, v1_q, v2_q, scale, group_size=group_size, bits=bits, kv_len=kv_len
+    )
+
+    assert a.shape == (B, H_q, 1, 2 * d)
+    atol = 5e-3 if dtype == mx.float16 else 5e-2
+    rtol = 5e-3 if dtype == mx.float16 else 5e-2
+    md = float(mx.max(mx.abs(a - b)))
+    assert mx.allclose(a, b, atol=atol, rtol=rtol).item(), (
+        f"cap={cap} kv_len={kv_len} bits={bits}: max diff = {md:.3e} (tol={atol})"
+    )
+
+
+def test_sdpa_dual_v_q4_growing_kv_len_no_respecialization():
+    """Growing kv_len over a fixed-capacity quantized buffer stays correct at
+    every length — the loop bound is a runtime input, not a template."""
+    B, H_q, H_kv, cap, d = 1, 32, 8, 256, 128
+    group_size, bits = 64, 4
+    mx.random.seed(13)
+    scale = 1.0 / (d**0.5)
+    q = mx.random.normal((B, H_q, 1, d)).astype(mx.float16)
+    full = mx.random.normal((B, H_kv, cap, d)).astype(mx.float16)
+    k_q = mx.quantize(full, group_size=group_size, bits=bits)
+    v1_q = mx.quantize(full * 0.5, group_size=group_size, bits=bits)
+    v2_q = mx.quantize(full * -0.25, group_size=group_size, bits=bits)
+
+    for kv_len in (1, 31, 32, 33, 100, 255, 256):
+        a = sdpa_dual_v_q4(
+            q, k_q, v1_q, v2_q, scale, group_size=group_size, bits=bits, kv_len=kv_len
+        )
+        b = sdpa_dual_v_q4_reference(
+            q, k_q, v1_q, v2_q, scale, group_size=group_size, bits=bits, kv_len=kv_len
+        )
+        md = float(mx.max(mx.abs(a - b)))
+        assert mx.allclose(a, b, atol=5e-3, rtol=5e-3).item(), (
+            f"kv_len={kv_len}: max diff = {md:.3e}"
+        )

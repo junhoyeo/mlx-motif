@@ -445,7 +445,9 @@ class MotifAttention(nn.Module):
             k2_new = self.rope(k2_new, offset=offset)
             if path is AttnPath.QUANT_SDPA:
                 # Return raw quantized triples; sdpa_dual_v_q4 reads packed
-                # bits directly — no per-step mx.dequantize.
+                # bits directly — no per-step mx.dequantize. The triples are
+                # FULL capacity buffers (row-contiguous); the kernel bounds
+                # reads by the runtime kv_len = cache.offset passed below.
                 k1_q, k2_q, v1_q, v2_q = cache.update_and_fetch_4_quantized(
                     k1_new,
                     k2_new,
@@ -455,6 +457,18 @@ class MotifAttention(nn.Module):
                 k1 = k2 = v1 = v2 = None  # unused on this path
             else:
                 k1, k2, v1, v2 = cache.update_and_fetch_4(k1_new, k2_new, v1_new, v2_new)
+                if path is not AttnPath.DUAL_V:
+                    # FALLBACK consumes exact-length tensors (generic SDPA has
+                    # no runtime length bound, and the mask only covers the
+                    # live region) — slice the step-padded capacity buffers.
+                    # MotifGroupedQuantizedKVCache's dequant bridge already
+                    # returns exact-length slices, so this is a no-op view
+                    # for that cache type.
+                    o = cache.offset
+                    k1 = k1[..., :o, :]
+                    k2 = k2[..., :o, :]
+                    v1 = v1[..., :o, :]
+                    v2 = v2[..., :o, :]
             kv_seq = cache.offset
         else:
             k = self.rope(k, offset=offset)
@@ -529,6 +543,7 @@ class MotifAttention(nn.Module):
                 self.scale,
                 group_size=cache.group_size,
                 bits=cache.bits,
+                kv_len=kv_seq,
             )
             attn_noise = sdpa_dual_v_q4(
                 q2,
@@ -538,6 +553,7 @@ class MotifAttention(nn.Module):
                 self.scale,
                 group_size=cache.group_size,
                 bits=cache.bits,
+                kv_len=kv_seq,
             )
             out = gda_post_split(
                 attn_origin,
@@ -552,8 +568,12 @@ class MotifAttention(nn.Module):
             # Custom kernel: shared QK, dual V SDPA with native GQA.
             # Origin call: GQA=gr (kernel broadcasts k1/v1/v2 internally).
             # Noise call:  GQA=1.
-            attn_origin = sdpa_dual_v(q1, k1, v1, v2, self.scale)
-            attn_noise = sdpa_dual_v(q2, k2, v1, v2, self.scale)
+            # kv_len bounds the KV loop at runtime: with the 4-slot cache,
+            # k1/k2/v1/v2 are full step-padded capacity buffers and
+            # kv_seq = cache.offset < capacity; on the non-4-slot path the
+            # tensors are exactly kv_seq long, so this is equivalent.
+            attn_origin = sdpa_dual_v(q1, k1, v1, v2, self.scale, kv_len=kv_seq)
+            attn_noise = sdpa_dual_v(q2, k2, v1, v2, self.scale, kv_len=kv_seq)
             out = gda_post_split(
                 attn_origin,
                 attn_noise,

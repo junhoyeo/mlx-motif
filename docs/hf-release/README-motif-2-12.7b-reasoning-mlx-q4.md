@@ -38,10 +38,9 @@ print(generate(model, tokenizer, prompt="…", max_tokens=128))
 
 ## Conversion provenance
 
-<!-- RELEASE-TODO: re-convert at the release commit and fill in the exact values -->
 - Converter: `mlx-motif convert --hf-path Motif-Technologies/Motif-2-12.7B-Reasoning --out … --quantize --bits 4` (group_size 64, uniform preset)
-- mlx-motif commit: `<fill at release>`
-- mlx version: `<fill at release>`
+- mlx-motif: [github.com/junhoyeo/mlx-motif](https://github.com/junhoyeo/mlx-motif) @ `e6c401a` (converted with this repo's `convert.py`; validated at this commit)
+- mlx version: 0.31.2
 
 ## Validation (measured on Apple M1 Max, 64 GB)
 

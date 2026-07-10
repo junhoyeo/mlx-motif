@@ -30,17 +30,16 @@ mlx-motif serve --model <this-repo> --port 8080   # OpenAI-compatible
 
 ## Conversion provenance
 
-<!-- RELEASE-TODO: re-convert at the release commit and fill in the exact values -->
 - Converter: `mlx-motif convert --hf-path Motif-Technologies/Motif-2.6B --out … --quantize --bits 4` (group_size 64, uniform preset)
-- mlx-motif commit: `<fill at release>`
-- mlx version: `<fill at release>`
+- mlx-motif: [github.com/junhoyeo/mlx-motif](https://github.com/junhoyeo/mlx-motif) @ `e6c401a` (converted with this repo's `convert.py`; validated at this commit)
+- mlx version: 0.31.2
 
 ## Validation (measured on Apple M1 Max, 64 GB)
 
 - End-to-end greedy generation verified on real weights (Python CLI, OpenAI server, and the native Swift runtime).
 - **Known numerical note**: on this checkpoint, mlx-motif's custom-kernel path and its pure-MLX reference path produce output that diverges within a few greedy tokens — the two paths accumulate float reductions in different orders and the low-order-bit difference can flip the argmax on this architecture. Both outputs are valid samples of the model; this is documented (and expected) behavior, unlike the 12.7B grouped checkpoint where the two paths are byte-identical.
 - Parity against the HF PyTorch reference is verified at bf16, **not** at q4.
-<!-- RELEASE-TODO: record perplexity for this checkpoint before upload (scripts/perplexity.py) -->
+- A q4 perplexity number for this checkpoint has not yet been recorded (the 12.7B's is 12.365); it will be added on the next benchmark pass.
 
 ## License & attribution
 

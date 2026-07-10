@@ -285,9 +285,7 @@ def run_tool_loop(
 
         # Normalise the assistant turn to a single canonical tool-call object so
         # the context does not accumulate the small model's repeated JSON.
-        conversation.append(
-            {"role": "assistant", "content": json.dumps({"tool_call": call})}
-        )
+        conversation.append({"role": "assistant", "content": json.dumps({"tool_call": call})})
 
         try:
             raw_result = tool_executor(call["name"], call["arguments"])
@@ -297,9 +295,7 @@ def run_tool_loop(
             is_error = True
         result_str = raw_result if isinstance(raw_result, str) else json.dumps(raw_result)
 
-        conversation.append(
-            {"role": tool_role, "name": call["name"], "content": result_str}
-        )
+        conversation.append({"role": tool_role, "name": call["name"], "content": result_str})
         rounds.append(
             ToolRound(
                 name=call["name"],
@@ -335,12 +331,8 @@ def make_mlx_generate_fn(model, tokenizer, *, max_tokens: int = 256) -> Generate
                 messages, tokenize=False, add_generation_prompt=True
             )
         else:  # pragma: no cover - defensive fallback
-            prompt = "".join(
-                f"{m.get('role', 'user')}: {m.get('content', '')}\n" for m in messages
-            )
-        return _mlx_generate(
-            model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False
-        )
+            prompt = "".join(f"{m.get('role', 'user')}: {m.get('content', '')}\n" for m in messages)
+        return _mlx_generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens, verbose=False)
 
     return _generate
 

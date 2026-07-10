@@ -106,9 +106,7 @@ def test_perm_matches_model_reorder(n_kv_heads):
     paired = mx.random.normal((B, 2 * Hk, S, d))
 
     # Model-style reorder from paired head order into slab head order.
-    slab_ref = (
-        paired.reshape(B, Hk, 2, S, d).transpose(0, 2, 1, 3, 4).reshape(B, 2 * Hk, S, d)
-    )
+    slab_ref = paired.reshape(B, Hk, 2, S, d).transpose(0, 2, 1, 3, 4).reshape(B, 2 * Hk, S, d)
     slab_perm = paired[:, vanilla_v_paired_to_slab_perm(Hk)]
     assert mx.allclose(slab_ref, slab_perm).item()
 

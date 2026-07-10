@@ -405,6 +405,13 @@ class MotifAttention(nn.Module):
         # kernels/attention.py). K/V are passed at Hk heads: `mx.fast`
         # SDPA's native GQA broadcast maps q head i -> kv head i // n_rep,
         # identical to the explicit `_repeat` (repeat_interleave) it replaces.
+        #
+        # Memory note: these four fast-template calls are O(S) in prefill
+        # memory (no S×S score buffer). The old generic v=2d path was O(S²);
+        # it is ~119 MB cheaper e2e at a 3.5k prompt but +369 MB at 6k and
+        # +755 MB at 8k, and it loses the decode-speed win — so the fast path
+        # is kept despite a measured +131 MB e2e peak at 3.5k. Full attribution
+        # + crossover table: docs/experiments/experiment-vanilla-prefill-peak-memory.md
         o1a = mx.fast.scaled_dot_product_attention(q1, k1, va, scale=self.scale, mask=mask)
         o1b = mx.fast.scaled_dot_product_attention(q1, k1, vb, scale=self.scale, mask=mask)
         o2a = mx.fast.scaled_dot_product_attention(q2, k2, va, scale=self.scale, mask=mask)

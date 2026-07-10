@@ -165,7 +165,8 @@ class AttnPath(enum.Enum):
 
     QUANT_SDPA   — sdpa_dual_v_q4: K/V stay quantized through the kernel.
     DUAL_V       — sdpa_dual_v: fp16 K/V, shared-QK dual-V kernel.
-    FALLBACK     — stacked SDPA + scalar gda_post (prefill / GQA repeat path).
+    FALLBACK     — per-slab fast SDPA + gda_post_split (prefill / GQA repeat
+                   path); legacy stacked SDPA + gda_post for k_ratio > 1.
     """
 
     QUANT_SDPA = "sdpa_dual_v_q4"
@@ -334,8 +335,12 @@ class MotifAttention(nn.Module):
         # equals
         #     SDPA(Qa, Ka, V) − λ · SDPA(Qb, Kb, V).
         # V is stored in the cache at the same head granularity as K (so
-        # `n_kv_heads = num_key_value_heads`), then reshaped into 2·d wide
-        # heads for the attention matmul.
+        # `n_kv_heads = num_key_value_heads`) but in *slab* head order
+        # [va_0..va_{Hk-1}, vb_0..vb_{Hk-1}] instead of the projection's
+        # paired order [v0_a, v0_b, v1_a, v1_b, ..]. That makes the two
+        # d-wide value slabs contiguous head-axis slices after fetch — the
+        # old paired layout needed a reshape→transpose→reshape that
+        # materialized a copy of the ENTIRE cached V every forward step.
         B, S, _ = x.shape
         d = self.head_dim
         H = self.num_heads  # halved (effective DiffAttn heads)
@@ -343,9 +348,9 @@ class MotifAttention(nn.Module):
 
         q = self.q_proj(x).reshape(B, S, 2 * H, d).transpose(0, 2, 1, 3)
         k = self.k_proj(x).reshape(B, S, 2 * Hk, d).transpose(0, 2, 1, 3)
-        # Store V at d-per-head so the standard KVCache (which assumes K/V have
-        # matching shapes) accepts it. Restore 2d-per-head after fetch.
-        v = self.v_proj(x).reshape(B, S, 2 * Hk, d).transpose(0, 2, 1, 3)
+        # Rearrange V into slab order at projection time — O(S·d) on the new
+        # tokens only (S=1 at decode), instead of O(context) after fetch.
+        v = self.v_proj(x).reshape(B, S, Hk, 2, d).transpose(0, 3, 2, 1, 4).reshape(B, 2 * Hk, S, d)
 
         offset = cache.offset if cache is not None else 0
         q = self.rope(q, offset=offset)
@@ -356,21 +361,29 @@ class MotifAttention(nn.Module):
             k, v = _maybe_dequant_kv(k, v, cache)
         kv_seq = k.shape[2]
 
-        # Recover (B, Hk, S, 2d) — see `_init_vanilla` shape derivation.
-        v = v.reshape(B, Hk, 2, kv_seq, d).transpose(0, 1, 3, 2, 4).reshape(B, Hk, kv_seq, 2 * d)
-        v = _repeat(v, self.n_rep, axis=1)
+        # Value slabs: contiguous head-axis slices, (B, Hk, kv_seq, d) each.
+        va, vb = v[:, :Hk], v[:, Hk:]
 
         # Stripe split for differential attention: heads pair adjacent in flat layout.
         q_ = q.reshape(B, H, 2, S, d)
         k_ = k.reshape(B, Hk, 2, kv_seq, d)
         q1, q2 = q_[:, :, 0], q_[:, :, 1]
-        k1, k2 = _repeat(k_[:, :, 0], self.n_rep, axis=1), _repeat(k_[:, :, 1], self.n_rep, axis=1)
+        k1, k2 = k_[:, :, 0], k_[:, :, 1]
 
-        out1 = mx.fast.scaled_dot_product_attention(q1, k1, v, scale=self.scale, mask=mask)
-        out2 = mx.fast.scaled_dot_product_attention(q2, k2, v, scale=self.scale, mask=mask)
+        # Per-slab SDPA with query_head_dim == value_head_dim == d hits MLX's
+        # fast attention templates — q width d against a 2d-wide V is exactly
+        # the combination that falls back to the slow generic SDPA (see
+        # kernels/attention.py). K/V are passed at Hk heads: `mx.fast`
+        # SDPA's native GQA broadcast maps q head i -> kv head i // n_rep,
+        # identical to the explicit `_repeat` (repeat_interleave) it replaces.
+        o1a = mx.fast.scaled_dot_product_attention(q1, k1, va, scale=self.scale, mask=mask)
+        o1b = mx.fast.scaled_dot_product_attention(q1, k1, vb, scale=self.scale, mask=mask)
+        o2a = mx.fast.scaled_dot_product_attention(q2, k2, va, scale=self.scale, mask=mask)
+        o2b = mx.fast.scaled_dot_product_attention(q2, k2, vb, scale=self.scale, mask=mask)
 
-        lam = self._lambda_full(out1.dtype)
-        out = out1 - lam * out2
+        lam = self._lambda_full(o1a.dtype)
+        # (out1 - λ·out2) computed slab-wise, then one small channel concat.
+        out = mx.concatenate([o1a - lam * o2a, o1b - lam * o2b], axis=-1)
         out = self.subln(out)
         out = out * (1.0 - self.lambda_init)
         out = out.transpose(0, 2, 1, 3).reshape(B, S, H * 2 * d)
@@ -503,15 +516,6 @@ class MotifAttention(nn.Module):
             v1 = v_[:, :, 0, :, :]
             v2 = v_[:, :, 1, :, :]
 
-        # Concat along the head axis to feed two SDPAs that share a queries-and-keys layout.
-        q_f = mx.concatenate([q1, q2], axis=1)
-
-        if self.kv_repeat > 1:
-            k1 = _repeat(k1, self.kv_repeat, axis=1)
-            k2 = _repeat(k2, self.kv_repeat, axis=1)
-            v1 = _repeat(v1, self.kv_repeat, axis=1)
-            v2 = _repeat(v2, self.kv_repeat, axis=1)
-
         # ------------------------------------------------------------------ #
         # Kernel selection — keyed off the same `path` computed above
         # ------------------------------------------------------------------ #
@@ -583,11 +587,53 @@ class MotifAttention(nn.Module):
                 gr,
                 eps=self.args.attn_rms_norm_eps,
             )
-        else:  # AttnPath.FALLBACK
-            if kr == 1:
-                k_f = mx.concatenate([_repeat(k1, gr, axis=1), k2], axis=1)
-            else:
-                k_f = mx.concatenate([k1, k2], axis=1)
+        elif kr == 1:  # AttnPath.FALLBACK, standard k_ratio (all shipped configs)
+            # Per-slab SDPA prefill path. Four calls with query_head_dim ==
+            # value_head_dim == d hit MLX's fast attention templates; the old
+            # stacked construction (gr-fold `_repeat` of k1/v1/v2 over the
+            # full kv length + 3 head-axis concats + one SDPA with q_dim=d,
+            # v_dim=2d) took the documented slow generic SDPA path (see
+            # kernels/attention.py) and re-materialized those copies for
+            # every chunk of a chunked prefill.
+            #
+            # Head mapping is unchanged: `mx.fast` SDPA's native GQA
+            # broadcast maps q head i -> kv head i // (Hq // Hkv), exactly
+            # the repeat_interleave layout `_repeat` produced (and the
+            # composition of the kv_repeat and gr repeats, when
+            # kv_repeat > 1). The same `mask` is applied per-head in each
+            # call, so causal semantics for chunked prefill with a nonzero
+            # cache offset are preserved exactly.
+            attn_origin = mx.concatenate(
+                [
+                    mx.fast.scaled_dot_product_attention(q1, k1, v1, scale=self.scale, mask=mask),
+                    mx.fast.scaled_dot_product_attention(q1, k1, v2, scale=self.scale, mask=mask),
+                ],
+                axis=-1,
+            )
+            attn_noise = mx.concatenate(
+                [
+                    mx.fast.scaled_dot_product_attention(q2, k2, v1, scale=self.scale, mask=mask),
+                    mx.fast.scaled_dot_product_attention(q2, k2, v2, scale=self.scale, mask=mask),
+                ],
+                axis=-1,
+            )
+            out = gda_post_split(
+                attn_origin,
+                attn_noise,
+                self.subln.weight,
+                lam,
+                self.lambda_init,
+                gr,
+                eps=self.args.attn_rms_norm_eps,
+            )
+        else:  # AttnPath.FALLBACK, exotic k_ratio > 1: legacy stacked SDPA
+            if self.kv_repeat > 1:
+                k1 = _repeat(k1, self.kv_repeat, axis=1)
+                k2 = _repeat(k2, self.kv_repeat, axis=1)
+                v1 = _repeat(v1, self.kv_repeat, axis=1)
+                v2 = _repeat(v2, self.kv_repeat, axis=1)
+            q_f = mx.concatenate([q1, q2], axis=1)
+            k_f = mx.concatenate([k1, k2], axis=1)
             v1_f = mx.concatenate([_repeat(v1, gr, axis=1), v1], axis=1)
             v2_f = mx.concatenate([_repeat(v2, gr, axis=1), v2], axis=1)
             v_cat = mx.concatenate([v1_f, v2_f], axis=-1)

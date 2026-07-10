@@ -7,8 +7,16 @@ These exercise `mlx_motif.tool_calls.parse_tool_call` and
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
-from mlx_motif.tool_calls import build_tools_preamble, parse_tool_call
+import pytest
+
+from mlx_motif.tool_calls import (
+    build_tools_preamble,
+    parse_tool_call,
+    run_tool_loop,
+    safe_arithmetic,
+)
 
 _WEATHER_TOOLS = [
     {
@@ -135,3 +143,205 @@ def test_build_preamble_is_deterministic_and_mentions_tools():
     assert "get_weather" in a
     assert "Get the weather for a city" in a
     assert "tool_call" in a
+
+
+# ---------------------------------------------------------------------------
+# Cross-language golden parity: same tools JSON -> byte-identical preamble.
+# The fixture's ``expected`` is the authoritative Python output; the Swift port
+# (MotifToolCallingTests) asserts against the SAME fixture. This test guards the
+# Python side from drifting away from the frozen golden.
+# ---------------------------------------------------------------------------
+
+_FIXTURE = Path(__file__).parent / "fixtures" / "tool_preamble_cases.json"
+
+
+def test_preamble_matches_cross_language_golden_fixture():
+    cases = json.loads(_FIXTURE.read_text())["cases"]
+    assert cases, "fixture must contain at least one case"
+    for case in cases:
+        assert build_tools_preamble(case["tools"]) == case["expected"], case["name"]
+
+
+# ---------------------------------------------------------------------------
+# safe_arithmetic — numeric only, no eval/exec.
+# ---------------------------------------------------------------------------
+
+
+def test_safe_arithmetic_basic():
+    assert safe_arithmetic("2 * (3 + 4)") == 14
+    assert safe_arithmetic("10 / 4") == 2.5
+    assert safe_arithmetic("2 ** 10") == 1024
+    assert safe_arithmetic("-7 + 3") == -4
+    assert safe_arithmetic("17 % 5") == 2
+    assert safe_arithmetic("17 // 5") == 3
+
+
+def test_safe_arithmetic_rejects_names_and_calls():
+    for expr in ["__import__('os')", "os.system('x')", "a + 1", "len([1])", "x"]:
+        with pytest.raises(ValueError):
+            safe_arithmetic(expr)
+
+
+def test_safe_arithmetic_rejects_oversized_power():
+    with pytest.raises(ValueError):
+        safe_arithmetic("2 ** 10000000")
+
+
+def test_safe_arithmetic_division_by_zero_surfaces():
+    with pytest.raises(ZeroDivisionError):
+        safe_arithmetic("1 / 0")
+
+
+# ---------------------------------------------------------------------------
+# run_tool_loop — generate -> parse -> execute -> append -> regenerate.
+# A scripted generate callable stands in for the model; no MLX involved.
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedModel:
+    """A generate() callable that returns a fixed list of outputs in order and
+    records the exact message list it was handed on each call."""
+
+    def __init__(self, outputs):
+        self._outputs = list(outputs)
+        self.calls = []
+
+    def __call__(self, messages):
+        # Snapshot (deep-ish copy of the role/content we care about) so later
+        # mutation of the running conversation does not corrupt the record.
+        self.calls.append([dict(m) for m in messages])
+        if self._outputs:
+            return self._outputs.pop(0)
+        return "(no more scripted outputs)"
+
+
+_CALC_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "calculator",
+            "description": "Evaluate arithmetic",
+            "parameters": {
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"],
+            },
+        },
+    }
+]
+
+
+def _calc_executor(name, arguments):
+    assert name == "calculator"
+    return str(safe_arithmetic(arguments["expression"]))
+
+
+def test_loop_executes_tool_then_returns_final_answer():
+    model = _ScriptedModel(
+        [
+            '{"tool_call": {"name": "calculator", "arguments": {"expression": "2 + 2"}}}',
+            "The answer is 4.",
+        ]
+    )
+    result = run_tool_loop(
+        messages=[{"role": "user", "content": "what is 2+2?"}],
+        tools=_CALC_TOOLS,
+        tool_executor=_calc_executor,
+        generate=model,
+    )
+    assert result.stopped_reason == "completed"
+    assert result.final_text == "The answer is 4."
+    assert len(result.rounds) == 1
+    assert result.rounds[0].name == "calculator"
+    assert result.rounds[0].result == "4"
+    assert result.rounds[0].is_error is False
+
+    roles = [m["role"] for m in result.messages]
+    # system preamble, user, assistant(tool_call), tool(result)
+    assert roles == ["system", "user", "assistant", "tool"]
+    assert "You have access to the following tools" in result.messages[0]["content"]
+    tool_msg = result.messages[3]
+    assert tool_msg["role"] == "tool"
+    assert tool_msg["name"] == "calculator"
+    assert tool_msg["content"] == "4"
+    # Second generation saw the tool result appended.
+    assert model.calls[1][-1]["role"] == "tool"
+
+
+def test_loop_is_bounded_by_max_rounds_when_model_never_stops():
+    # Model that ALWAYS emits a tool call -> without a bound this would spin
+    # forever. The loop must stop after max_rounds executions.
+    always_call = '{"tool_call": {"name": "calculator", "arguments": {"expression": "1 + 1"}}}'
+    model = _ScriptedModel([always_call] * 50)
+    result = run_tool_loop(
+        messages=[{"role": "user", "content": "loop"}],
+        tools=_CALC_TOOLS,
+        tool_executor=_calc_executor,
+        generate=model,
+        max_rounds=3,
+    )
+    assert result.stopped_reason == "max_rounds"
+    assert len(result.rounds) == 3
+    # At most max_rounds + 1 generations.
+    assert len(model.calls) == 4
+
+
+def test_loop_surfaces_executor_errors_as_tool_messages_not_crashes():
+    model = _ScriptedModel(
+        [
+            '{"tool_call": {"name": "calculator", "arguments": {"expression": "1 / 0"}}}',
+            "I could not compute that.",
+        ]
+    )
+
+    def boom_executor(name, arguments):
+        return str(safe_arithmetic(arguments["expression"]))  # raises ZeroDivisionError
+
+    # No exception should escape the loop.
+    result = run_tool_loop(
+        messages=[{"role": "user", "content": "divide by zero"}],
+        tools=_CALC_TOOLS,
+        tool_executor=boom_executor,
+        generate=model,
+    )
+    assert result.stopped_reason == "completed"
+    assert result.final_text == "I could not compute that."
+    assert len(result.rounds) == 1
+    assert result.rounds[0].is_error is True
+    assert "Error executing tool 'calculator'" in result.rounds[0].result
+    # The error was appended as a tool-role message the model then saw.
+    assert result.messages[-1]["role"] == "tool"
+    assert "Error executing tool 'calculator'" in result.messages[-1]["content"]
+
+
+def test_loop_without_tools_is_single_generation():
+    model = _ScriptedModel(["just a plain answer"])
+    result = run_tool_loop(
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+        tool_executor=_calc_executor,
+        generate=model,
+    )
+    assert result.stopped_reason == "completed"
+    assert result.final_text == "just a plain answer"
+    assert result.rounds == []
+    assert len(model.calls) == 1
+    # No preamble injected when there are no tools.
+    assert [m["role"] for m in result.messages] == ["user"]
+
+
+def test_loop_does_not_mutate_caller_messages():
+    original = [{"role": "user", "content": "what is 2+2?"}]
+    model = _ScriptedModel(
+        [
+            '{"tool_call": {"name": "calculator", "arguments": {"expression": "2 + 2"}}}',
+            "4",
+        ]
+    )
+    run_tool_loop(
+        messages=original,
+        tools=_CALC_TOOLS,
+        tool_executor=_calc_executor,
+        generate=model,
+    )
+    assert original == [{"role": "user", "content": "what is 2+2?"}]

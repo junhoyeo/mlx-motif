@@ -42,6 +42,86 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _demo_tools() -> list[dict]:
+    """Two SAFE builtin tools for the CLI tool-execution demo.
+
+    Neither tool executes arbitrary code: ``get_current_time`` reads the clock
+    and ``calculator`` evaluates a numeric expression via an AST whitelist
+    (``mlx_motif.tool_calls.safe_arithmetic`` — no ``eval``/``exec``).
+    """
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_current_time",
+                "description": "Get the current local date and time as an ISO 8601 string.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "description": (
+                    "Evaluate a basic arithmetic expression "
+                    "(supports + - * / // % ** and parentheses)."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {
+                            "type": "string",
+                            "description": "e.g. '2 * (3 + 4)'",
+                        }
+                    },
+                    "required": ["expression"],
+                },
+            },
+        },
+    ]
+
+
+def _demo_tool_executor(name: str, arguments: dict) -> str:
+    """Execute a builtin demo tool. Raises on unknown tool / bad arguments;
+    ``run_tool_loop`` catches and surfaces the error as a tool message."""
+    from datetime import datetime
+
+    from mlx_motif.tool_calls import safe_arithmetic
+
+    if name == "get_current_time":
+        return datetime.now().isoformat(timespec="seconds")
+    if name == "calculator":
+        expression = arguments.get("expression")
+        if not isinstance(expression, str):
+            raise ValueError("calculator requires a string 'expression' argument")
+        return str(safe_arithmetic(expression))
+    raise ValueError(f"unknown tool: {name}")
+
+
+def _cmd_tools_demo(args: argparse.Namespace) -> int:
+    from mlx_motif import load
+    from mlx_motif.tool_calls import make_mlx_generate_fn, run_tool_loop
+
+    model, tokenizer = load(args.model)
+    tools = _demo_tools()
+    generate = make_mlx_generate_fn(model, tokenizer, max_tokens=args.max_tokens)
+
+    result = run_tool_loop(
+        messages=[{"role": "user", "content": args.prompt}],
+        tools=tools,
+        tool_executor=_demo_tool_executor,
+        generate=generate,
+        max_rounds=args.max_rounds,
+    )
+
+    for i, rnd in enumerate(result.rounds, 1):
+        marker = "ERROR" if rnd.is_error else "ok"
+        print(f"[tool round {i}] {rnd.name}({rnd.arguments}) -> {rnd.result} ({marker})")
+    print(f"[stopped: {result.stopped_reason}]")
+    print(result.final_text)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mlx-motif")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -98,6 +178,21 @@ def main(argv: list[str] | None = None) -> int:
             or 0
         )
     )
+
+    pt = sub.add_parser(
+        "tools-demo",
+        help="Run the tool-EXECUTION loop with 2 safe builtin tools (time, calculator)",
+    )
+    pt.add_argument("--model", required=True, help="Path to converted MLX checkpoint")
+    pt.add_argument("--prompt", required=True)
+    pt.add_argument("--max-tokens", type=int, default=256)
+    pt.add_argument(
+        "--max-rounds",
+        type=int,
+        default=5,
+        help="Maximum tool-execution cycles before stopping",
+    )
+    pt.set_defaults(func=_cmd_tools_demo)
 
     args = parser.parse_args(argv)
     return args.func(args)

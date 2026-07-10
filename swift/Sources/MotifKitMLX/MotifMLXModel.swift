@@ -373,11 +373,16 @@ public final class MotifMLXAttentionScaffold: Module {
                 executionMode: kernelExecutionMode
             )
         } else if attentionPath == .dualV {
+            // The kernel broadcasts GQA natively (`kv_head_idx = head_idx /
+            // GQA_FACTOR`, i.e. repeat-interleave semantics), matching Python
+            // model.py's `sdpa_dual_v(q1, k1, v1, v2, scale)`: pass the cached
+            // slabs unrepeated instead of materializing groupedRatio× copies
+            // of the full KV history per layer per decoded token.
             let attnOrigin = MotifSDPADualV.apply(
                 queries: slices.qOrigin,
-                keys: repeatHeadsIfNeeded(slices.kOrigin, count: layout.groupedRatio),
-                value1: repeatHeadsIfNeeded(slices.value1, count: layout.groupedRatio),
-                value2: repeatHeadsIfNeeded(slices.value2, count: layout.groupedRatio),
+                keys: slices.kOrigin,
+                value1: slices.value1,
+                value2: slices.value2,
                 scale: scale,
                 mask: mask,
                 executionMode: kernelExecutionMode

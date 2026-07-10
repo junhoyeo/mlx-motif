@@ -859,11 +859,16 @@ public enum MotifGroupedDifferentialAttentionReference {
         mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
         eps: Float = 1e-5
     ) -> MLXArray {
+        // Both downstream paths broadcast GQA natively — the Metal kernel via
+        // `kv_head_idx = head_idx / GQA_FACTOR` and MLXFast SDPA via its
+        // built-in grouped-query support (identical repeat-interleave head
+        // mapping) — so the origin slabs are passed unrepeated instead of
+        // materializing groupedRatio× full-sequence copies per layer.
         let attnOrigin = dualValueAttention(
             queries: qOrigin,
-            keys: repeatHeadsIfNeeded(kOrigin, count: groupedRatio),
-            value1: repeatHeadsIfNeeded(value1, count: groupedRatio),
-            value2: repeatHeadsIfNeeded(value2, count: groupedRatio),
+            keys: kOrigin,
+            value1: value1,
+            value2: value2,
             scale: scale,
             mask: mask
         )
@@ -922,10 +927,6 @@ public enum MotifGroupedDifferentialAttentionReference {
             groupedRatio: groupedRatio,
             eps: eps
         )
-    }
-
-    private static func repeatHeadsIfNeeded(_ x: MLXArray, count: Int) -> MLXArray {
-        count == 1 ? x : repeated(x, count: count, axis: 1)
     }
 }
 

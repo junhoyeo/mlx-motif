@@ -322,7 +322,20 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
 
     @property
     def state(self):
-        return self.k1, self.k2, self.v1, self.v2
+        # Mirror the fp16 variant: serialize only the live [:offset] region of
+        # each quantized triple, not the step-padded capacity (slots grow in
+        # step=256 increments, so untrimmed state carries up to step-1 tokens of
+        # zero padding — and post-trim() stale rows — across 12 tensors/layer).
+        # _grow handles non-step-aligned capacities via _trim_slot/_expand_slot,
+        # so a trimmed slot round-trips through the setter + meta_state offset.
+        if self.offset == 0 or self.k1 is None:
+            return self.k1, self.k2, self.v1, self.v2
+        o = self.offset
+
+        def _trim(slot):
+            return tuple(x[..., :o, :] for x in slot)
+
+        return _trim(self.k1), _trim(self.k2), _trim(self.v1), _trim(self.v2)
 
     @state.setter
     def state(self, v):

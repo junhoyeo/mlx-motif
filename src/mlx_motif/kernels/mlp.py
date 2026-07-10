@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from ._common import _DISABLE
+from ._common import _DISABLE, _scalar_f32
 
 # --------------------------------------------------------------------------- #
 # PolyNorm
@@ -145,7 +145,7 @@ def polynorm(x: mx.array, weight: mx.array, bias: mx.array, eps: float = 1e-6) -
     grid = (rows * tg, 1, 1)
     threadgroup = (tg, 1, 1)
 
-    eps_arr = mx.array([eps], dtype=mx.float32)
+    eps_arr = _scalar_f32(eps)
     out = _polynorm_kernel(
         inputs=[x_flat, weight.astype(x.dtype), bias.astype(x.dtype), eps_arr],
         template=[("T", x.dtype), ("D", D)],

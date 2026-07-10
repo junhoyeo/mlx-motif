@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from ._common import _DISABLE
+from ._common import _DISABLE, _scalar_f32
 
 # --------------------------------------------------------------------------- #
 # Fused post-attention GDA reduction
@@ -28,7 +28,6 @@ _GDA_POST_SRC = r"""
     // CHANNELS = 2 * head_dim contiguous channels.
     uint row     = threadgroup_position_in_grid.x;
     uint tid     = thread_position_in_threadgroup.x;
-    uint tgsize  = threads_per_threadgroup.x;
 
     // Decompose row into (b, h_o, s) using contiguous (B, q_origin, S) layout.
     uint hs    = (Q_ORIGIN * S);
@@ -48,10 +47,18 @@ _GDA_POST_SRC = r"""
     float scale = float(scale_in[0]);
     float eps   = float(eps_in[0]);
 
-    // Pass 1: compute the per-row sum of squares of the differential.
+    // Pass 1: compute the per-row sum of squares of the differential, caching
+    // each thread's differential(s) in registers so pass 2 does not re-read
+    // row_o/row_n from device memory and recompute (mirrors sdpa_dual_v's
+    // in-register o1/o2 accumulation). TG == threads_per_threadgroup.x, so
+    // each thread owns PER_THREAD channels at stride TG.
+    constexpr uint PER_THREAD = (uint(CHANNELS) + uint(TG) - 1u) / uint(TG);
+    float d_reg[PER_THREAD];
     float ssq = 0.0f;
-    for (uint i = tid; i < CHANNELS; i += tgsize) {
-        float d = float(row_o[i]) - lam * float(row_n[i]);
+    for (uint j = 0; j < PER_THREAD; ++j) {
+        uint i = tid + j * uint(TG);
+        float d = (i < CHANNELS) ? (float(row_o[i]) - lam * float(row_n[i])) : 0.0f;
+        d_reg[j] = d;
         ssq += d * d;
     }
 
@@ -71,11 +78,13 @@ _GDA_POST_SRC = r"""
 
     float rms_inv = metal::rsqrt(tg_partial[0] / float(CHANNELS) + eps);
 
-    // Pass 2: emit the SubLN-normalised, scaled output.
-    for (uint i = tid; i < CHANNELS; i += tgsize) {
-        float d  = float(row_o[i]) - lam * float(row_n[i]);
-        float sw = float(subln_w[i]);
-        row_y[i] = T(d * rms_inv * sw * scale);
+    // Pass 2: emit the SubLN-normalised, scaled output from the cached d.
+    for (uint j = 0; j < PER_THREAD; ++j) {
+        uint i = tid + j * uint(TG);
+        if (i < CHANNELS) {
+            float sw = float(subln_w[i]);
+            row_y[i] = T(d_reg[j] * rms_inv * sw * scale);
+        }
     }
 """
 
@@ -121,7 +130,6 @@ _GDA_POST_SPLIT_SRC = r"""
     // (B, q_origin+q_groups, S, 2d) concat allocation upstream.
     uint row     = threadgroup_position_in_grid.x;
     uint tid     = thread_position_in_threadgroup.x;
-    uint tgsize  = threads_per_threadgroup.x;
 
     uint hs    = (Q_ORIGIN * S);
     uint b     = row / hs;
@@ -138,9 +146,16 @@ _GDA_POST_SPLIT_SRC = r"""
     float scale = float(scale_in[0]);
     float eps   = float(eps_in[0]);
 
+    // Cache the per-thread differential(s) in registers during pass 1 so pass 2
+    // reuses them instead of re-reading row_o/row_n and recomputing. TG ==
+    // threads_per_threadgroup.x; each thread owns PER_THREAD channels at stride TG.
+    constexpr uint PER_THREAD = (uint(CHANNELS) + uint(TG) - 1u) / uint(TG);
+    float d_reg[PER_THREAD];
     float ssq = 0.0f;
-    for (uint i = tid; i < CHANNELS; i += tgsize) {
-        float d = float(row_o[i]) - lam * float(row_n[i]);
+    for (uint j = 0; j < PER_THREAD; ++j) {
+        uint i = tid + j * uint(TG);
+        float d = (i < CHANNELS) ? (float(row_o[i]) - lam * float(row_n[i])) : 0.0f;
+        d_reg[j] = d;
         ssq += d * d;
     }
 
@@ -160,10 +175,12 @@ _GDA_POST_SPLIT_SRC = r"""
 
     float rms_inv = metal::rsqrt(tg_partial[0] / float(CHANNELS) + eps);
 
-    for (uint i = tid; i < CHANNELS; i += tgsize) {
-        float d  = float(row_o[i]) - lam * float(row_n[i]);
-        float sw = float(subln_w[i]);
-        row_y[i] = T(d * rms_inv * sw * scale);
+    for (uint j = 0; j < PER_THREAD; ++j) {
+        uint i = tid + j * uint(TG);
+        if (i < CHANNELS) {
+            float sw = float(subln_w[i]);
+            row_y[i] = T(d_reg[j] * rms_inv * sw * scale);
+        }
     }
 """
 
@@ -228,8 +245,8 @@ def gda_post_split(
     grid = (rows * tg, 1, 1)
     threadgroup = (tg, 1, 1)
 
-    scale = mx.array([1.0 - lambda_init], dtype=mx.float32)
-    eps_arr = mx.array([eps], dtype=mx.float32)
+    scale = _scalar_f32(1.0 - lambda_init)
+    eps_arr = _scalar_f32(eps)
 
     out = _gda_post_split_kernel(
         inputs=[
@@ -247,6 +264,7 @@ def gda_post_split(
             ("GR", gr),
             ("S", S),
             ("CHANNELS", channels),
+            ("TG", tg),
         ],
         grid=grid,
         threadgroup=threadgroup,
@@ -286,8 +304,8 @@ def gda_post(
     grid = (rows * tg, 1, 1)
     threadgroup = (tg, 1, 1)
 
-    scale = mx.array([1.0 - lambda_init], dtype=mx.float32)
-    eps_arr = mx.array([eps], dtype=mx.float32)
+    scale = _scalar_f32(1.0 - lambda_init)
+    eps_arr = _scalar_f32(eps)
 
     out = _gda_post_kernel(
         inputs=[
@@ -304,6 +322,7 @@ def gda_post(
             ("GR", gr),
             ("S", S),
             ("CHANNELS", channels),
+            ("TG", tg),
         ],
         grid=grid,
         threadgroup=threadgroup,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from ._common import _DISABLE
+from ._common import _DISABLE, _scalar_f32
 
 # --------------------------------------------------------------------------- #
 # Shared-QK, dual-V SDPA decode (`sdpa_dual_v`)
@@ -210,7 +210,7 @@ def sdpa_dual_v(q: mx.array, k: mx.array, v1: mx.array, v2: mx.array, scale: flo
     grid = (rows * tg, 1, 1)
     threadgroup = (tg, 1, 1)
 
-    scale_arr = mx.array([scale], dtype=mx.float32)
+    scale_arr = _scalar_f32(scale)
     out = _sdpa_dual_v_kernel(
         inputs=[q, k, v1, v2, scale_arr],
         template=[("T", q.dtype), ("D", D), ("KV_SEQ", KV), ("GQA_FACTOR", gqa_factor)],
@@ -505,7 +505,7 @@ def sdpa_dual_v_q4(
     grid = (rows * tg, 1, 1)
     threadgroup = (tg, 1, 1)
 
-    scale_arr = mx.array([scale], dtype=mx.float32)
+    scale_arr = _scalar_f32(scale)
     out = _sdpa_dual_v_q4_kernel(
         inputs=[
             q,

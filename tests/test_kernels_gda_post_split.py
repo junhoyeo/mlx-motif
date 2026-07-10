@@ -43,3 +43,27 @@ def test_gda_post_split_matches_reference(B, q_groups, gr, S, d, dtype):
         f"gda_post_split mismatch B={B} q_groups={q_groups} gr={gr} S={S} d={d} dtype={dtype}: "
         f"max diff={diff:.4e}"
     )
+
+
+# Exercise the in-register differential cache (finding 24): channels > tg
+# (PER_THREAD > 1) and channels not a multiple of 32 (tail threads masked).
+@pytest.mark.parametrize("d", [192, 20, 17])
+def test_gda_post_split_register_cache_edge_channels(d):
+    mx.random.seed(1)
+    B, q_groups, gr, S = 1, 2, 4, 3
+    q_origin = q_groups * gr
+    channels = 2 * d
+
+    attn_o = mx.random.normal((B, q_origin, S, channels)).astype(mx.float32)
+    attn_n = mx.random.normal((B, q_groups, S, channels)).astype(mx.float32)
+    subln_w = mx.random.normal((channels,)).astype(mx.float32)
+    lambda_full = mx.array([0.4321], dtype=mx.float32)
+    lambda_init = 0.65
+    eps = 1e-5
+
+    ref = gda_post_split_reference(attn_o, attn_n, subln_w, lambda_full, lambda_init, gr, eps)
+    got = gda_post_split(attn_o, attn_n, subln_w, lambda_full, lambda_init, gr, eps)
+    np.testing.assert_allclose(
+        np.array(got.astype(mx.float32)), np.array(ref.astype(mx.float32)),
+        rtol=1e-4, atol=1e-4,
+    )

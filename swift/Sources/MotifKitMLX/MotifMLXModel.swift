@@ -831,18 +831,25 @@ public final class MotifMLXModel: Module, LLMModel, KVCacheDimensionProvider {
         guard configuration.isGroupedDifferentialAttention else {
             return Self.defaultCaches(count: configuration.numHiddenLayers, parameters: parameters)
         }
-        // Fail-fast: the 4-slot grouped caches (MotifGroupedKVCache /
+        // The 4-slot grouped caches (MotifGroupedKVCache /
         // MotifGroupedQuantizedKVCache) allocate all four slots with a single
         // head count taken from kOrigin, but with kRatio > 1 the kOrigin slot
         // has keyGroups*kRatio heads while kNoise/value1/value2 have keyGroups
         // heads — the mismatched slot writes fail (or silently corrupt)
-        // mid-forward at cache-write time. No shipped config uses kRatio > 1, so
-        // guard the unsupported combination loudly here. (Python mirror:
+        // mid-forward at cache-write time. No shipped config uses kRatio > 1.
+        // An EXPLICIT request for the unsupported combination fails loudly;
+        // the default-on case (env var unset) quietly falls back to the stock
+        // cache so unsupported configs still run. (Python mirror:
         // Model.make_cache.)
         if let reason = Self.fourSlotCacheUnsupportedReason(
             mode: runtimeFeatures.fourSlotCacheMode,
             kRatio: configuration.kRatio
         ) {
+            guard runtimeFeatures.fourSlotCache != nil else {
+                return Self.defaultCaches(
+                    count: configuration.numHiddenLayers, parameters: parameters
+                )
+            }
             preconditionFailure(reason)
         }
         switch runtimeFeatures.fourSlotCacheMode {

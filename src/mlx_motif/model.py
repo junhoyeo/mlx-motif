@@ -798,9 +798,12 @@ class Model(nn.Module):
         """Override mlx-lm's default cache construction.
 
         For grouped-attention layers, return a `MotifGroupedKVCache` (4 slots)
-        if `MLX_MOTIF_4SLOT_CACHE=1`. The 4-slot path lets the per-step head
-        split happen BEFORE caching, so each layer's K and V live as
-        independent k1/k2/v1/v2 tensors instead of being re-sliced post-fetch.
+        by DEFAULT (`MLX_MOTIF_4SLOT_CACHE` unset or `=1`); set `=0` to opt
+        out. The 4-slot path lets the per-step head split happen BEFORE
+        caching, so each layer's K and V live as independent k1/k2/v1/v2
+        tensors instead of being re-sliced post-fetch — measured July 2026 on
+        the 12.7B q4 (M1 Max, bench_decode_e2e.py): 40.9 vs ~28 tok/s at p5
+        against the stock-cache configuration, so it is the default.
 
         With `MLX_MOTIF_4SLOT_CACHE=q4` the slots are quantized to 4-bit
         (group_size=64); `=q8` for 8-bit. Quantized variants feed
@@ -815,23 +818,29 @@ class Model(nn.Module):
             MotifVanillaKVCache,
         )
 
-        env = os.environ.get("MLX_MOTIF_4SLOT_CACHE", "0").lower()
+        raw = os.environ.get("MLX_MOTIF_4SLOT_CACHE")
+        explicit = raw is not None
+        env = (raw if explicit else "1").lower()
         use_4slot = env not in ("0", "", "false", "off")
-        # Fail-fast: the 4-slot grouped caches allocate all four slots (k1/k2/
-        # v1/v2) with a single head count derived from k1, but with k_ratio > 1
-        # the origin slot k1 has k_groups*k_ratio heads while k2/v1/v2 have
-        # k_groups heads — the mismatched slot writes would fail (or silently
-        # corrupt) mid-forward at cache-write time. No shipped config uses
-        # k_ratio > 1, so guard the unsupported combination loudly at cache
-        # construction instead. (Swift mirror: MotifMLXModel.newCache.)
+        # The 4-slot grouped caches allocate all four slots (k1/k2/v1/v2) with
+        # a single head count derived from k1, but with k_ratio > 1 the origin
+        # slot k1 has k_groups*k_ratio heads while k2/v1/v2 have k_groups
+        # heads — the mismatched slot writes would fail (or silently corrupt)
+        # mid-forward at cache-write time. No shipped config uses k_ratio > 1.
+        # An EXPLICIT request for the unsupported combination fails loudly at
+        # cache construction; the default-on case quietly falls back to the
+        # stock cache so unsupported configs still work out of the box.
+        # (Swift mirror: MotifMLXModel.newCache.)
         if use_4slot and self.args.is_grouped and self.args.k_ratio != 1:
-            raise ValueError(
-                "MLX_MOTIF_4SLOT_CACHE is not supported with k_ratio > 1 "
-                f"(got k_ratio={self.args.k_ratio}): the 4-slot grouped KV cache "
-                "allocates every slot with k1's head count, which differs from "
-                "k2/v1/v2 when k_ratio > 1. Unset MLX_MOTIF_4SLOT_CACHE for this "
-                "model configuration."
-            )
+            if explicit:
+                raise ValueError(
+                    "MLX_MOTIF_4SLOT_CACHE is not supported with k_ratio > 1 "
+                    f"(got k_ratio={self.args.k_ratio}): the 4-slot grouped KV cache "
+                    "allocates every slot with k1's head count, which differs from "
+                    "k2/v1/v2 when k_ratio > 1. Unset MLX_MOTIF_4SLOT_CACHE for this "
+                    "model configuration."
+                )
+            use_4slot = False
         caches = []
         for _layer in self.layers:
             if use_4slot and self.args.is_grouped:

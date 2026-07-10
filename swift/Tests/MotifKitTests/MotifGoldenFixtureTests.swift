@@ -141,6 +141,12 @@ final class MotifGoldenFixtureTests: XCTestCase {
         XCTAssertFalse(disabled.dualVAttention)
         XCTAssertFalse(disabled.quantizedSDPA)
         XCTAssertTrue(disabled.disableCustomKernels)
+
+        // Unset defaults ON (fp16 4-slot) — the measured-fastest decode
+        // configuration; parity with Python's Model.make_cache default.
+        let defaults = MotifRuntimeFeatureFlags.fromEnvironment([:])
+        XCTAssertEqual(defaults.fourSlotCacheMode, .fp)
+        XCTAssertEqual(defaults.fourSlotCacheMode.cacheKind, .groupedFourSlot)
         // QKV fusion now defaults ON for the grouped q4 decode path (measured
         // ~12-20% lower median ms/step at the 12.7B per-layer shape in the
         // synthetic decode micro-benchmark). It remains explicitly opt-out.

@@ -197,11 +197,21 @@ def test_make_cache_vanilla_uses_marked_cache():
     assert all(isinstance(c, MotifVanillaKVCache) for c in caches)
 
 
-def test_make_cache_grouped_non_4slot_uses_stock_cache(monkeypatch):
+def test_make_cache_grouped_default_uses_4slot_cache(monkeypatch):
+    # The 4-slot cache is the DEFAULT for grouped models (measured-fastest
+    # decode configuration); the vanilla-marked subclass never appears here.
     monkeypatch.delenv("MLX_MOTIF_4SLOT_CACHE", raising=False)
     model = Model(_grouped_args())
     caches = model.make_cache()
-    # Stock KVCache (not the vanilla-marked subclass) on the grouped path.
+    assert all(type(c).__name__ == "MotifGroupedKVCache" for c in caches)
+    assert all(not isinstance(c, MotifVanillaKVCache) for c in caches)
+
+
+def test_make_cache_grouped_opt_out_uses_stock_cache(monkeypatch):
+    monkeypatch.setenv("MLX_MOTIF_4SLOT_CACHE", "0")
+    model = Model(_grouped_args())
+    caches = model.make_cache()
+    # Stock KVCache (not the vanilla-marked subclass) on the opted-out path.
     assert all(isinstance(c, KVCache) for c in caches)
     assert all(not isinstance(c, MotifVanillaKVCache) for c in caches)
 

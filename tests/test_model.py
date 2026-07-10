@@ -149,11 +149,23 @@ def test_make_cache_rejects_4slot_with_k_ratio_gt_1(monkeypatch):
     assert len(caches) == model.args.num_hidden_layers
     assert type(caches[0]).__name__ == "KVCache"
 
+    # DEFAULT-on (env unset) must NOT raise for k_ratio > 1: only an explicit
+    # request fails loudly; the default quietly falls back to the stock cache
+    # so unsupported configs still work out of the box.
+    monkeypatch.delenv("MLX_MOTIF_4SLOT_CACHE", raising=False)
+    caches = model.make_cache()
+    assert type(caches[0]).__name__ == "KVCache"
+
 
 def test_make_cache_allows_4slot_with_k_ratio_1(monkeypatch):
-    """The default k_ratio == 1 grouped model still builds the 4-slot cache."""
+    """The default k_ratio == 1 grouped model builds the 4-slot cache both
+    explicitly and by default (env unset)."""
     model = Model(_grouped_args())
     monkeypatch.setenv("MLX_MOTIF_4SLOT_CACHE", "1")
+    caches = model.make_cache()
+    assert type(caches[0]).__name__ == "MotifGroupedKVCache"
+
+    monkeypatch.delenv("MLX_MOTIF_4SLOT_CACHE", raising=False)
     caches = model.make_cache()
     assert type(caches[0]).__name__ == "MotifGroupedKVCache"
 

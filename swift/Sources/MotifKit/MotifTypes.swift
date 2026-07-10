@@ -563,9 +563,12 @@ public struct MotifRuntimeFeatureFlags: Equatable, Sendable {
     }
 
     public static func parseFourSlotCacheMode(_ value: String?) -> FourSlotCacheMode {
-        guard let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
-              !["", "0", "false", "off", "no"].contains(normalized)
-        else {
+        // Unset defaults ON (fp16 4-slot) — the measured-fastest decode
+        // configuration (Python mirror: Model.make_cache). Only an explicit
+        // falsy value opts out.
+        guard let value else { return .fp }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !["", "0", "false", "off", "no"].contains(normalized) else {
             return .disabled
         }
         switch normalized {

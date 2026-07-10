@@ -186,10 +186,42 @@ public final class MotifMLXAttentionScaffold: Module {
         }
     }
 
-    private func lambdaFull(dtype: DType) -> MLXArray {
+    /// Reference box for the materialized fp32 lambda scalar. Held as a plain
+    /// Swift class (not an `MLXArray`/`Module`) so MLXNN parameter reflection
+    /// never treats the cache as a model parameter.
+    private final class LambdaScalarCache {
+        var fp32: MLXArray?
+    }
+
+    private let lambdaScalarCache = LambdaScalarCache()
+
+    /// Lambda scalar for the differential subtraction, computed in fp32 to match
+    /// Python's `_lambda_full(mx.float32)` — the `exp`/`sub` is numerically
+    /// sensitive, so lambda is kept in fp32 before any downcast (see model.py:255
+    /// "lambda parameters — kept fp32 for numerical stability of exp/sub").
+    ///
+    /// `lambdaQ1/K1/Q2/K2` are frozen at inference, so the fp32 scalar is
+    /// materialized once and cached; callers requesting another dtype get a cheap
+    /// cast of the cached value instead of rebuilding the exp/sum graph per layer
+    /// per decoded token. The cache is only valid while the lambda parameters do
+    /// not change (inference / `training == false`).
+    func lambdaFull(dtype: DType) -> MLXArray {
+        let base = cachedLambdaFullFP32()
+        return dtype == .float32 ? base : base.asType(dtype)
+    }
+
+    private func cachedLambdaFullFP32() -> MLXArray {
+        if let cached = lambdaScalarCache.fp32 {
+            return cached
+        }
         let l1 = exp(sum(lambdaQ1 * lambdaK1, axis: -1).asType(.float32))
         let l2 = exp(sum(lambdaQ2 * lambdaK2, axis: -1).asType(.float32))
-        return (l1 - l2 + lambdaInit).asType(dtype)
+        let value = (l1 - l2 + lambdaInit).asType(.float32)
+        // Materialize once so subsequent forwards reference stored data rather
+        // than re-executing the reduction/exp kernels per decoded token.
+        eval(value)
+        lambdaScalarCache.fp32 = value
+        return value
     }
 
     private func forwardGrouped(
@@ -333,7 +365,11 @@ public final class MotifMLXAttentionScaffold: Module {
             )
         }
 
-        let lambda = lambdaFull(dtype: x.dtype).reshaped([1])
+        // Match Python's grouped path (`self._lambda_full(mx.float32)`, model.py:517):
+        // keep lambda in fp32 into the kernels. Casting to the activation dtype
+        // here would round lambda before the wrappers upcast it back to fp32,
+        // losing mantissa bits and diverging from Python in every grouped layer.
+        let lambda = lambdaFull(dtype: .float32).reshaped([1])
         let kernelExecutionMode: MotifMetalKernelExecutionMode =
             runtimeFeatures.disableCustomKernels ? .referenceOnly : .metalPreferred
         let out: MLXArray

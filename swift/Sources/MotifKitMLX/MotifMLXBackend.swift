@@ -66,7 +66,7 @@ public actor MotifMLXBackend: MotifChatBackend {
         }
 
         return AsyncThrowingStream { continuation in
-            Task {
+            let task = Task {
                 do {
                     let runtime = try await self.runtime(modelDirectory: modelDirectory)
                     let stream = runtime.streamResponse(messages: messages, parameters: parameters)
@@ -78,6 +78,12 @@ public actor MotifMLXBackend: MotifChatBackend {
                     continuation.finish(throwing: error)
                 }
             }
+            // Forward consumer cancellation (e.g. the UI "stop" button) down to
+            // this wrapper task. Cancelling it terminates the `for try await`
+            // over the runtime stream, which fires that stream's own
+            // onTermination and cancels the underlying GPU token loop. Without
+            // this, an aborted turn keeps decoding to maxTokens/EOS.
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 

@@ -508,6 +508,22 @@ public final class MotifGroupedQuantizedKVCache: KVCache, CustomDebugStringConve
     private func initQuantizedStorage(batch: Int, heads: Int, sequenceLength: Int, headDim: Int, dtype: DType)
         -> MotifQuantizedTuple
     {
+        // Allocate the packed storage directly instead of materializing a full
+        // fp zeros slab and running the quantize kernel over it just to obtain
+        // correctly-shaped buffers. Quantizing zeros produces all-zero packed
+        // words / scales / biases, so plain zeros of the packed shapes are
+        // bit-identical — and skip a throwaway slab plus a quantize dispatch on
+        // every growth step. Mirrors the Python reference `_init_storage`
+        // (src/mlx_motif/cache.py). Only the default affine layout is safe to
+        // synthesize by hand; other modes fall back to quantizing zeros.
+        if mode == .affine {
+            let packedLast = headDim * bits / 32
+            let groups = headDim / groupSize
+            let data = MLXArray.zeros([batch, heads, sequenceLength, packedLast], dtype: .uint32)
+            let scales = MLXArray.zeros([batch, heads, sequenceLength, groups], dtype: dtype)
+            let biases = MLXArray.zeros([batch, heads, sequenceLength, groups], dtype: dtype)
+            return (data, scales, biases)
+        }
         let zeros = MLXArray.zeros([batch, heads, sequenceLength, headDim], dtype: dtype)
         let q = quantized(zeros, groupSize: groupSize, bits: bits, mode: mode)
         return (q.wq, q.scales, q.biases)

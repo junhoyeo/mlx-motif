@@ -119,8 +119,17 @@ final class MotifGroupedAttentionReferenceTests: XCTestCase {
         let cached = cache.updateAndFetch4(kOrigin: k1, kNoise: k2, value1: v1, value2: v2)
 
         XCTAssertEqual(cache.offset, 1)
-        XCTAssertEqual(cached.kOrigin.shape, [1, 2, 1, 4])
+        // updateAndFetch4 returns FULL step-padded capacity buffers now, so the
+        // fetched axis-2 length is `step` (256), not the live length (1). The
+        // decode kernel bounds reads by cache.offset; the live region still
+        // holds exactly the written slice.
+        XCTAssertEqual(cached.kOrigin.shape, [1, 2, cache.step, 4])
+        XCTAssertTrue(
+            allClose(cached.kOrigin[.ellipsis, ..<cache.offset, 0...], k1).item(Bool.self)
+        )
+        // state serializes only the live [:offset] region, so it is exact-length.
         XCTAssertEqual(cache.state.count, 4)
+        XCTAssertEqual(cache.state[0].shape, [1, 2, 1, 4])
         XCTAssertEqual(cache.metaState.first, "1")
         XCTAssertEqual(cache.trim(1), 1)
         XCTAssertEqual(cache.offset, 0)
@@ -138,9 +147,12 @@ final class MotifGroupedAttentionReferenceTests: XCTestCase {
 
         let packed = cache.updateAndFetch4Quantized(kOrigin: k1, kNoise: k2, value1: v1, value2: v2)
         XCTAssertEqual(cache.offset, 1)
-        XCTAssertEqual(Array(packed.kOrigin.data.shape[0...2]), [1, 2, 1])
+        // updateAndFetch4Quantized returns FULL step-padded capacity triples, so
+        // the packed axis-2 length is `step` (256), not the live length (1).
+        XCTAssertEqual(Array(packed.kOrigin.data.shape[0...2]), [1, 2, cache.step])
         XCTAssertTrue([8, 12].contains(cache.state.count))
 
+        // The dequantizing bridge stays EXACT-length for the fp16 fallback.
         let dequantized = cache.updateAndFetch4(kOrigin: k1, kNoise: k2, value1: v1, value2: v2)
         XCTAssertEqual(cache.offset, 2)
         XCTAssertEqual(dequantized.value2.shape, [1, 2, 2, 32])

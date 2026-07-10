@@ -548,14 +548,25 @@ public enum MotifSDPADualV {
         value2: MLXArray,
         scale: Float,
         mask: MLXFast.ScaledDotProductAttentionMaskMode = .none,
+        kvLen: Int? = nil,
         executionMode: MotifMetalKernelExecutionMode = .metalPreferred
     ) -> MLXArray {
+        // `kvLen` is the number of live KV rows to attend over. It defaults to
+        // the buffer length (`keys.dim(2)`); callers pass full step-padded
+        // capacity buffers together with a smaller live length so the kernel
+        // avoids a per-step `ensure_row_contiguous` copy of the live KV region
+        // (see MotifGroupedKVCache.updateAndFetch4). Row strides come from each
+        // buffer's own shape, so padded rows past `liveLength` are never read.
+        // Mirrors the Python `sdpa_dual_v(..., kv_len=...)` wrapper.
+        let liveLength = kvLen ?? keys.dim(2)
         guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode),
               maskIsDecodeNoOp(mask),
               queries.dim(2) == 1,
               queries.dim(3) % 32 == 0,
               keys.dim(1) > 0,
               queries.dim(1) % keys.dim(1) == 0,
+              liveLength >= 0,
+              liveLength <= keys.dim(2),
               // Full K/V contract, mirroring the Python wrapper's asserts
               // (`v1.shape == v2.shape == (B, H_kv, KV, D)`, `k.shape[-1] == D`):
               // the kernel indexes K and both V slabs with strides derived from
@@ -567,9 +578,28 @@ public enum MotifSDPADualV {
               value2.shape == keys.shape
         else {
             MotifKernelFallbackTelemetry.recordFallback(.sdpaDualV)
-            return reference(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale, mask: mask)
+            // The reference (MLXFast SDPA) path has no runtime length bound, so
+            // slice the buffers to the live region before the fallback attends
+            // over them. Mirrors the Python reference wrapper, which slices
+            // `k/v1/v2[..., :kv_len, :]` before falling back.
+            return reference(
+                queries: queries,
+                keys: boundedRows(keys, to: liveLength),
+                value1: boundedRows(value1, to: liveLength),
+                value2: boundedRows(value2, to: liveLength),
+                scale: scale,
+                mask: mask
+            )
         }
-        return metal(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale)
+        return metal(queries: queries, keys: keys, value1: value1, value2: value2, scale: scale, kvLen: liveLength)
+    }
+
+    /// Slice a `(B, H, KV_cap, D)` buffer to its first `length` rows along the
+    /// sequence axis. Returns the buffer unchanged when it is already exactly
+    /// `length` long, so the exact-length caller path never builds a view.
+    private static func boundedRows(_ buffer: MLXArray, to length: Int) -> MLXArray {
+        guard length >= 0, length < buffer.dim(2) else { return buffer }
+        return buffer[.ellipsis, ..<length, 0...]
     }
 
     /// The Metal kernel computes an unmasked softmax over every KV position.
@@ -592,7 +622,8 @@ public enum MotifSDPADualV {
         keys: MLXArray,
         value1: MLXArray,
         value2: MLXArray,
-        scale: Float
+        scale: Float,
+        kvLen: Int
     ) -> MLXArray {
         let batch = queries.dim(0)
         let queryHeads = queries.dim(1)
@@ -609,8 +640,11 @@ public enum MotifSDPADualV {
         let scaleArray = MotifKernelScalarCache.scalar(scale)
         // KV length is a runtime input rather than a template constant so a
         // growing decode context does not force a fresh Metal JIT compile
-        // (one new pipeline per token) — the template set stays finite.
-        let kvLengthArray = MLXArray([Int32(kvSequenceLength)])
+        // (one new pipeline per token) — the template set stays finite. The
+        // kernel indexes K/V rows by each buffer's own capacity stride (from
+        // its shape) and bounds the softmax loop by this live `kvLen`, so
+        // callers may pass step-padded capacity buffers with kvLen < capacity.
+        let kvLengthArray = MLXArray([Int32(kvLen)])
         let outputs = metalKernel(
             [queries, keys, value1, value2, scaleArray, kvLengthArray],
             template: [
@@ -699,14 +733,25 @@ public enum MotifSDPADualVQ4 {
         bits: Int,
         mode: QuantizationMode = .affine,
         dtype: DType? = nil,
+        kvLen: Int? = nil,
         executionMode: MotifMetalKernelExecutionMode = .metalPreferred
     ) -> MLXArray {
+        // Live KV rows to attend over (defaults to the packed buffer length).
+        // Callers pass full step-padded capacity triples plus a smaller live
+        // length so the kernel skips a per-step `ensure_row_contiguous` copy of
+        // all nine live-region buffers. Mirrors Python `sdpa_dual_v_q4(kv_len=)`.
+        let liveLength = kvLen ?? quantizedKeys.data.dim(2)
         guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode),
               mode == .affine,
               queries.dim(2) == 1,
               queries.dim(3) % 32 == 0,
               queries.dim(3) % groupSize == 0,
               bits == 4 || bits == 8,
+              // Live-region bounds (from the full-capacity cache-fetch path):
+              // callers pass step-padded capacity triples plus a smaller live
+              // length, so bound it before the kernel indexes the packed buffers.
+              liveLength >= 0,
+              liveLength <= quantizedKeys.data.dim(2),
               // Packed-SDPA lane -> word -> group contract (SUFFICIENT, not just
               // necessary). Each lane owns a CONTIGUOUS block of qk_per_thread =
               // D/32 channels starting at base = sg_lid*qk_per_thread, and per
@@ -748,11 +793,14 @@ public enum MotifSDPADualVQ4 {
               quantizedKeys.scales.dim(2) == quantizedKeys.data.dim(2)
         else {
             MotifKernelFallbackTelemetry.recordFallback(.sdpaDualVQ4)
+            // The dequant + MLXFast SDPA reference path has no runtime length
+            // bound, so slice each packed triple to the live region first.
+            // Mirrors the Python reference wrapper's `[..., :kv_len, :]` slice.
             return reference(
                 queries: queries,
-                quantizedKeys: quantizedKeys,
-                quantizedValue1: quantizedValue1,
-                quantizedValue2: quantizedValue2,
+                quantizedKeys: boundedTriple(quantizedKeys, to: liveLength),
+                quantizedValue1: boundedTriple(quantizedValue1, to: liveLength),
+                quantizedValue2: boundedTriple(quantizedValue2, to: liveLength),
                 scale: scale,
                 groupSize: groupSize,
                 bits: bits,
@@ -767,7 +815,20 @@ public enum MotifSDPADualVQ4 {
             quantizedValue2: (quantizedValue2.data, quantizedValue2.scales, value2Biases),
             scale: scale,
             groupSize: groupSize,
-            bits: bits
+            bits: bits,
+            kvLen: liveLength
+        )
+    }
+
+    /// Slice a packed `(data, scales, biases)` triple to its first `length`
+    /// sequence rows. Returns the triple unchanged when it is already exactly
+    /// `length` long so the exact-length caller path never builds a view.
+    private static func boundedTriple(_ triple: MotifQuantizedTuple, to length: Int) -> MotifQuantizedTuple {
+        guard length >= 0, length < triple.data.dim(2) else { return triple }
+        return (
+            triple.data[.ellipsis, ..<length, 0...],
+            triple.scales[.ellipsis, ..<length, 0...],
+            triple.biases.map { $0[.ellipsis, ..<length, 0...] }
         )
     }
 
@@ -778,7 +839,8 @@ public enum MotifSDPADualVQ4 {
         quantizedValue2: (data: MLXArray, scales: MLXArray, biases: MLXArray),
         scale: Float,
         groupSize: Int,
-        bits: Int
+        bits: Int,
+        kvLen: Int
     ) -> MLXArray {
         let batch = queries.dim(0)
         let queryHeads = queries.dim(1)
@@ -802,9 +864,11 @@ public enum MotifSDPADualVQ4 {
         let rows = batch * queryHeads
         let threads = 32 * 32
         let scaleArray = MotifKernelScalarCache.scalar(scale)
-        // Runtime KV length (see MotifSDPADualV.metal): keeps the compiled
-        // pipeline set finite instead of respecializing per context length.
-        let kvLengthArray = MLXArray([Int32(kvSequenceLength)])
+        // Runtime KV length (see MotifSDPADualV.metal): the kernel indexes rows
+        // by the packed K buffer's own capacity stride and bounds the softmax
+        // loop by this live `kvLen`, so callers may pass step-padded capacity
+        // triples with kvLen < capacity. Keeps the compiled pipeline set finite.
+        let kvLengthArray = MLXArray([Int32(kvLen)])
         let outputs = metalKernel(
             [
                 queries,

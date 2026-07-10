@@ -141,10 +141,14 @@ def main():
         for run in range(args.warmup_runs):
             tps = run_bench(prompt, model, tokenizer, args.max_tokens)
             print(f"[bench]   warmup {run + 1}: {tps:.2f} tok/s", file=sys.stderr, flush=True)
+        # Peak memory is process-global and monotone; reset after warmup so
+        # each cell reports the high-water mark of its own measured runs only.
+        mx.reset_peak_memory()
         for run in range(args.n_runs):
             tps = run_bench(prompt, model, tokenizer, args.max_tokens)
             tps_list.append(tps)
             print(f"[bench]   run {run + 1}: {tps:.2f} tok/s", file=sys.stderr, flush=True)
+        peak_gb = mx.get_peak_memory() / 1e9
 
         stats = summarize(tps_list)
         results[key] = {
@@ -155,6 +159,7 @@ def main():
             "min": stats["min"],
             "max": stats["max"],
             "actual_prompt_len": actual_len,
+            "peak_memory_gb": round(peak_gb, 3),
         }
         median = stats["median"] or 0
         print(f"[bench] {key} median: {median:.2f} tok/s", file=sys.stderr, flush=True)

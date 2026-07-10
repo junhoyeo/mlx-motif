@@ -147,8 +147,15 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
     /// the new suffix and reuse the cached prefix instead of re-prefilling it.
     /// `nil` means "no reusable cache" — the next turn starts fresh.
     ///
-    /// Reuse is mathematically lossless: it feeds the exact KV the model already
-    /// computed. On the quantized (q4) checkpoint the resulting greedy output is
+    /// Reuse feeds the exact KV the model already computed — but only once the
+    /// cache offset has been reconciled with `cachedTokenIDs`. `generateTokens`
+    /// steps the stop token through the model before deciding to stop, so an
+    /// EOS-terminated turn leaves the cache one position ahead of the tokens we
+    /// recorded; `streamResponse` trims that surplus before carrying the cache
+    /// forward (otherwise the next reused suffix would be appended at the wrong
+    /// offset and shift every RoPE position by +1). With that reconciliation the
+    /// reused prefix is bit-for-bit the KV computed for the recorded tokens.
+    /// On the quantized (q4) checkpoint the resulting greedy output is
     /// a valid decode but is not guaranteed byte-identical to the legacy
     /// "re-prefill everything" path, because a single-token decode forward
     /// (`[1, 1]`) and a batched prefill forward (`[1, n]`) over the same tokens
@@ -176,6 +183,17 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
     /// Whether the most recent `streamResponse` turn reused the carried cache
     /// (true) or prefilled the full prompt (false). Diagnostic only.
     public private(set) var lastTurnReusedCache = false
+
+    /// Offset of the currently carried reuse cache, or `nil` when no cache is
+    /// carried. Diagnostic only: the cache-reuse correctness gate asserts this
+    /// equals ``cachedTokenCount`` after every turn (including EOS-terminated
+    /// turns) so the reused suffix is always appended at the right position.
+    public var reuseCacheOffset: Int? { reuseCache?.first?.offset }
+
+    /// Number of token IDs the carried reuse cache claims to hold (prompt +
+    /// generated tokens of the previous turn), or `nil` when no cache is
+    /// carried. Diagnostic only; pairs with ``reuseCacheOffset``.
+    public var cachedTokenCount: Int? { cachedTokenIDs?.count }
 
     public static func load(
         modelDirectory: URL,
@@ -434,6 +452,27 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                             if reuseDisabled {
                                 resetCache()
                             } else {
+                                // Reconcile the cache offset with the tokens we
+                                // actually recorded before carrying it forward.
+                                // `generateTokens` runs each token through the
+                                // model *before* yielding it, and on an
+                                // EOS-terminated turn the stop token is stepped
+                                // (its KV appended, offset advanced) but never
+                                // yielded — so the cache ends up one position
+                                // ahead of `generatedTokenIDs`. Left unfixed, the
+                                // next reused turn appends its suffix at the wrong
+                                // offset on top of the stale stop-token KV,
+                                // shifting every RoPE position by +1. Trim the
+                                // surplus so offset == cachedTokenIDs.count and
+                                // reuse is truly lossless (see the
+                                // MotifMLXNativeRuntimeCacheReuseTests gate).
+                                let recordedTokenCount = promptTokens.count + generatedTokenIDs.count
+                                let extra = (cache.first?.offset ?? recordedTokenCount) - recordedTokenCount
+                                if extra > 0 {
+                                    for kvCache in cache where kvCache.isTrimmable {
+                                        kvCache.trim(extra)
+                                    }
+                                }
                                 reuseCache = cache
                                 cachedTokenIDs = promptTokens + generatedTokenIDs
                             }

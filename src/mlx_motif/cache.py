@@ -15,13 +15,30 @@ Both classes implement the mlx-lm `_BaseCache` contract (`offset`,
 `update_and_fetch`, `state`, `meta_state`, `is_trimmable`, `trim`,
 `make_mask`) plus a 4-slot `update_and_fetch_4(k1, k2, v1, v2)` helper
 that the model uses when it detects the cache type.
+
+Fetch contract: the hot-path fetches (`MotifGroupedKVCache.update_and_fetch_4`
+and `update_and_fetch_4_quantized`) return the FULL row-contiguous capacity
+buffers — axis-2 length is the step-padded capacity, NOT the live length.
+Consumers must bound reads by `cache.offset` (the decode kernels take it as a
+runtime `kv_len` input; other consumers slice `[..., :offset, :]`). This keeps
+the buffers contiguous so no per-step `ensure_row_contiguous` copy of the live
+KV region is inserted before custom-kernel launches. The quantized dequant
+bridge (`MotifGroupedQuantizedKVCache.update_and_fetch_4`) still returns
+exact-length dequantized slices.
 """
 
 from __future__ import annotations
 
 import mlx.core as mx
-from mlx_lm.models.base import create_attention_mask
-from mlx_lm.models.cache import _BaseCache
+
+# NOTE: import the cache-module `create_attention_mask`, whose signature is
+# `(N, offset, return_array, window_size)` — NOT the base-module one
+# `(h, cache=None, window_size=None, return_array=False)`. `make_mask` below is
+# invoked by mlx-lm as `cache.make_mask(N, return_array=..., window_size=...)`
+# and forwards `offset=self.offset`, which only the cache-module function
+# accepts. Importing from `mlx_lm.models.base` here raises TypeError on any
+# invocation (see cache-module `_BaseCache.make_mask`, whose body this mirrors).
+from mlx_lm.models.cache import _BaseCache, create_attention_mask
 
 
 class MotifGroupedKVCacheBase(_BaseCache):
@@ -129,6 +146,25 @@ class MotifGroupedKVCacheBase(_BaseCache):
     def _expand_slot(self, slot, fresh):
         raise NotImplementedError
 
+    @staticmethod
+    def _assert_uniform_heads(k1, k2, v1, v2) -> None:
+        """All four slots share one allocation head count (derived from k1).
+
+        With k_ratio > 1 the model produces k1 with ``k_groups*k_ratio`` heads
+        but k2/v1/v2 with ``k_groups`` heads; storing them in equally-shaped
+        slots would fail (or silently corrupt) at write time. Guard loudly here
+        so the unsupported combination is unmistakable even if a caller
+        constructs the cache directly (bypassing ``Model.make_cache``).
+        """
+        h1 = k1.shape[1]
+        if not (k2.shape[1] == v1.shape[1] == v2.shape[1] == h1):
+            raise ValueError(
+                "4-slot grouped KV cache requires k1/k2/v1/v2 to share a head "
+                f"count; got k1={h1}, k2={k2.shape[1]}, v1={v1.shape[1]}, "
+                f"v2={v2.shape[1]}. This happens with k_ratio > 1, which the "
+                "4-slot cache does not support."
+            )
+
 
 class MotifGroupedKVCache(MotifGroupedKVCacheBase):
     """4-slot unquantized KV cache for grouped DiffAttn (k1, k2, v1, v2).
@@ -165,6 +201,20 @@ class MotifGroupedKVCache(MotifGroupedKVCacheBase):
     # ------------------------------------------------------------------
 
     def update_and_fetch_4(self, k1, k2, v1, v2):
+        """Append the 4 incoming slices and return the FULL capacity buffers.
+
+        The returned buffers are row-contiguous and step-padded: their axis-2
+        length is the allocated capacity (a multiple of `step`), not the live
+        length. Consumers must bound reads by `self.offset` — either by
+        passing `kv_len=self.offset` to a runtime-length kernel
+        (`sdpa_dual_v`) or by slicing `[..., :self.offset, :]`.
+
+        Returning full buffers (instead of exact-length `[..., :o, :]`
+        slices) keeps the tensors row-contiguous so `mx.fast.metal_kernel`'s
+        `ensure_row_contiguous` does not copy the whole live KV region on
+        every decode step.
+        """
+        self._assert_uniform_heads(k1, k2, v1, v2)
         B, H, S, D = k1.shape
         prev = self.offset
         self._grow(B, H, S, D, k1.dtype)
@@ -173,8 +223,7 @@ class MotifGroupedKVCache(MotifGroupedKVCacheBase):
         self.v1[..., prev : prev + S, :] = v1
         self.v2[..., prev : prev + S, :] = v2
         self.offset += S
-        o = self.offset
-        return self.k1[..., :o, :], self.k2[..., :o, :], self.v1[..., :o, :], self.v2[..., :o, :]
+        return self.k1, self.k2, self.v1, self.v2
 
     # ------------------------------------------------------------------
     # mlx-lm _BaseCache contract: state / meta_state
@@ -282,37 +331,49 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
         return _deq(self.k1), _deq(self.k2), _deq(self.v1), _deq(self.v2)
 
     def update_and_fetch_4_quantized(self, k1, k2, v1, v2):
-        """Quantize the 4 incoming slices and append; return live-region
-        slices of each slot as raw quantized triples `(data, scales, biases)`.
+        """Quantize the 4 incoming slices and append; return each slot's FULL
+        capacity buffers as raw quantized triples `(data, scales, biases)`.
 
         This is the bandwidth-saving path: the consumer (a quant-input
         attention kernel like `sdpa_dual_v_q4`) reads packed 4/8-bit
         memory directly without paying the per-step `mx.dequantize` cost.
+
+        The triples are row-contiguous and step-padded (axis-2 length is the
+        allocated capacity, not the live length); consumers must bound reads
+        by `self.offset` (pass `kv_len=self.offset` to `sdpa_dual_v_q4`).
+        Exact-length `[..., :o, :]` slices would be non-contiguous views and
+        force `ensure_row_contiguous` to copy all 9 live-region buffers on
+        every decode step.
         """
         self._update_4(k1, k2, v1, v2)
-        o = self.offset
-
-        def _live(slot):
-            return (
-                slot[0][..., :o, :],
-                slot[1][..., :o, :],
-                slot[2][..., :o, :],
-            )
-
-        return _live(self.k1), _live(self.k2), _live(self.v1), _live(self.v2)
+        return self.k1, self.k2, self.v1, self.v2
 
     def _update_4(self, k1, k2, v1, v2):
+        self._assert_uniform_heads(k1, k2, v1, v2)
         B, H, S, D = k1.shape
         prev = self.offset
         self._grow(B, H, S, D, k1.dtype)
 
-        for fresh, slot in [(k1, self.k1), (k2, self.k2), (v1, self.v1), (v2, self.v2)]:
-            q_data, q_scales, q_biases = mx.quantize(
-                fresh, group_size=self.group_size, bits=self.bits
-            )
-            slot[0][..., prev : prev + S, :] = q_data
-            slot[1][..., prev : prev + S, :] = q_scales
-            slot[2][..., prev : prev + S, :] = q_biases
+        # Batch the four same-shape (B, H, S, D) slices along the head axis and
+        # quantize once, collapsing 4 mx.quantize dispatches into 1 concat + 1
+        # quantize on the per-token decode hot path. mx.quantize groups along
+        # the last axis (D), so a head-axis (axis 1) concatenation never mixes
+        # groups — the packed triple is bit-identical per head to quantizing
+        # each slot separately (verified in tests/test_grouped_cache.py).
+        fresh = mx.concatenate([k1, k2, v1, v2], axis=1)
+        q_data, q_scales, q_biases = mx.quantize(fresh, group_size=self.group_size, bits=self.bits)
+
+        # Split the packed triple back into per-slot head partitions and write
+        # each into its own backing triple. The four slots stay physically
+        # separate so the fetch path returns contiguous per-slot views
+        # unchanged — feeding head-offset slices of one unified buffer to
+        # `sdpa_dual_v_q4` (ensure_row_contiguous=True) would instead force a
+        # copy of the whole growing live region every token.
+        for i, slot in enumerate((self.k1, self.k2, self.v1, self.v2)):
+            h0, h1 = i * H, (i + 1) * H
+            slot[0][..., prev : prev + S, :] = q_data[:, h0:h1, :, :]
+            slot[1][..., prev : prev + S, :] = q_scales[:, h0:h1, :, :]
+            slot[2][..., prev : prev + S, :] = q_biases[:, h0:h1, :, :]
 
         self.offset += S
 
@@ -322,7 +383,20 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
 
     @property
     def state(self):
-        return self.k1, self.k2, self.v1, self.v2
+        # Mirror the fp16 variant: serialize only the live [:offset] region of
+        # each quantized triple, not the step-padded capacity (slots grow in
+        # step=256 increments, so untrimmed state carries up to step-1 tokens of
+        # zero padding — and post-trim() stale rows — across 12 tensors/layer).
+        # _grow handles non-step-aligned capacities via _trim_slot/_expand_slot,
+        # so a trimmed slot round-trips through the setter + meta_state offset.
+        if self.offset == 0 or self.k1 is None:
+            return self.k1, self.k2, self.v1, self.v2
+        o = self.offset
+
+        def _trim(slot):
+            return tuple(x[..., :o, :] for x in slot)
+
+        return _trim(self.k1), _trim(self.k2), _trim(self.v1), _trim(self.v2)
 
     @state.setter
     def state(self, v):

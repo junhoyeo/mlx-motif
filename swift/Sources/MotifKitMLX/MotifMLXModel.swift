@@ -186,10 +186,42 @@ public final class MotifMLXAttentionScaffold: Module {
         }
     }
 
-    private func lambdaFull(dtype: DType) -> MLXArray {
+    /// Reference box for the materialized fp32 lambda scalar. Held as a plain
+    /// Swift class (not an `MLXArray`/`Module`) so MLXNN parameter reflection
+    /// never treats the cache as a model parameter.
+    private final class LambdaScalarCache {
+        var fp32: MLXArray?
+    }
+
+    private let lambdaScalarCache = LambdaScalarCache()
+
+    /// Lambda scalar for the differential subtraction, computed in fp32 to match
+    /// Python's `_lambda_full(mx.float32)` — the `exp`/`sub` is numerically
+    /// sensitive, so lambda is kept in fp32 before any downcast (see model.py:255
+    /// "lambda parameters — kept fp32 for numerical stability of exp/sub").
+    ///
+    /// `lambdaQ1/K1/Q2/K2` are frozen at inference, so the fp32 scalar is
+    /// materialized once and cached; callers requesting another dtype get a cheap
+    /// cast of the cached value instead of rebuilding the exp/sum graph per layer
+    /// per decoded token. The cache is only valid while the lambda parameters do
+    /// not change (inference / `training == false`).
+    func lambdaFull(dtype: DType) -> MLXArray {
+        let base = cachedLambdaFullFP32()
+        return dtype == .float32 ? base : base.asType(dtype)
+    }
+
+    private func cachedLambdaFullFP32() -> MLXArray {
+        if let cached = lambdaScalarCache.fp32 {
+            return cached
+        }
         let l1 = exp(sum(lambdaQ1 * lambdaK1, axis: -1).asType(.float32))
         let l2 = exp(sum(lambdaQ2 * lambdaK2, axis: -1).asType(.float32))
-        return (l1 - l2 + lambdaInit).asType(dtype)
+        let value = (l1 - l2 + lambdaInit).asType(.float32)
+        // Materialize once so subsequent forwards reference stored data rather
+        // than re-executing the reduction/exp kernels per decoded token.
+        eval(value)
+        lambdaScalarCache.fp32 = value
+        return value
     }
 
     private func forwardGrouped(
@@ -333,7 +365,11 @@ public final class MotifMLXAttentionScaffold: Module {
             )
         }
 
-        let lambda = lambdaFull(dtype: x.dtype).reshaped([1])
+        // Match Python's grouped path (`self._lambda_full(mx.float32)`, model.py:517):
+        // keep lambda in fp32 into the kernels. Casting to the activation dtype
+        // here would round lambda before the wrappers upcast it back to fp32,
+        // losing mantissa bits and diverging from Python in every grouped layer.
+        let lambda = lambdaFull(dtype: .float32).reshaped([1])
         let kernelExecutionMode: MotifMetalKernelExecutionMode =
             runtimeFeatures.disableCustomKernels ? .referenceOnly : .metalPreferred
         let out: MLXArray
@@ -373,11 +409,16 @@ public final class MotifMLXAttentionScaffold: Module {
                 executionMode: kernelExecutionMode
             )
         } else if attentionPath == .dualV {
+            // The kernel broadcasts GQA natively (`kv_head_idx = head_idx /
+            // GQA_FACTOR`, i.e. repeat-interleave semantics), matching Python
+            // model.py's `sdpa_dual_v(q1, k1, v1, v2, scale)`: pass the cached
+            // slabs unrepeated instead of materializing groupedRatio× copies
+            // of the full KV history per layer per decoded token.
             let attnOrigin = MotifSDPADualV.apply(
                 queries: slices.qOrigin,
-                keys: repeatHeadsIfNeeded(slices.kOrigin, count: layout.groupedRatio),
-                value1: repeatHeadsIfNeeded(slices.value1, count: layout.groupedRatio),
-                value2: repeatHeadsIfNeeded(slices.value2, count: layout.groupedRatio),
+                keys: slices.kOrigin,
+                value1: slices.value1,
+                value2: slices.value2,
                 scale: scale,
                 mask: mask,
                 executionMode: kernelExecutionMode
@@ -746,6 +787,20 @@ public final class MotifMLXModel: Module, LLMModel, KVCacheDimensionProvider {
         guard configuration.isGroupedDifferentialAttention else {
             return Self.defaultCaches(count: configuration.numHiddenLayers, parameters: parameters)
         }
+        // Fail-fast: the 4-slot grouped caches (MotifGroupedKVCache /
+        // MotifGroupedQuantizedKVCache) allocate all four slots with a single
+        // head count taken from kOrigin, but with kRatio > 1 the kOrigin slot
+        // has keyGroups*kRatio heads while kNoise/value1/value2 have keyGroups
+        // heads — the mismatched slot writes fail (or silently corrupt)
+        // mid-forward at cache-write time. No shipped config uses kRatio > 1, so
+        // guard the unsupported combination loudly here. (Python mirror:
+        // Model.make_cache.)
+        if let reason = Self.fourSlotCacheUnsupportedReason(
+            mode: runtimeFeatures.fourSlotCacheMode,
+            kRatio: configuration.kRatio
+        ) {
+            preconditionFailure(reason)
+        }
         switch runtimeFeatures.fourSlotCacheMode {
         case .disabled:
             return Self.defaultCaches(count: configuration.numHiddenLayers, parameters: parameters)
@@ -760,6 +815,25 @@ public final class MotifMLXModel: Module, LLMModel, KVCacheDimensionProvider {
                 MotifGroupedQuantizedKVCache(groupSize: parameters?.kvGroupSize ?? 64, bits: 8)
             }
         }
+    }
+
+    /// Returns a human-readable reason when the requested four-slot cache
+    /// configuration is unsupported, or `nil` when it is fine. Exposed
+    /// (non-crashing) so the fail-fast guard in `newCache` is unit-testable.
+    ///
+    /// The four-slot grouped caches allocate every slot with kOrigin's head
+    /// count; with `kRatio > 1` the kOrigin slot has `keyGroups*kRatio` heads
+    /// while kNoise/value1/value2 have `keyGroups` heads, so the combination is
+    /// unsupported. (Python mirror: `Model.make_cache`.)
+    static func fourSlotCacheUnsupportedReason(
+        mode: MotifRuntimeFeatureFlags.FourSlotCacheMode,
+        kRatio: Int
+    ) -> String? {
+        guard mode != .disabled, kRatio != 1 else { return nil }
+        return "Four-slot grouped KV cache is not supported with kRatio > 1 "
+            + "(got kRatio=\(kRatio)): every slot is allocated with kOrigin's head "
+            + "count, which differs from kNoise/value1/value2 when kRatio > 1. "
+            + "Disable the four-slot cache for this configuration."
     }
 
     private static func defaultCaches(count: Int, parameters: GenerateParameters?) -> [KVCache] {

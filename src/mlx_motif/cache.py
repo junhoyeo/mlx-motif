@@ -313,9 +313,7 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
         # groups — the packed triple is bit-identical per head to quantizing
         # each slot separately (verified in tests/test_grouped_cache.py).
         fresh = mx.concatenate([k1, k2, v1, v2], axis=1)
-        q_data, q_scales, q_biases = mx.quantize(
-            fresh, group_size=self.group_size, bits=self.bits
-        )
+        q_data, q_scales, q_biases = mx.quantize(fresh, group_size=self.group_size, bits=self.bits)
 
         # Split the packed triple back into per-slot head partitions and write
         # each into its own backing triple. The four slots stay physically

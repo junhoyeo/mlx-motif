@@ -88,9 +88,7 @@ def _quantize_per_slot_reference(cache_cls, group_size, bits, steps):
             (v1, cache.v1),
             (v2, cache.v2),
         ]:
-            q_data, q_scales, q_biases = mx.quantize(
-                fresh, group_size=group_size, bits=bits
-            )
+            q_data, q_scales, q_biases = mx.quantize(fresh, group_size=group_size, bits=bits)
             slot[0][..., prev : prev + S, :] = q_data
             slot[1][..., prev : prev + S, :] = q_scales
             slot[2][..., prev : prev + S, :] = q_biases
@@ -124,9 +122,7 @@ def test_quantized_batched_write_matches_per_slot(bits):
         (_rand((B, H, 1, D)), _rand((B, H, 1, D)), _rand((B, H, 1, D)), _rand((B, H, 1, D))),
     ]
 
-    ref = _quantize_per_slot_reference(
-        MotifGroupedQuantizedKVCache, group_size, bits, steps
-    )
+    ref = _quantize_per_slot_reference(MotifGroupedQuantizedKVCache, group_size, bits, steps)
 
     batched = MotifGroupedQuantizedKVCache(group_size=group_size, bits=bits)
     live = None

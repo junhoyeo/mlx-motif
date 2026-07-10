@@ -306,13 +306,28 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
         prev = self.offset
         self._grow(B, H, S, D, k1.dtype)
 
-        for fresh, slot in [(k1, self.k1), (k2, self.k2), (v1, self.v1), (v2, self.v2)]:
-            q_data, q_scales, q_biases = mx.quantize(
-                fresh, group_size=self.group_size, bits=self.bits
-            )
-            slot[0][..., prev : prev + S, :] = q_data
-            slot[1][..., prev : prev + S, :] = q_scales
-            slot[2][..., prev : prev + S, :] = q_biases
+        # Batch the four same-shape (B, H, S, D) slices along the head axis and
+        # quantize once, collapsing 4 mx.quantize dispatches into 1 concat + 1
+        # quantize on the per-token decode hot path. mx.quantize groups along
+        # the last axis (D), so a head-axis (axis 1) concatenation never mixes
+        # groups — the packed triple is bit-identical per head to quantizing
+        # each slot separately (verified in tests/test_grouped_cache.py).
+        fresh = mx.concatenate([k1, k2, v1, v2], axis=1)
+        q_data, q_scales, q_biases = mx.quantize(
+            fresh, group_size=self.group_size, bits=self.bits
+        )
+
+        # Split the packed triple back into per-slot head partitions and write
+        # each into its own backing triple. The four slots stay physically
+        # separate so the fetch path returns contiguous per-slot views
+        # unchanged — feeding head-offset slices of one unified buffer to
+        # `sdpa_dual_v_q4` (ensure_row_contiguous=True) would instead force a
+        # copy of the whole growing live region every token.
+        for i, slot in enumerate((self.k1, self.k2, self.v1, self.v2)):
+            h0, h1 = i * H, (i + 1) * H
+            slot[0][..., prev : prev + S, :] = q_data[:, h0:h1, :, :]
+            slot[1][..., prev : prev + S, :] = q_scales[:, h0:h1, :, :]
+            slot[2][..., prev : prev + S, :] = q_biases[:, h0:h1, :, :]
 
         self.offset += S
 

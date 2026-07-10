@@ -350,12 +350,7 @@ class MotifAttention(nn.Module):
         k = self.k_proj(x).reshape(B, S, 2 * Hk, d).transpose(0, 2, 1, 3)
         # Rearrange V into slab order at projection time — O(S·d) on the new
         # tokens only (S=1 at decode), instead of O(context) after fetch.
-        v = (
-            self.v_proj(x)
-            .reshape(B, S, Hk, 2, d)
-            .transpose(0, 3, 2, 1, 4)
-            .reshape(B, 2 * Hk, S, d)
-        )
+        v = self.v_proj(x).reshape(B, S, Hk, 2, d).transpose(0, 3, 2, 1, 4).reshape(B, 2 * Hk, S, d)
 
         offset = cache.offset if cache is not None else 0
         q = self.rope(q, offset=offset)
@@ -590,23 +585,15 @@ class MotifAttention(nn.Module):
             # cache offset are preserved exactly.
             attn_origin = mx.concatenate(
                 [
-                    mx.fast.scaled_dot_product_attention(
-                        q1, k1, v1, scale=self.scale, mask=mask
-                    ),
-                    mx.fast.scaled_dot_product_attention(
-                        q1, k1, v2, scale=self.scale, mask=mask
-                    ),
+                    mx.fast.scaled_dot_product_attention(q1, k1, v1, scale=self.scale, mask=mask),
+                    mx.fast.scaled_dot_product_attention(q1, k1, v2, scale=self.scale, mask=mask),
                 ],
                 axis=-1,
             )
             attn_noise = mx.concatenate(
                 [
-                    mx.fast.scaled_dot_product_attention(
-                        q2, k2, v1, scale=self.scale, mask=mask
-                    ),
-                    mx.fast.scaled_dot_product_attention(
-                        q2, k2, v2, scale=self.scale, mask=mask
-                    ),
+                    mx.fast.scaled_dot_product_attention(q2, k2, v1, scale=self.scale, mask=mask),
+                    mx.fast.scaled_dot_product_attention(q2, k2, v2, scale=self.scale, mask=mask),
                 ],
                 axis=-1,
             )

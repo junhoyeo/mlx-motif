@@ -57,6 +57,32 @@ p16000: 0.781x). The
 12.7B rows still have prompt-token mismatches, so their ratios remain flagged
 as non-clean comparisons.
 
+## 12.7B-Reasoning q4 perplexity
+
+Quality gate for the converted **Motif-2-12.7B-Reasoning q4** checkpoint
+(grouped-differential attention, 4-bit weights). Measured locally on Apple
+M1 Max with the bundled deterministic corpus (no network download):
+
+```bash
+PYTHONPATH=$PWD/src python scripts/perplexity.py \
+  --model ~/.models/motif-2-12.7b-reasoning-mlx-q4 \
+  --chunk 512
+```
+
+| Metric | Value |
+|---|---|
+| Perplexity | **12.365** |
+| NLL / token | 2.5149 |
+| Tokens evaluated | 592 (bundled snippet, 2 chunks of ≤512) |
+| Corpus | `scripts/perplexity.py` `_DEFAULT_TEXT` (4 paragraphs of encyclopedic prose) |
+| Model | `~/.models/motif-2-12.7b-reasoning-mlx-q4` |
+| Host | local Apple M1 Max |
+
+This is a single-run local smoke of model quality, not a certified throughput
+claim. It exists to confirm the q4 conversion produces a coherent, low-perplexity
+model; it is the perplexity referenced by the README parity note (numerical
+parity vs the HuggingFace PyTorch reference is not independently verified).
+
 ## Checked-in target sweep
 
 The current target sweep evidence is

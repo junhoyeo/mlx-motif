@@ -70,22 +70,28 @@ def test_unquantized_cache_roundtrip():
     mx.random.seed(0)
     B, H, D = 1, 8, 128
     cache = MotifGroupedKVCache()
-    # Step 1: 5-token prompt
+    # Step 1: 5-token prompt.
+    # Contract: update_and_fetch_4 returns the FULL step-padded capacity
+    # buffers (row-contiguous, no ensure_row_contiguous copy downstream);
+    # the live region is [..., :cache.offset, :].
     k1, k2 = _rand((B, H, 5, D)), _rand((B, H, 5, D))
     v1, v2 = _rand((B, H, 5, D)), _rand((B, H, 5, D))
     out = cache.update_and_fetch_4(k1, k2, v1, v2)
-    assert all(t.shape == (B, H, 5, D) for t in out)
+    assert all(t.shape == (B, H, cache.step, D) for t in out)
     assert cache.offset == 5
+    # The exact-length live region is exposed via `state`.
+    assert all(t.shape == (B, H, 5, D) for t in cache.state)
 
     # Step 2: 1 more token
     k1b, k2b = _rand((B, H, 1, D)), _rand((B, H, 1, D))
     v1b, v2b = _rand((B, H, 1, D)), _rand((B, H, 1, D))
     out = cache.update_and_fetch_4(k1b, k2b, v1b, v2b)
-    assert all(t.shape == (B, H, 6, D) for t in out)
+    assert cache.offset == 6
+    assert all(t.shape == (B, H, cache.step, D) for t in out)
 
-    # Tail of fetched k1 must equal the just-pushed k1b.
+    # Last live row of fetched k1 must equal the just-pushed k1b.
     np.testing.assert_allclose(
-        np.array(out[0][..., -1, :].astype(mx.float32)),
+        np.array(out[0][..., cache.offset - 1, :].astype(mx.float32)),
         np.array(k1b[..., 0, :].astype(mx.float32)),
         rtol=1e-5,
     )
@@ -117,6 +123,39 @@ def test_quantized_cache_roundtrip(bits):
     tol = {4: 0.5, 8: 0.05}[bits]
     np.testing.assert_allclose(
         np.array(out[0].astype(mx.float32)),
+        np.array(k1.astype(mx.float32)),
+        atol=tol,
+        rtol=tol,
+    )
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_quantized_fetch_returns_full_capacity_triples(bits):
+    """update_and_fetch_4_quantized returns FULL step-padded capacity triples;
+    the live region is [..., :offset, :] of each component."""
+    mx.random.seed(0)
+    B, H, D = 1, 8, 128
+    cache = MotifGroupedQuantizedKVCache(group_size=64, bits=bits)
+    k1, k2 = _rand((B, H, 5, D)), _rand((B, H, 5, D))
+    v1, v2 = _rand((B, H, 5, D)), _rand((B, H, 5, D))
+    out = cache.update_and_fetch_4_quantized(k1, k2, v1, v2)
+    assert cache.offset == 5
+    for triple in out:
+        assert len(triple) == 3
+        for component in triple:
+            assert component.shape[2] == cache.step
+
+    # Live region of the returned k1 triple dequantizes back to ~k1.
+    deq = mx.dequantize(
+        out[0][0][..., :5, :],
+        out[0][1][..., :5, :],
+        out[0][2][..., :5, :],
+        group_size=64,
+        bits=bits,
+    )
+    tol = {4: 0.5, 8: 0.05}[bits]
+    np.testing.assert_allclose(
+        np.array(deq.astype(mx.float32)),
         np.array(k1.astype(mx.float32)),
         atol=tol,
         rtol=tol,

@@ -24,19 +24,20 @@ Motif's flagship LLMs combine **Grouped Differential Attention** ([2510.06949](h
 
 ## Headline numbers
 
-Motif-2-12.7B-Reasoning at 4-bit, M1 Max (32-core GPU, 64 GB), 5 measurement runs after 3 warmup runs, same Python session for A/B fairness, mean ± stdev:
+Motif-2-12.7B-Reasoning at 4-bit, M1 Max (32-core GPU, 64 GB), measured July 2026 on current `main` (`scripts/bench_decode_e2e.py`, 5 runs after 3 warmups, `max_tokens=64`, median tok/s):
 
-| Prompt length | mlx-lm-only baseline¹ | with custom kernels | speedup |
-|---|---|---|---|
-| 5 tokens (short)   | 34.70 ± 0.06 tok/s | **40.64 ± 0.15 tok/s** | **+17%** |
-| 164 tokens (med)   | ~30 tok/s          | ~37 tok/s              | ~+23% |
-| 800 tokens (long)  | 21.56 ± 0.05 tok/s | **34.71 ± 0.08 tok/s** | **+61%** |
-| 3.2k tokens (xlong)| ~14 tok/s²         | **24.02 ± 0.17 tok/s** | **+71%** |
+| Prompt length | pure-MLX reference¹ | **4-slot fp16 + kernels²** | q4 packed cache³ | speedup (kernels vs ref) |
+|---|---|---|---|---|
+| 5 tokens    | 19.0 | **40.9** | 31.1 | **2.2×** |
+| 164 tokens  | 17.4 | **40.0** | 31.6 | **2.3×** |
+| 800 tokens  | 13.7 | **38.2** | 29.6 | **2.8×** |
+| 3204 tokens | 2.8  | **30.7** | 24.8 | **10.9×** |
 
-¹ With `MLX_MOTIF_DUAL_V=0` (stacked-SDPA fallback path).
-² Estimated; full A/B at 3.2k took prohibitively long with the slow path.
+¹ `MLX_MOTIF_DISABLE_KERNELS=1` — every custom kernel replaced by its pure-MLX reference.
+² `MLX_MOTIF_4SLOT_CACHE=1` — the full custom path: 4-slot fp16 cache, `sdpa_dual_v`, `gda_post_split`, PolyNorm.
+³ `MLX_MOTIF_4SLOT_CACHE=q4` — same kernels reading the packed q4 cache directly; trades throughput at these lengths for cache memory (its per-call attention win needs KV ≥ ~1k and compounds beyond these prompt sizes).
 
-**The win compounds with context length.** Attention is ~10% of decode time at 64 KV tokens but grows linearly while MLP stays fixed; the custom path saves attention time specifically. These are the certified sweeps from [`docs/benchmarks/`](docs/benchmarks/README.md); they predate the July 2026 dispatch/cache-fetch rework described below, which removes further fixed overhead from the decode hot path.
+**The win compounds with context length.** Attention is a small share of decode time at short context but grows linearly while MLP stays fixed; the custom path saves attention time specifically. Two provenance notes: the earlier certified sweeps in [`docs/benchmarks/`](docs/benchmarks/README.md) (e.g. 24.0 tok/s at p3204 on the same hardware) predate the July 2026 dispatch/cache-fetch rework — the current numbers above are ~28% faster at long context. And the old table's "mlx-lm-only baseline" (`MLX_MOTIF_DUAL_V=0`, then a stacked-SDPA fallback) is **no longer reproducible**: that fallback was replaced by the per-slab fast path, so today's honest baseline is the all-reference configuration shown here. Note the 4-slot cache is opt-in (`MLX_MOTIF_4SLOT_CACHE=1`); the out-of-the-box default currently measures ~28 tok/s at p5 — flipping the default is under consideration.
 
 On the grouped-differential **Motif-2-12.7B-Reasoning q4** checkpoint, greedy output is **byte-identical** between the in-tree kernel and reference (`MLX_MOTIF_DISABLE_KERNELS=1`) decode paths — verified end-to-end on real Motif weights (prompt `"Once upon a time"`, 32 tokens; also checked at 48/96 tokens). This parity is **checkpoint-specific**, not universal: on the smaller **2.6B** vanilla-attention checkpoint the two paths diverge within a couple of greedy tokens (default `"in a small village, there was…"` vs kernels-off `"there was a little girl…"`), because the custom kernels and the stock reference path accumulate their float reductions in different orders and the low-order-bit differences can flip the argmax on that architecture. Both comparisons use the default fp16 KV cache; the lossy q4/q8 4-slot cache is expected to differ and is out of scope for this claim. Numerical parity against the HuggingFace PyTorch reference is **not** independently verified; the 12.7B-q4 quality is checked via perplexity (`scripts/perplexity.py`) instead — see [`docs/benchmarks/`](docs/benchmarks/README.md#127b-reasoning-q4-perplexity).
 
@@ -318,7 +319,12 @@ End-to-end on the real 2.6B q4 checkpoint, greedy output is token-identical to t
 
 Sampled decoding (temperature > 0) is supported **losslessly** via standard rejection sampling (Leviathan/Chen): a draft token `x` is accepted with probability `min(1, p(x)/q(x))`; on rejection the token is resampled from the normalized residual `max(0, p − q)`, so the output distribution equals plain target sampling exactly. Self-draft acceptance ≈ 1 (38/38 in the gate test, since `p == q`) and seeded runs are deterministic.
 
-Measured on the real 2.6B q4 checkpoint (self-draft, debug build): 46 tokens generated in **10 target forwards** (37/40 drafts accepted). That proves the forward-count reduction; **no wall-clock speedup is claimed** — with draft == target the draft cost cancels the win. A small (sub-1B) Motif draft model is the missing piece for a wall-clock win.
+Measured (July 2026, M1 Max, release build, greedy, 128 tokens, real checkpoints):
+
+- **Self-draft gate** (2.6B → 2.6B, debug build): 46 tokens in **10 target forwards** (37/40 accepted) — proves the batched-verification mechanism.
+- **Real pairing** (2.6B draft → 12.7B target): 128 tokens in **43 target forwards** (3.0× forward reduction, 85/168 drafts accepted ≈ 51%) — but generation-only wall clock was **9.4 s ≈ 13.6 tok/s vs ~30 tok/s plain** (plain isolated as a 128-token run minus a 1-token run, both ~2× measured). The draft's own sequential decode plus batched-verify overhead costs ~2.2× more than the saved target forwards.
+
+So the forward-count win is real and the wall-clock loss is now measured, not predicted: at this draft/target ratio speculative decoding does not pay on M1 Max. A small (sub-1B) Motif draft model remains the missing piece.
 
 ## Development & tests
 

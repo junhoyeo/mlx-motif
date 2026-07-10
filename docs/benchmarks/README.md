@@ -57,6 +57,29 @@ p16000: 0.781x). The
 12.7B rows still have prompt-token mismatches, so their ratios remain flagged
 as non-clean comparisons.
 
+## July 2026 decode-e2e refresh (post dispatch/cache-fetch rework)
+
+`decode-e2e-127b-20260711T0430Z-{A-ref,C-4slot,D-q4}.json` — the run behind the
+README headline table. `scripts/bench_decode_e2e.py`, Motif-2-12.7B-Reasoning
+q4 (converted 2026-07-11), Apple M1 Max 64 GB, mlx 0.31.2, `max_tokens=64`,
+`n_runs=5`, `warmup_runs=3`, prompt lengths 5/164/800/3204, medians:
+
+| Config | p5 | p164 | p800 | p3204 |
+|---|---|---|---|---|
+| A `MLX_MOTIF_DISABLE_KERNELS=1` (all-reference) | 19.0 | 17.4 | 13.7 | 2.8 |
+| C `MLX_MOTIF_4SLOT_CACHE=1` (full custom path) | 40.9 | 40.0 | 38.2 | 30.7 |
+| D `MLX_MOTIF_4SLOT_CACHE=q4 MLX_MOTIF_QUANT_SDPA=1` | 31.1 | 31.6 | 29.6 | 24.8 |
+
+Methodology notes: (1) the May certified sweep's `MLX_MOTIF_DUAL_V=0` baseline
+config is not comparable — that stacked fallback was replaced by the per-slab
+fast path in July, so A (all-reference) is the honest "no custom kernels"
+bound now. (2) Configs ran sequentially in separate processes (not
+interleaved); C's p5 stdev was 0.08 tok/s across the 5 runs. (3) The
+speculative-decoding wall-clock measurement from the same session (2.6B draft
+→ 12.7B target, release build, greedy, 128 tokens): 43 target forwards
+(3.0× reduction, 85/168 drafts accepted) but 9.42 s generation ≈ 13.6 tok/s
+vs ~30 tok/s plain — forward-count win, wall-clock loss.
+
 ## 12.7B-Reasoning q4 perplexity
 
 Quality gate for the converted **Motif-2-12.7B-Reasoning q4** checkpoint

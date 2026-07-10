@@ -219,6 +219,21 @@ def _resolve_attention_path(
     return AttnPath.FALLBACK
 
 
+class _LambdaCache:
+    """Holds memoized ``lambda_full`` arrays outside the nn.Module parameter tree.
+
+    Stored as a plain (non-array/dict/list/tuple) attribute so mlx's
+    ``Module.__setattr__`` keeps it off the module's parameter dict — otherwise
+    the cached arrays would be picked up by ``parameters()`` / ``update()`` /
+    quantization and corrupt weight round-tripping.
+    """
+
+    __slots__ = ("store",)
+
+    def __init__(self):
+        self.store: dict = {}
+
+
 class MotifAttention(nn.Module):
     """
     Differential / Grouped-Differential Attention.
@@ -258,6 +273,15 @@ class MotifAttention(nn.Module):
         self.lambda_k1 = mx.zeros((self.head_dim,), dtype=mx.float32)
         self.lambda_q2 = mx.zeros((self.head_dim,), dtype=mx.float32)
         self.lambda_k2 = mx.zeros((self.head_dim,), dtype=mx.float32)
+
+        # Memoized lambda_full per output dtype. The four lambda vectors are
+        # frozen at inference, so lambda_full is a constant recomputed per layer
+        # per token on the decode hot loop — cache it on first use. Held on a
+        # plain object (see _LambdaCache) so it stays out of the parameter tree.
+        # Correctness note: this assumes weights are set once before the first
+        # forward (the load path does load_weights()/fuse_qkv() up front, neither
+        # of which mutates lambda_q/k). Reload the module to invalidate.
+        self._lam_cache = _LambdaCache()
 
         # SubLN over `2 * head_dim` (concatenated per-head output of two SDPAs)
         self.subln = nn.RMSNorm(2 * self.head_dim, eps=args.attn_rms_norm_eps)
@@ -311,9 +335,14 @@ class MotifAttention(nn.Module):
     # -- common helpers ----------------------------------------------------- #
 
     def _lambda_full(self, dtype: mx.Dtype) -> mx.array:
+        cached = self._lam_cache.store.get(dtype)
+        if cached is not None:
+            return cached
         l1 = mx.exp(mx.sum(self.lambda_q1 * self.lambda_k1, axis=-1).astype(mx.float32))
         l2 = mx.exp(mx.sum(self.lambda_q2 * self.lambda_k2, axis=-1).astype(mx.float32))
-        return (l1 - l2 + self.lambda_init).astype(dtype)
+        val = (l1 - l2 + self.lambda_init).astype(dtype)
+        self._lam_cache.store[dtype] = val
+        return val
 
     # -- forward dispatch --------------------------------------------------- #
 
@@ -419,6 +448,10 @@ class MotifAttention(nn.Module):
 
         offset = cache.offset if cache is not None else 0
         q = self.rope(q, offset=offset)
+        # RoPE acts independently per head, so roping the full k here — before
+        # the head-axis split into k1/k2 below — is identical to roping each
+        # slice separately, but costs one kernel dispatch instead of two.
+        k = self.rope(k, offset=offset)
 
         from mlx_motif.cache import MotifGroupedKVCache, MotifGroupedQuantizedKVCache
 
@@ -447,15 +480,14 @@ class MotifAttention(nn.Module):
         k1_q = k2_q = v1_q = v2_q = None  # quantized triples; QUANT_SDPA only
 
         if is_4slot:
-            # Pre-cache split: RoPE k1/k2 before writing to 4-slot cache.
+            # k is already RoPE'd above (before the split); slice it into the
+            # 4-slot layout for the cache write.
             k_pre = k.reshape(B, k_groups, kr + 1, S, d)
             k1_new = k_pre[:, :, :kr, :, :].reshape(B, k_groups * kr, S, d)
             k2_new = k_pre[:, :, kr:, :, :].reshape(B, k_groups, S, d)
             v_pre = v.reshape(B, self.k_noise_heads, 2, S, d)
             v1_new = v_pre[:, :, 0, :, :]
             v2_new = v_pre[:, :, 1, :, :]
-            k1_new = self.rope(k1_new, offset=offset)
-            k2_new = self.rope(k2_new, offset=offset)
             if path is AttnPath.QUANT_SDPA:
                 # Return raw quantized triples; sdpa_dual_v_q4 reads packed
                 # bits directly — no per-step mx.dequantize. The triples are
@@ -484,7 +516,7 @@ class MotifAttention(nn.Module):
                     v2 = v2[..., :o, :]
             kv_seq = cache.offset
         else:
-            k = self.rope(k, offset=offset)
+            # k already RoPE'd above.
             if cache is not None:
                 k, v = cache.update_and_fetch(k, v)
                 k, v = _maybe_dequant_kv(k, v, cache)
@@ -515,6 +547,13 @@ class MotifAttention(nn.Module):
             v_ = v.reshape(B, self.k_noise_heads, 2, kv_seq, d)
             v1 = v_[:, :, 0, :, :]
             v2 = v_[:, :, 1, :, :]
+
+        # The q_f concat and the kv_repeat expansion below are only consumed by
+        # the FALLBACK path, so they live inside that branch — the decode
+        # kernel paths (QUANT_SDPA / DUAL_V) build no dead nodes and their
+        # dataflow (q1/q2 fed directly to the custom kernels) is explicit.
+        # kv_repeat > 1 is also unreachable on the custom-kernel paths:
+        # _resolve_attention_path requires kv_repeat == 1 for both.
 
         # ------------------------------------------------------------------ #
         # Kernel selection — keyed off the same `path` computed above
@@ -632,6 +671,9 @@ class MotifAttention(nn.Module):
                 k2 = _repeat(k2, self.kv_repeat, axis=1)
                 v1 = _repeat(v1, self.kv_repeat, axis=1)
                 v2 = _repeat(v2, self.kv_repeat, axis=1)
+            # Concat q on the head axis to feed a single SDPA over both halves.
+            # This branch is only reachable for kr > 1 (kr == 1 takes the
+            # per-slab fast path above), so no gr-fold k1 repeat is needed.
             q_f = mx.concatenate([q1, q2], axis=1)
             k_f = mx.concatenate([k1, k2], axis=1)
             v1_f = mx.concatenate([_repeat(v1, gr, axis=1), v1], axis=1)

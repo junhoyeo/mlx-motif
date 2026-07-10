@@ -48,9 +48,11 @@ Shipped and tested on `main`:
 - Custom Metal kernels: fused PolyNorm, GDA-post, shared-QK dual-V SDPA (`sdpa_dual_v`), and a quantized-input variant (`sdpa_dual_v_q4`) that reads the packed q4/q8 KV cache directly — all with runtime-length dispatch (no per-token Metal recompiles) and full-capacity contiguous cache fetches (no per-step copy of the live KV region)
 - 4-slot KV cache (fp16 / q4 / q8) with single-dispatch batched quantized writes
 - Fast-path prefill and vanilla attention via per-slab native-GQA SDPA (no head-repeat materialization)
-- Speculative decoding with real batched verification (persistent draft KV cache, one `[1, K+1]` target forward per cycle, greedy-lossless)
-- OpenAI-compatible server with `<think>` streaming modes and prompt-based tool calling
-- Native Swift/macOS stack: SwiftUI chat app with cross-turn KV-cache reuse (EOS-reconciled), `MotifKit` runtime layer, `MotifKitMLX` overlay porting the decoder + Metal kernels to MLX-Swift, and native CLIs (`MotifNativeGenerate`, `MotifNativeEvaluate`, `MotifNativeServe`, `MotifDecodeBench`)
+- Speculative decoding with real batched verification (persistent draft KV cache, one `[1, K+1]` target forward per cycle) — lossless for greedy *and* sampled decoding (rejection sampling)
+- OpenAI-compatible server with `<think>` streaming modes and prompt-based tool calling, plus a bounded tool-**execution** loop (`run_tool_loop` + CLI demo with AST-whitelisted builtin tools)
+- Native Swift/macOS stack: SwiftUI chat app with cross-turn KV-cache reuse (EOS-reconciled), `MotifKit` runtime layer, `MotifKitMLX` overlay porting the decoder + Metal kernels to MLX-Swift, and native CLIs (`MotifNativeGenerate`, `MotifNativeEvaluate`, `MotifNativeServe` with OpenAI `tools` parity, `MotifDecodeBench`)
+- Both shipped checkpoints validated end-to-end at q4: 12.7B-Reasoning (kernels-on == kernels-off byte-identical, perplexity 12.365 recorded) and 2.6B
+- Self-hosted Apple-Silicon CI lane (build + GPU kernel tests on a registered M-series runner)
 
 What's *not* done lives in one place: [Limitations & roadmap](#limitations--roadmap).
 
@@ -136,7 +138,9 @@ The server accepts the OpenAI `tools` / `tool_choice` fields, implemented as **p
 1. A deterministic system preamble is prepended describing each tool and instructing the model to emit a single `{"tool_call": {"name", "arguments"}}` JSON object.
 2. The output is buffered (not streamed delta-by-delta, since the small model tends to loop the object), and the **first** valid balanced-JSON tool call is extracted and returned as an OpenAI `tool_calls` chunk. If no tool call is emitted, the buffered text is flushed as normal content.
 
-`tool_choice: "none"` suppresses tools; `auto`/`required` behave like the default prompt. This is a pragmatic compatibility shim, not model-native function calling — treat it accordingly. Tool **execution** is the client's job, matching OpenAI semantics.
+`tool_choice: "none"` suppresses tools; `auto`/`required` behave like the default prompt. This is a pragmatic compatibility shim, not model-native function calling — treat it accordingly. For the **server**, tool execution is the client's job, matching OpenAI semantics; the native Swift server (`MotifNativeServe`) accepts the same `tools` field, injects a byte-identical preamble (locked by a cross-language golden fixture), and returns OpenAI-shaped `tool_calls` with `finish_reason: "tool_calls"`.
+
+For local use there is also a bounded tool-**execution** loop: `run_tool_loop(...)` in [`tool_calls.py`](src/mlx_motif/tool_calls.py) generates → parses the tool call → invokes a caller-supplied executor → appends the result as a `tool` turn → regenerates, capped at `max_rounds`, with executor exceptions surfaced as tool error messages rather than crashes. The CLI demo (`mlx-motif tools-demo`) ships two safe builtins — current time and an AST-whitelisted arithmetic evaluator (no `eval`/`exec`, numeric literals and operators only, capped exponents).
 
 ## Swift / native macOS app
 
@@ -144,8 +148,8 @@ A native macOS stack lives under [`swift/`](swift/):
 
 - **`MotifChatApp`** — SwiftUI chat app with markdown rendering, conversation history, context-budget trimming, Liquid Glass chrome (macOS 26), and **cross-turn KV-cache reuse**: the backend and its KV cache persist across turns, re-prefilling only the token suffix that changed (reuse is reconciled after EOS-terminated turns so cache offsets always match the recorded tokens).
 - **`MotifKit`** — runtime layer with an OpenAI-compatible bridge and `<think>` filtering that mirrors the Python server.
-- **`MotifKitMLX`** (gated by `MOTIFKIT_ENABLE_MLX=1`) — the Motif decoder and custom Metal kernels ported to MLX-Swift, including QKV fusion (originals released after fusing), native-GQA kernel dispatch, runtime-length kernels, generation-loop cancellation, and GPU cache-limit configuration.
-- Native CLIs: `MotifNativeGenerate` (incl. `--speculative`), `MotifNativeEvaluate` (perplexity via fused log-softmax), `MotifNativeServe`, `MotifDecodeBench`.
+- **`MotifKitMLX`** (gated by `MOTIFKIT_ENABLE_MLX=1`) — the Motif decoder and custom Metal kernels ported to MLX-Swift, including QKV fusion (originals released after fusing), native-GQA kernel dispatch, runtime-length kernels with full-capacity cache fetches, generation-loop cancellation, and GPU cache-limit configuration.
+- Native CLIs: `MotifNativeGenerate` (incl. `--speculative`), `MotifNativeEvaluate` (perplexity via fused log-softmax), `MotifNativeServe` (OpenAI-compatible, incl. `tools`), `MotifDecodeBench`.
 
 ```bash
 # Default lightweight build (talks to `mlx-motif serve` over /v1)
@@ -206,7 +210,7 @@ Two properties of the decode hot path (landed July 2026) matter as much as the k
 - **Runtime KV length, static templates.** The kernels take the live KV length as a runtime `int32` input, not a Metal template constant. Template parameters are only the genuinely-static ones (dtype, head dim, GQA factor, bits, group size). This matters because `mx.fast.metal_kernel` JIT-compiles one Metal variant per unique template tuple — and decode grows the KV length by 1 every token. With the length baked into the template, **every generated token paid a fresh ~50–100 ms Metal compile**; with runtime length, the same call is ~1.7 ms (kernel microbench, M1 Max, mlx 0.31.2: fresh-KV-length call 53–99 ms before vs 1.7 ms median after, statistically identical to a zero-compile control).
 - **Full-capacity contiguous fetches.** `mx.fast.metal_kernel` defaults to `ensure_row_contiguous=True`, and an exact-length slice `[..., :offset, :]` of a step-padded cache buffer is *not* row-contiguous — so every kernel launch silently copied the entire live KV region (V slabs twice, since origin and noise calls are separate). The caches therefore return their full row-contiguous capacity buffers, and consumers bound reads by `cache.offset` (kernels via `kv_len`; non-kernel paths by slicing back).
 
-The Swift kernels implement the same runtime-length contract; wiring the Swift *caches* to full-capacity fetches is the one remaining piece (see [Limitations & roadmap](#limitations--roadmap)).
+The Swift port implements the same contract end-to-end: its kernels take the runtime KV length and its caches return full-capacity buffers, with the `kv_len < capacity` path locked by poisoned-padding tests through the public wrappers.
 
 ### `sdpa_dual_v` — the headline kernel
 
@@ -312,7 +316,9 @@ End-to-end on the real 2.6B q4 checkpoint, greedy output is token-identical to t
 
 `MotifSpeculativeEngine` (Swift, `MotifNativeGenerate --speculative`) implements real speculative decoding: a persistent draft KV cache proposes K tokens per cycle, the target verifies them in a **single batched `[1, K+1]` forward** against its own persistent cache, the longest matching prefix is accepted, and both caches `trim()` past the first mismatch. Greedy output is exactly the target's greedy continuation (gated by an exact-equivalence test against plain decode).
 
-Measured on the real 2.6B q4 checkpoint (self-draft, debug build): 46 tokens generated in **10 target forwards** (37/40 drafts accepted). That proves the forward-count reduction; **no wall-clock speedup is claimed** — with draft == target the draft cost cancels the win, and the 2.6B→12.7B pairing isn't aggressive enough on M1 Max. A sub-1B Motif draft model is the missing piece. Temperature > 0 currently throws (`greedyOnly`) rather than silently sampling non-losslessly.
+Sampled decoding (temperature > 0) is supported **losslessly** via standard rejection sampling (Leviathan/Chen): a draft token `x` is accepted with probability `min(1, p(x)/q(x))`; on rejection the token is resampled from the normalized residual `max(0, p − q)`, so the output distribution equals plain target sampling exactly. Self-draft acceptance ≈ 1 (38/38 in the gate test, since `p == q`) and seeded runs are deterministic.
+
+Measured on the real 2.6B q4 checkpoint (self-draft, debug build): 46 tokens generated in **10 target forwards** (37/40 drafts accepted). That proves the forward-count reduction; **no wall-clock speedup is claimed** — with draft == target the draft cost cancels the win. A small (sub-1B) Motif draft model is the missing piece for a wall-clock win.
 
 ## Development & tests
 
@@ -362,18 +368,17 @@ Everything known-incomplete, in one list — caveats first, then planned work. (
 
 - **Tested on M1 Max only.** The kernel constants (BN, BD, register footprint) are tuned for Apple7 / M1 Max. M2/M3/M4 may need re-tuning; not validated.
 - **Custom Metal kernels are decode-only (S=1).** Prefill uses the per-slab fast-path SDPA (MLX's stock fast templates with native GQA) — a large improvement over the old stacked fallback, but not a bespoke prefill kernel.
-- **One model class verified end-to-end at q4.** The bf16 unquantized path passes structural tests but has no end-to-end generation bench. Parity against HF is verified at bf16, not q4 — quantization adds noise that hasn't been numerically diffed.
+- **bf16 has no end-to-end bench, and HF parity is verified at bf16, not q4.** Both shipped checkpoints are validated end-to-end at q4 (the 12.7B additionally kernels-on == kernels-off byte-identical with recorded perplexity), but quantization noise hasn't been numerically diffed against the HF PyTorch reference.
 - **q4 KV-cache reuse is not byte-identical to a from-scratch prefill.** The `[1,1]` decode and `[1,n]` prefill kernels round differently in quantized arithmetic, so reused turns can diverge from a hypothetical fresh re-prefill in low-order bits. This is a property of batched-vs-incremental quantized kernels (present in every inference stack with prefix caching), not a bug; the achievable invariant — reuse == fresh *batched* reconstruction, bit-exact — is enforced by tests, including after EOS-terminated turns.
-- **2.6B e2e peak memory rose ~130 MB** (3.76 → 3.89 GB at a 3.5k prompt) with the per-slab rework even though layer-level decode is much faster — cause not yet attributed.
-- **The vanilla V cache is slab-ordered** (`[a-heads | b-heads]`) — anything reading the raw vanilla cache must account for it.
+- **2.6B e2e peak memory rose ~130 MB** (3.76 → 3.89 GB at a 3.5k prompt) with the per-slab rework. Attributed and kept as a documented trade-off: reverting would save 119 MB at 3.5k but cost +369 MB at 6k and +755 MB at 8k context (bisection and crossover table in `docs/experiments/`).
+- **The vanilla V cache is slab-ordered** (`[a-heads | b-heads]`) — the ordering is stamped into the cache's `meta_state`, so restoring a slab-ordered state into code expecting HF order fails loudly, and an inverse-permutation helper recovers HF order when needed.
 
 **Roadmap, in order of expected payoff:**
 
-1. **Swift full-capacity cache fetch** — mirror the Python cache rewiring so the Swift decode path stops copying the live KV region per token (the Swift kernels already take runtime `kv_len`).
-2. **HF Hub upload** of the converted MLX checkpoints (`mlx-community/Motif-2-12.7B-Reasoning-MLX-q4` etc).
-3. **Multi-chip validation** — re-tune and re-bench the Metal kernels on M2/M3/M4 (several negative results are worth re-running there too).
-4. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings end-to-end.
-5. **Sub-1B draft model** to turn speculative decoding's forward-count win into a wall-clock win; lossless rejection sampling for temperature > 0.
+1. **HF Hub upload** of the converted MLX checkpoints (`mlx-community/Motif-2-12.7B-Reasoning-MLX-q4` etc).
+2. **Multi-chip validation** — re-tune and re-bench the Metal kernels on M2/M3/M4 (several negative results are worth re-running there too).
+3. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings end-to-end.
+4. **Sub-1B draft model** to turn speculative decoding's forward-count win into a wall-clock win (lossless sampling is already in; the draft economics are the blocker).
 
 ## Further reading
 

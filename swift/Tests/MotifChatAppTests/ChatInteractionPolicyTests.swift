@@ -442,6 +442,61 @@ final class ChatInteractionPolicyTests: XCTestCase {
     }
 
     @MainActor
+    func testCapturedReasoningPersistsAcrossConversationSwitch() async throws {
+        let backend = ScriptedBackend([
+            .events([
+                .reasoning("First, recall the speed formula. "),
+                .reasoning("60 / 1.5 = 40."),
+                .text("The average speed is 40 mph."),
+                .completed(usage: nil, finishReason: .stop),
+            ]),
+        ])
+        let store = ChatStore(backendOverride: backend, loadsPersistedConversations: false)
+        let firstID = try XCTUnwrap(store.activeConversationID)
+
+        store.prompt = "What is the average speed?"
+        store.send()
+        await waitUntil { !store.isGenerating }
+
+        let answerID = try XCTUnwrap(store.messages.last(where: { $0.role == .assistant })?.id)
+        XCTAssertEqual(
+            store.reasoningByMessage[answerID],
+            "First, recall the speed formula. 60 / 1.5 = 40."
+        )
+
+        // Switching away clears the live reasoning map...
+        store.newChat()
+        XCTAssertNil(store.reasoningByMessage[answerID])
+
+        // ...and reopening the original conversation restores it (the persistence
+        // path other than UserDefaults: the in-memory `conversations` array that
+        // is what gets JSON-encoded to disk).
+        store.selectConversation(firstID)
+        XCTAssertEqual(
+            store.reasoningByMessage[answerID],
+            "First, recall the speed formula. 60 / 1.5 = 40."
+        )
+    }
+
+    func testConversationCodableRoundTripsReasoningAndDecodesLegacyPayload() throws {
+        let answerID = UUID()
+        let conversation = MotifConversation(
+            title: "t",
+            messages: [.user("q"), .init(id: answerID, role: .assistant, content: "a")],
+            reasoningByMessage: [answerID.uuidString: "captured reasoning"]
+        )
+        let data = try JSONEncoder().encode(conversation)
+        let decoded = try JSONDecoder().decode(MotifConversation.self, from: data)
+        XCTAssertEqual(decoded.reasoningByMessage?[answerID.uuidString], "captured reasoning")
+
+        // A conversation persisted before this field (no `reasoningByMessage`
+        // key) must still decode, with reasoning defaulting to nil.
+        let legacy = #"{"id":"\#(UUID().uuidString)","title":"t","messages":[],"createdAt":0,"updatedAt":0}"#
+        let legacyDecoded = try JSONDecoder().decode(MotifConversation.self, from: Data(legacy.utf8))
+        XCTAssertNil(legacyDecoded.reasoningByMessage)
+    }
+
+    @MainActor
     private func waitUntil(
         attempts: Int = 200,
         _ predicate: @escaping @MainActor () -> Bool

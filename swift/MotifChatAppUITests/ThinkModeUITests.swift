@@ -118,4 +118,36 @@ final class ThinkModeUITests: XCTestCase {
         requireExists(app.buttons[A11y.send], "Send button after completion", timeout: 15)
         requireExists(element(app, A11y.reasoning), "collapsed disclosure persists")
     }
+
+    /// Captured reasoning is persisted with the conversation, so the disclosure
+    /// is still present after quitting and relaunching (the disclosure only
+    /// renders when reasoning for that message is non-empty).
+    func testCapturedReasoningSurvivesRelaunch() {
+        let suite = "io.junho.motif.uitest.think.persist"
+        let config = [
+            "MOTIF_UITEST_FAKE_CHUNKS": "6",
+            "MOTIF_UITEST_FAKE_DELAY_MS": "20",
+            "MOTIF_UITEST_FAKE_ANSWER": "PERSISTANSWER ",
+            "MOTIF_UITEST_FAKE_REASONING": "PERSISTREASONINGSENTINEL",
+        ]
+        let app = XCUIApplication()
+
+        // First launch: fresh suite, capture a reasoning turn.
+        app.launchForUITest(fakeBackend: true, defaultsSuite: suite, resetDefaults: true, fakeConfig: config)
+        openRuntime(app)
+        selectPickerValue(app, pickerId: A11y.thinkPicker, title: "Captured")
+        openChat(app)
+        sendPrompt(app, "Hello")
+        waitForAnyLabel(app, contains: "PERSISTANSWER")
+        requireExists(element(app, A11y.reasoning), "reasoning disclosure after generation")
+        requireExists(app.buttons[A11y.send], "Send returns before relaunch", timeout: 15)
+
+        app.terminate()
+
+        // Relaunch the same suite WITHOUT reset and WITHOUT generating again: the
+        // disclosure must reappear purely from persisted reasoning.
+        app.launchForUITest(defaultsSuite: suite, resetDefaults: false)
+        waitForAnyLabel(app, contains: "PERSISTANSWER")
+        requireExists(element(app, A11y.reasoning), "captured reasoning survives relaunch")
+    }
 }

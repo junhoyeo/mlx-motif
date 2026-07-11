@@ -56,9 +56,14 @@ extension XCUIApplication {
         launchArguments = args
         for (k, v) in fakeConfig { launchEnvironment[k] = v }
         launch()
-        // Ensure the window is actually up before any query, so the first
-        // sidebar/element lookup isn't racing app startup.
+        // Ensure the window is up AND the chat UI is actually built before any
+        // query. The chat pane (with its input field) is the default detail at
+        // every launch, so waiting on the input keeps the first lookup in a test
+        // from racing the SwiftUI hierarchy under back-to-back-relaunch load.
         _ = wait(for: .runningForeground, timeout: 30)
+        _ = descendants(matching: .any)
+            .matching(identifier: A11y.input).firstMatch
+            .waitForExistence(timeout: 20)
         return self
     }
 }

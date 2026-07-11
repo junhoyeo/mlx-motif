@@ -9,19 +9,27 @@ public struct MotifConversation: Identifiable, Codable, Equatable, Sendable {
   public var messages: [MotifChatMessage]
   public var createdAt: Date
   public var updatedAt: Date
+  /// Captured `<think>` reasoning for assistant turns, keyed by the message id's
+  /// `uuidString`. Persisted alongside `messages` so the "Captured reasoning"
+  /// disclosure survives a conversation switch or app relaunch — reasoning is
+  /// display-only and never replayed into the model request. Optional so
+  /// conversations persisted before this field still decode.
+  public var reasoningByMessage: [String: String]?
 
   public init(
     id: UUID = UUID(),
     title: String,
     messages: [MotifChatMessage],
     createdAt: Date = Date(),
-    updatedAt: Date = Date()
+    updatedAt: Date = Date(),
+    reasoningByMessage: [String: String]? = nil
   ) {
     self.id = id
     self.title = title
     self.messages = messages
     self.createdAt = createdAt
     self.updatedAt = updatedAt
+    self.reasoningByMessage = reasoningByMessage
   }
 
   /// Placeholder shown until the first user message names the conversation.

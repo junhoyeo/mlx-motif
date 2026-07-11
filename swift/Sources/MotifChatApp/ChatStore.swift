@@ -541,7 +541,20 @@ final class ChatStore: ObservableObject {
         activeConversationID = conversation.id
         isLoadingConversation = true
         messages = conversation.messages
+        // Restore captured reasoning so the disclosure survives switching away
+        // and back (and app relaunch). Keys are message-id uuidStrings.
+        reasoningByMessage = Self.decodeReasoning(conversation.reasoningByMessage)
+        reasoningCharCount = reasoningByMessage.values.reduce(0) { $0 + $1.count }
         isLoadingConversation = false
+    }
+
+    /// Converts persisted `[uuidString: reasoning]` back to the store's
+    /// `[UUID: reasoning]`, dropping any entry whose key is not a valid UUID.
+    private static func decodeReasoning(_ stored: [String: String]?) -> [UUID: String] {
+        guard let stored else { return [:] }
+        return stored.reduce(into: [:]) { result, pair in
+            if let id = UUID(uuidString: pair.key) { result[id] = pair.value }
+        }
     }
 
     /// Mirrors the live `messages` back into the active conversation and persists.
@@ -550,8 +563,32 @@ final class ChatStore: ObservableObject {
         guard !isLoadingConversation, let id = activeConversationID,
               let index = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[index].messages = messages
+        conversations[index].reasoningByMessage = encodedReasoningForPersistence()
         conversations[index].title = MotifConversation.deriveTitle(from: messages)
         conversations[index].updatedAt = Date()
+        saveConversations()
+    }
+
+    /// Reasoning keyed by message-id uuidString for persistence, restricted to
+    /// messages still present in the transcript so deleted turns don't leave
+    /// orphaned reasoning behind. Returns nil when empty to keep the JSON small
+    /// and match the un-migrated on-disk shape.
+    private func encodedReasoningForPersistence() -> [String: String]? {
+        let liveIDs = Set(messages.map(\.id))
+        let encoded = reasoningByMessage.reduce(into: [String: String]()) { result, pair in
+            if liveIDs.contains(pair.key) { result[pair.key.uuidString] = pair.value }
+        }
+        return encoded.isEmpty ? nil : encoded
+    }
+
+    /// Persist the active conversation's reasoning without waiting for the next
+    /// `messages` mutation — reasoning tokens arrive on their own event stream,
+    /// so a turn that is pure reasoning (or whose reasoning lands after the last
+    /// answer token) would otherwise not be saved.
+    private func persistReasoning() {
+        guard !isLoadingConversation, let id = activeConversationID,
+              let index = conversations.firstIndex(where: { $0.id == id }) else { return }
+        conversations[index].reasoningByMessage = encodedReasoningForPersistence()
         saveConversations()
     }
 
@@ -951,6 +988,9 @@ final class ChatStore: ObservableObject {
                 }
                 self.liveTokensPerSecond = 0
                 self.liveTokenEstimate = 0
+                // Flush captured reasoning for this settled turn so it is durable
+                // even when reasoning was the only thing streamed.
+                self.persistReasoning()
                 if outcome != .succeeded, self.restorePendingRegenerationBackup() {
                     if self.activeConversationID != conversationID {
                         self.runtimeStatus = "Idle"

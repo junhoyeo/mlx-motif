@@ -213,9 +213,15 @@ final class ChatInteractionPolicyTests: XCTestCase {
         store.deleteConversation(deletedConversationID)
 
         XCTAssertNotEqual(store.activeConversationID, deletedConversationID)
-        XCTAssertTrue(store.isGenerating)
-        XCTAssertEqual(store.runtimeStatus, "Stopping…")
-        await waitUntil { !store.isGenerating }
+        // Deleting the active conversation releases the composer immediately —
+        // every callback of the dying stream no-ops once its conversation is
+        // gone, so there is nothing for the replacement chat to wait on.
+        XCTAssertFalse(store.isGenerating)
+        XCTAssertEqual(store.runtimeStatus, "Idle")
+        // Once the cancelled stream settles, its typed outcome lands without
+        // bleeding status into the replacement conversation.
+        await waitUntil { store.lastGenerationOutcome == .cancelled }
+        XCTAssertFalse(store.isGenerating)
         XCTAssertEqual(store.runtimeStatus, "Idle")
     }
 

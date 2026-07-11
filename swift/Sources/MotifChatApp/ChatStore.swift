@@ -361,7 +361,25 @@ final class ChatStore: ObservableObject {
     /// Suppresses conversation auto-save while we are loading messages into the
     /// view (selecting/restoring), so a load doesn't bump `updatedAt` or reorder.
     private var isLoadingConversation = false
-    private static let defaults = UserDefaults.standard
+    /// Persistence store. Normally `.standard`, but a UI test can pass
+    /// `-UITestDefaultsSuite <name>` to route settings into an isolated suite
+    /// (and `-UITestResetDefaults` to wipe it on launch) so automated runs never
+    /// read or clobber the developer's real preferences. See
+    /// `docs/swift-app-smoke.md` for the launch-argument contract.
+    private static let defaults: UserDefaults = {
+        let args = ProcessInfo.processInfo.arguments
+        guard
+            let i = args.firstIndex(of: "-UITestDefaultsSuite"),
+            i + 1 < args.count,
+            let suite = UserDefaults(suiteName: args[i + 1])
+        else {
+            return .standard
+        }
+        if args.contains("-UITestResetDefaults") {
+            suite.removePersistentDomain(forName: args[i + 1])
+        }
+        return suite
+    }()
     private static let defaultSystemPrompt = "You are Motif accessed through the configured local runtime. Be concise and helpful."
 
     var nativeMLXCompiledIn: Bool {
@@ -500,6 +518,13 @@ final class ChatStore: ObservableObject {
         // request cancellation before removing that conversation from storage.
         if activeConversationID == id {
             cancel()
+            // The cancelled stream settles asynchronously, and once this
+            // conversation is gone every one of its UI callbacks no-ops (they
+            // re-check conversation and lifecycle ownership). Release the
+            // composer and status now instead of leaving the next conversation
+            // locked behind a "Stopping…" settle it cannot observe.
+            isGenerating = false
+            runtimeStatus = "Idle"
         }
         conversations.removeAll { $0.id == id }
         if activeConversationID == id {
@@ -933,7 +958,10 @@ final class ChatStore: ObservableObject {
                     return
                 }
                 guard self.activeConversationID == conversationID else {
-                    if self.runtimeStatus == "Stopping…" {
+                    // Don't let a settling or already-cancelled status bleed
+                    // into whichever conversation the user switched to;
+                    // `lastGenerationOutcome` carries the typed result.
+                    if self.runtimeStatus == "Stopping…" || self.runtimeStatus == "Cancelled" {
                         self.runtimeStatus = "Idle"
                     }
                     return
@@ -1102,6 +1130,14 @@ final class ChatStore: ObservableObject {
     private func buildBackend(
         configuration: GenerationConfiguration
     ) throws -> any MotifChatBackend {
+        // UI-test hook: `-UITestFakeBackend` swaps in a deterministic in-process
+        // streaming backend for BOTH modes so XCUITest can drive send/stop/
+        // streaming/think-mode with no model and no network. Real validation
+        // errors (invalid URL, native-not-compiled) are still exercised by simply
+        // NOT passing this argument. See docs/swift-app-smoke.md.
+        if ProcessInfo.processInfo.arguments.contains("-UITestFakeBackend") {
+            return FakeStreamingMotifBackend()
+        }
         switch configuration.backendMode {
         case .openAICompatible:
             guard let baseURL = Self.validatedEndpointURL(configuration.endpoint) else {

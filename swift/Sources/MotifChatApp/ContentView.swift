@@ -124,6 +124,7 @@ private struct SidebarView: View {
             Section {
                 NavigationLink(value: SidebarDestination.runtime) {
                     Label("Runtime", systemImage: "speedometer")
+                        .accessibilityIdentifier("motif.sidebar.runtime")
                 }
             }
 
@@ -601,6 +602,7 @@ private struct ReasoningDisclosure: View {
                 }
             }
         }
+        .accessibilityIdentifier("motif.chat.reasoning")
         .padding(12)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
@@ -655,6 +657,7 @@ private struct InputBar: View {
                     .foregroundStyle(.red)
                     .accessibilityLabel("Generation error")
                     .accessibilityValue(lastError)
+                    .accessibilityIdentifier("motif.chat.error")
             }
 
             // Claude-style layout: the text field spans the full bar width, and
@@ -839,6 +842,8 @@ private struct MessageBubble: View {
             } else {
                 HStack(alignment: .bottom, spacing: 4) {
                     MarkdownMessageView(content: message.content)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("motif.chat.message.text")
                     if isStreaming {
                         StreamingCaret()
                     }
@@ -906,6 +911,7 @@ private struct MessageBubble: View {
                     : "This permanently removes the response from the conversation."
             )
         }
+        .accessibilityIdentifier(isUser ? "motif.chat.bubble.user" : "motif.chat.bubble.assistant")
     }
 
     /// Content alignment inside the bubble: user turns hang from the trailing
@@ -1016,11 +1022,13 @@ private struct RuntimeView: View {
                         Label(mode.label, systemImage: mode.systemImage).tag(mode)
                     }
                 }
+                .accessibilityIdentifier("motif.runtime.backendPicker")
 
                 switch store.backendMode {
                 case .openAICompatible:
                     TextField("OpenAI-compatible endpoint", text: $store.endpoint)
                         .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("motif.runtime.endpoint")
                     TextField("Model ID", text: $store.model)
                         .textFieldStyle(.roundedBorder)
 
@@ -1042,12 +1050,14 @@ private struct RuntimeView: View {
                         Text(mode.rawValue.capitalized).tag(mode)
                     }
                 }
+                .accessibilityIdentifier("motif.runtime.thinkPicker")
             }
             .disabled(store.isGenerating)
 
             Section("App status") {
                 Label("Active chat path: \(store.backendMode.label)", systemImage: store.backendMode.systemImage)
                 Label("Runtime status: \(store.runtimeStatus)", systemImage: statusIcon)
+                    .accessibilityIdentifier("motif.runtime.status")
                 if let lastError = store.lastError {
                     Label(lastError, systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.red)
@@ -1068,6 +1078,7 @@ private struct RuntimeView: View {
 
             Section("Generation") {
                 Stepper("Max tokens: \(store.maxTokens)", value: $store.maxTokens, in: 1...8192, step: 64)
+                    .accessibilityIdentifier("motif.runtime.maxTokens")
                 Slider(value: $store.temperature, in: 0...2) {
                     Text("Temperature")
                 }
@@ -1244,7 +1255,9 @@ private struct BackendMenu: View {
         .accessibilityLabel("Backend and model")
         .accessibilityValue("\(store.backendDisplayName), \(store.backendMode.label), runtime \(store.runtimeStatus)")
         .accessibilityIdentifier("motif.chat.model")
-        .padding(.horizontal, 12)
+        // 16pt to match every other toolbar pill (context meter, tok/s readout,
+        // Runtime title) — "one item per pill, each with matched padding".
+        .padding(.horizontal, 16)
         .padding(.vertical, 5)
     }
 }

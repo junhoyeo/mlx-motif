@@ -80,6 +80,29 @@ speculative-decoding wall-clock measurement from the same session (2.6B draft
 (3.0× reduction, 85/168 drafts accepted) but 9.42 s generation ≈ 13.6 tok/s
 vs ~30 tok/s plain — forward-count win, wall-clock loss.
 
+## July 2026 long-context 16k A/B: fp16 vs q4 4-slot cache
+
+`decode-e2e-127b-longctx-20260711T0215Z-{fp16,q4}.json` — same harness, model
+and host as the refresh above (`scripts/bench_decode_e2e.py`,
+Motif-2-12.7B-Reasoning q4, Apple M1 Max 64 GB, `max_tokens=64`, `n_runs=5`,
+`warmup_runs=2`), run sequentially on an idle machine. Medians and per-cell
+peak MLX memory:
+
+| Cache | p8192 tok/s | p16000 tok/s | p8192 peak | p16000 peak |
+|---|---|---|---|---|
+| fp16 4-slot (default, `MLX_MOTIF_4SLOT_CACHE=1`) | **22.47** | 14.14 | 11.82 GB | 14.29 GB |
+| q4 direct (`MLX_MOTIF_4SLOT_CACHE=q4 MLX_MOTIF_QUANT_SDPA=1`) | 21.66 | **14.74** | 10.16 GB | **10.72 GB** |
+
+Reading: (1) the throughput crossover lands **between 8k and 16k** — fp16 is
++3.7% at 8k, q4 is +4.2% at 16k, small either way (per-cell stdevs
+0.04–0.57 tok/s); (2) the decisive q4 win is **memory**: 3.6 GB lower peak at
+16k, because the fp16 cache grows context-linearly while the packed q4 cache
+grows ~4× slower (10.16 → 10.72 GB across the same doubling that takes fp16
+from 11.82 → 14.29 GB). Methodology note: a first fp16 pass taken while the
+machine was under load measured 20.18 / 12.43 tok/s with a 1.06 tok/s p16000
+stdev — it was discarded and re-run idle; only the idle numbers above are
+citable.
+
 ## 12.7B-Reasoning q4 perplexity
 
 Quality gate for the converted **Motif-2-12.7B-Reasoning q4** checkpoint

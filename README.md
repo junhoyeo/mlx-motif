@@ -35,7 +35,7 @@ Motif-2-12.7B-Reasoning at 4-bit, M1 Max (32-core GPU, 64 GB), measured July 202
 
 ¹ `MLX_MOTIF_DISABLE_KERNELS=1` — every custom kernel replaced by its pure-MLX reference.
 ² The **default configuration** (4-slot fp16 cache + `sdpa_dual_v` + `gda_post_split` + PolyNorm); equivalently `MLX_MOTIF_4SLOT_CACHE=1`.
-³ `MLX_MOTIF_4SLOT_CACHE=q4` — same kernels reading the packed q4 cache directly; trades throughput at these lengths for cache memory (its per-call attention win needs KV ≥ ~1k and compounds beyond these prompt sizes).
+³ `MLX_MOTIF_4SLOT_CACHE=q4` — same kernels reading the packed q4 cache directly; trades throughput at these lengths for cache memory (its per-call attention win needs KV ≥ ~1k and compounds beyond these prompt sizes). **Measured at long context** (idle-machine A/B, [details](docs/benchmarks/README.md#july-2026-long-context-16k-ab-fp16-vs-q4-4-slot-cache)): the throughput crossover lands between 8k and 16k (fp16 22.5 vs q4 21.7 tok/s at p8192; 14.1 vs **14.7** at p16000), and q4's decisive win is peak memory — **10.7 GB vs fp16's 14.3 GB at 16k**.
 
 **The win compounds with context length.** Attention is a small share of decode time at short context but grows linearly while MLP stays fixed; the custom path saves attention time specifically. Two provenance notes: the earlier certified sweeps in [`docs/benchmarks/`](docs/benchmarks/README.md) (e.g. 24.0 tok/s at p3204 on the same hardware) predate the July 2026 dispatch/cache-fetch rework — the current numbers above are ~28% faster at long context. And the old table's "mlx-lm-only baseline" (`MLX_MOTIF_DUAL_V=0`, then a stacked-SDPA fallback) is **no longer reproducible**: that fallback was replaced by the per-slab fast path, so today's honest baseline is the all-reference configuration shown here. The 4-slot fp16 cache became the **default** off the back of this sweep (the previous stock-cache default measured ~28 tok/s at p5, leaving ~30% on the table); opt out with `MLX_MOTIF_4SLOT_CACHE=0`.
 
@@ -391,8 +391,7 @@ Everything known-incomplete, in one list — caveats first, then planned work. (
 **Roadmap, in order of expected payoff:**
 
 1. **Multi-chip validation** — re-tune and re-bench the Metal kernels on M2/M3/M4 (several negative results are worth re-running there too).
-2. **Long-context bench** at 16k+ to characterize the 4-slot quantized cache's memory savings end-to-end.
-3. **Sub-1B draft model** to turn speculative decoding's forward-count win into a wall-clock win (lossless sampling is already in; the draft economics are the blocker).
+2. **Sub-1B draft model** to turn speculative decoding's forward-count win into a wall-clock win (lossless sampling is already in; the draft economics are the blocker).
 
 ## Further reading
 

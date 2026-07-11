@@ -687,11 +687,26 @@ private struct RuntimeView: View {
             }
         }
         .formStyle(.grouped)
-        // No extra .padding(): the grouped form carries its own content
-        // insets, and stacking more read as broken top padding on this tab.
+        // Kill the grouped form's own top inset: stacked under the reserved
+        // toolbar strip it read as a large dead band above 'Backend'. With a
+        // zero top margin the first section sits flush under the toolbar,
+        // matching the chat pane's vertical rhythm.
+        .contentMargins(.top, 0, for: .scrollContent)
         // Let the sections float on the translucent window like the chat pane.
         .scrollContentBackground(.hidden)
         .navigationTitle("Runtime")
+        .toolbar {
+            // Give the otherwise-empty toolbar strip a purpose on this tab —
+            // a leading title pill where the chat tab has its model selector.
+            ToolbarItem(placement: .navigation) {
+                Label("Runtime", systemImage: "speedometer")
+                    // Toolbar labels default to icon-only; keep the title.
+                    .labelStyle(.titleAndIcon)
+                    .font(.subheadline).fontWeight(.semibold)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 5)
+            }
+        }
         // Mask the toolbar strip like the chat tab — without this the empty
         // unified-toolbar band above the form reads as dead gray space.
         .toolbarBackground(.visible, for: .windowToolbar)

@@ -229,7 +229,14 @@ final class ChatStore: ObservableObject {
     @Published var isGenerating = false
     @Published var lastError: String?
     @Published var runtimeStatus = "Idle"
-    @Published var capturedReasoning = ""
+    /// Live captured reasoning (`<think>` content) keyed by the assistant
+    /// message it belongs to, so it streams ABOVE that message's bubble.
+    /// Session-only, like `metrics`/`toolCalls` (not persisted across relaunch).
+    @Published var reasoningByMessage: [UUID: String] = [:]
+    /// Bumps on every reasoning token so the transcript can follow the stream
+    /// to the bottom before any answer text arrives — answer text drives
+    /// `liveTokenEstimate`, but reasoning arrives first and separately.
+    @Published private(set) var reasoningCharCount = 0
     /// Non-error note surfaced when the context guard trims earlier messages.
     @Published var contextNotice: String?
     @Published var conversations: [MotifConversation] = []
@@ -363,7 +370,8 @@ final class ChatStore: ObservableObject {
     func newChat() {
         cancel()
         prompt = ""
-        capturedReasoning = ""
+        reasoningByMessage.removeAll()
+        reasoningCharCount = 0
         contextNotice = nil
         lastError = nil
         runtimeStatus = "Idle"
@@ -389,7 +397,8 @@ final class ChatStore: ObservableObject {
               let conversation = conversations.first(where: { $0.id == id }) else { return }
         cancel()
         prompt = ""
-        capturedReasoning = ""
+        reasoningByMessage.removeAll()
+        reasoningCharCount = 0
         contextNotice = nil
         lastError = nil
         runtimeStatus = "Idle"
@@ -468,7 +477,7 @@ final class ChatStore: ObservableObject {
         let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isGenerating else { return }
 
-        capturedReasoning = ""
+        reasoningCharCount = 0
         prompt = ""
         toolRoundsThisTurn = 0
         messages.append(.user(trimmed))
@@ -484,10 +493,11 @@ final class ChatStore: ObservableObject {
         // user's — a tool round leaves [assistant(call), tool, assistant(answer)]
         // after the user turn, and regenerate should replay from the user prompt.
         while let last = messages.last, last.role == .assistant || last.role == .tool {
+            reasoningByMessage.removeValue(forKey: last.id)
             messages.removeLast()
         }
         guard messages.last?.role == .user else { return }
-        capturedReasoning = ""
+        reasoningCharCount = 0
         toolRoundsThisTurn = 0
         startGeneration()
     }
@@ -588,7 +598,8 @@ final class ChatStore: ObservableObject {
                             }
                             self.append(text, toAssistantMessage: assistantID)
                         case .reasoning(let reasoning):
-                            self.capturedReasoning += reasoning
+                            self.reasoningByMessage[assistantID, default: ""] += reasoning
+                            self.reasoningCharCount += reasoning.count
                         case .completed(let usage):
                             let now = Date()
                             let content = self.messages.first(where: { $0.id == assistantID })?.content ?? ""
@@ -638,10 +649,10 @@ final class ChatStore: ObservableObject {
                 let content = self.messages.first(where: { $0.id == assistantID })?.content ?? ""
                 if let call = MotifToolCalling.parseToolCall(text: content, toolNames: MotifChatDemoTools.names) {
                     self.toolCalls[assistantID] = call
-                    if self.toolsEnabled,
-                       self.lastError == nil,
-                       self.runtimeStatus != "Cancelled",
-                       self.toolRoundsThisTurn < Self.maxToolRounds {
+                    let canExecute = self.toolsEnabled
+                        && self.lastError == nil
+                        && self.runtimeStatus != "Cancelled"
+                    if canExecute, self.toolRoundsThisTurn < Self.maxToolRounds {
                         self.toolRoundsThisTurn += 1
                         let result = MotifChatDemoTools.execute(call)
                         // Bare result as a real `tool` turn (rendered <|tool|>
@@ -651,6 +662,15 @@ final class ChatStore: ObservableObject {
                         self.runtimeStatus = "Running tool round \(self.toolRoundsThisTurn)…"
                         self.startGeneration()
                         return
+                    } else if canExecute {
+                        // Budget exhausted while the model keeps calling tools.
+                        // Python's run_tool_loop returns final text with
+                        // stopped_reason="max_rounds"; here we surface a visible
+                        // note so the transcript never dead-ends on a bare
+                        // tool-call card with no resolution (the original bug,
+                        // deferred to the round cap).
+                        self.messages.append(.assistant(
+                            "_Stopped after \(Self.maxToolRounds) tool rounds without a final answer._"))
                     }
                 }
                 if self.lastError == nil, self.runtimeStatus != "Cancelled" {
@@ -714,7 +734,7 @@ final class ChatStore: ObservableObject {
         endpoint = "http://127.0.0.1:8080/v1"
         model = "motif"
         nativeModelDirectory = ChatStore.defaultNativeModelDirectory
-        thinkMode = .hidden
+        thinkMode = .captured
         maxTokens = 512
         temperature = 0.6
         contextTokenBudget = 12000
@@ -871,10 +891,13 @@ final class ChatStore: ObservableObject {
     }
 
     private static func storedThinkMode() -> MotifThinkMode {
+        // Default to `.captured`: reasoning models stream their `<think>` block
+        // into a live disclosure above the answer, which is the most useful
+        // default for a dev tool inspecting model behaviour.
         guard let rawValue = defaults.string(forKey: DefaultsKey.thinkMode.rawValue) else {
-            return .hidden
+            return .captured
         }
-        return MotifThinkMode(rawValue: rawValue) ?? .hidden
+        return MotifThinkMode(rawValue: rawValue) ?? .captured
     }
 
     private static func storedNativeModelDirectory() -> String {

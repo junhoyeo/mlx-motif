@@ -221,24 +221,14 @@ private struct ChatView: View {
                 } else {
                     LazyVStack(alignment: .leading, spacing: 16) {
                         ForEach(Array(visibleMessages.enumerated()), id: \.element.id) { index, message in
-                            MessageBubble(
+                            TranscriptRow(
                                 store: store,
                                 message: message,
-                                isStreaming: store.isGenerating
-                                    && message.id == visibleMessages.last?.id
-                                    && message.role == .assistant,
                                 isLast: message.id == visibleMessages.last?.id,
-                                // A following tool turn is the PERSISTED marker
-                                // that this assistant turn executed a tool —
-                                // survives relaunch, unlike store.toolCalls.
                                 executedToolFollows: index + 1 < visibleMessages.count
                                     && visibleMessages[index + 1].role == .tool
                             )
                             .id(message.id)
-                        }
-
-                        if !store.capturedReasoning.isEmpty {
-                            ReasoningDisclosure(text: store.capturedReasoning)
                         }
 
                         // Bottom scroll target. The input bar's height is handled
@@ -268,6 +258,11 @@ private struct ChatView: View {
                 scrollToBottom(proxy, animated: true)
             }
             .onChange(of: store.liveTokenEstimate) { _, _ in
+                scrollToBottom(proxy, animated: false)
+            }
+            // Follow the captured-reasoning stream too — it arrives before any
+            // answer text, so `liveTokenEstimate` alone wouldn't track it.
+            .onChange(of: store.reasoningCharCount) { _, _ in
                 scrollToBottom(proxy, animated: false)
             }
             // The input bar is a real bottom inset of the scroll view: content is
@@ -344,17 +339,28 @@ private struct EmptyChatState: View {
 
 private struct ReasoningDisclosure: View {
     let text: String
+    var isStreaming: Bool = false
+
+    // Auto-expanded while the model is thinking so the stream is visible, then
+    // collapsed to a tidy summary once the answer starts. The user can still
+    // toggle it manually at any point.
+    @State private var expanded = false
 
     var body: some View {
-        DisclosureGroup {
+        DisclosureGroup(isExpanded: $expanded) {
             Text(text)
                 .font(.body)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 6)
         } label: {
-            Label("Captured reasoning", systemImage: "brain")
-                .font(.callout)
+            HStack(spacing: 6) {
+                Label(isStreaming ? "Reasoning…" : "Captured reasoning", systemImage: "brain")
+                    .font(.callout)
+                if isStreaming {
+                    ProgressView().controlSize(.mini)
+                }
+            }
         }
         .padding(12)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -362,6 +368,11 @@ private struct ReasoningDisclosure: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .stroke(.quaternary, lineWidth: 1)
         )
+        .onAppear { expanded = isStreaming }
+        .onChange(of: isStreaming) { _, streaming in
+            // Expand when a new think stream starts; collapse when it finishes.
+            withAnimation(.easeInOut(duration: 0.2)) { expanded = streaming }
+        }
     }
 }
 
@@ -443,6 +454,46 @@ private struct InputBar: View {
             .motifGlassGroup()
         }
         .padding(16)
+    }
+}
+
+// MARK: - Transcript row
+
+/// One transcript entry: an assistant turn's captured reasoning (streamed live
+/// above the answer) followed by the message bubble. Extracted from the
+/// `ForEach` body so the per-row derivations stay out of the view builder's
+/// type-inference (which times out when inlined).
+private struct TranscriptRow: View {
+    @ObservedObject var store: ChatStore
+    let message: MotifChatMessage
+    let isLast: Bool
+    let executedToolFollows: Bool
+
+    private var reasoning: String {
+        message.role == .assistant ? (store.reasoningByMessage[message.id] ?? "") : ""
+    }
+
+    /// Reasoning is "live" while this is the last message, the turn is
+    /// generating, and no answer text has arrived yet (Motif emits the whole
+    /// `<think>` block before the answer). Once answer text starts, the card
+    /// collapses to a tidy summary.
+    private var reasoningStreaming: Bool {
+        store.isGenerating && isLast && message.content.isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !reasoning.isEmpty {
+                ReasoningDisclosure(text: reasoning, isStreaming: reasoningStreaming)
+            }
+            MessageBubble(
+                store: store,
+                message: message,
+                isStreaming: store.isGenerating && isLast && message.role == .assistant,
+                isLast: isLast,
+                executedToolFollows: executedToolFollows
+            )
+        }
     }
 }
 

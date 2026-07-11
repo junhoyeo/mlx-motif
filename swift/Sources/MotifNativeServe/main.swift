@@ -230,7 +230,10 @@ private final class NativeOpenAIServer: @unchecked Sendable {
                 ]
                 try await sendSSE(connection, payload: payload)
             case .reasoning(let reasoning):
-                capturedReasoning = reasoning
+                // Reasoning now arrives as incremental deltas (streamed live in
+                // the app); accumulate so the terminal `reasoning` field still
+                // carries the full captured think block.
+                capturedReasoning = (capturedReasoning ?? "") + reasoning
             case .completed(let usage):
                 terminalUsage = usage
                 // Tools declared: parse the buffered output. If a tool call is

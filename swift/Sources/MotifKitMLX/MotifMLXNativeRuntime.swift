@@ -500,18 +500,36 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                             generatedTokenIDs.append(token)
                             detokenizer.append(token: token)
                             if let chunk = detokenizer.next() {
+                                let reasoningBefore = thinkFilter.capturedReasoning.count
                                 let visible = thinkFilter.feed(chunk)
                                 if !visible.isEmpty {
                                     continuation.yield(.text(visible))
                                 }
+                                // Stream captured reasoning incrementally (delta
+                                // appended to the filter this feed) so the app
+                                // can render the think block live above the
+                                // answer, instead of dumping it all at the end.
+                                if parameters.thinkMode == .captured {
+                                    let delta = String(
+                                        thinkFilter.capturedReasoning.suffix(
+                                            thinkFilter.capturedReasoning.count - reasoningBefore))
+                                    if !delta.isEmpty { continuation.yield(.reasoning(delta)) }
+                                }
                             }
                         case .info(let completion):
+                            let reasoningBefore = thinkFilter.capturedReasoning.count
                             let tail = thinkFilter.finish()
                             if !tail.isEmpty {
                                 continuation.yield(.text(tail))
                             }
-                            if parameters.thinkMode == .captured, !thinkFilter.capturedReasoning.isEmpty {
-                                continuation.yield(.reasoning(thinkFilter.capturedReasoning))
+                            // Flush any reasoning still buffered at end-of-stream
+                            // (e.g. the stream ended mid-think) as a final delta,
+                            // consistent with the incremental emission above.
+                            if parameters.thinkMode == .captured {
+                                let delta = String(
+                                    thinkFilter.capturedReasoning.suffix(
+                                        thinkFilter.capturedReasoning.count - reasoningBefore))
+                                if !delta.isEmpty { continuation.yield(.reasoning(delta)) }
                             }
                             // Carry the cache forward for the next turn. The
                             // cache now holds the full prompt plus everything we

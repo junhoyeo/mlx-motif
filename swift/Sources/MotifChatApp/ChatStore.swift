@@ -193,6 +193,40 @@ enum SafeArithmetic {
     }
 }
 
+/// Small value-type coordinator that makes generation ownership explicit. A
+/// completion may clear shared UI state only when it still owns the active ID;
+/// this keeps a late callback from an older task from finishing a newer one.
+struct ChatGenerationLifecycle: Equatable {
+    private(set) var activeID: UUID?
+
+    @discardableResult
+    mutating func begin(id: UUID = UUID()) -> UUID {
+        activeID = id
+        return id
+    }
+
+    func owns(_ id: UUID) -> Bool {
+        activeID == id
+    }
+
+    @discardableResult
+    mutating func finish(id: UUID) -> Bool {
+        guard owns(id) else { return false }
+        activeID = nil
+        return true
+    }
+}
+
+/// Typed terminal result for the most recently settled generation. UI
+/// announcements use this instead of inferring an outcome from display copy
+/// such as `runtimeStatus`, which may legitimately return to Idle after the
+/// user switches conversations while cancellation is settling.
+enum ChatGenerationOutcome: Equatable, Sendable {
+    case succeeded
+    case cancelled
+    case failed
+}
+
 @MainActor
 final class ChatStore: ObservableObject {
     @Published var backendMode: MotifChatBackendMode = ChatStore.storedBackendMode() {
@@ -227,6 +261,7 @@ final class ChatStore: ObservableObject {
         didSet { syncActiveConversation() }
     }
     @Published var isGenerating = false
+    @Published private(set) var lastGenerationOutcome: ChatGenerationOutcome?
     @Published var lastError: String?
     @Published var runtimeStatus = "Idle"
     /// Live captured reasoning (`<think>` content) keyed by the assistant
@@ -278,17 +313,51 @@ final class ChatStore: ObservableObject {
     @Published var liveTokensPerSecond: Double = 0
     @Published var liveTokenEstimate: Int = 0
 
-    private var generationTask: Task<Void, Never>?
+    private struct GenerationConfiguration: Sendable {
+        let backendMode: MotifChatBackendMode
+        let endpoint: String
+        let nativeModelDirectory: String
+        let parameters: MotifGenerationParameters
+        let contextTokenBudget: Int
+        let toolsEnabled: Bool
+
+        var backendSignature: String {
+            switch backendMode {
+            case .openAICompatible:
+                "openai:\(endpoint):\(parameters.model)"
+            case .nativeMLX:
+                "native:\(nativeModelDirectory)"
+            }
+        }
+    }
+
+    private struct RegenerationBackup {
+        let conversationID: UUID
+        let insertionIndex: Int
+        let messages: [MotifChatMessage]
+        let reasoning: [UUID: String]
+        let metrics: [UUID: MessageMetrics]
+        let toolCalls: [UUID: MotifToolCalling.ParsedToolCall]
+        let truncatedMessageIDs: Set<UUID>
+        let reasoningCharCount: Int
+        let toolRounds: Int
+        let continuations: Int
+    }
+
+    private var generationLifecycle = ChatGenerationLifecycle()
+    private var generationTask: (id: UUID, task: Task<Void, Never>)?
+    private var pendingRegenerationBackup: RegenerationBackup?
     // Streaming-metrics scratch (reset per turn).
     private var genFirstTokenAt: Date?
     private var genCharCount: Int = 0
-    private var nativeDirectoryAccess: NativeDirectoryAccessGrant?
     /// Backend reused across turns so the native runtime (and its KV-cache) is
     /// not rebuilt every message — that reuse is what lets the runtime skip
     /// re-prefilling the shared conversation prefix. Keyed on the backend config
     /// signature; rebuilt when the config changes or after a backend error.
     private var cachedBackend: (any MotifChatBackend)?
     private var cachedBackendSignature: String?
+    private let backendOverride: (any MotifChatBackend)?
+    private let persistsConversations: Bool
     /// Suppresses conversation auto-save while we are loading messages into the
     /// view (selecting/restoring), so a load doesn't bump `updatedAt` or reorder.
     private var isLoadingConversation = false
@@ -366,8 +435,13 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    init() {
-        conversations = Self.loadConversations()
+    init(
+        backendOverride: (any MotifChatBackend)? = nil,
+        loadsPersistedConversations: Bool = true
+    ) {
+        self.backendOverride = backendOverride
+        self.persistsConversations = loadsPersistedConversations
+        conversations = loadsPersistedConversations ? Self.loadConversations() : []
         // Open the most recently updated conversation if one exists, otherwise
         // start a fresh chat so the active conversation is always tracked.
         if let mostRecent = conversations.max(by: { $0.updatedAt < $1.updatedAt }) {
@@ -385,7 +459,9 @@ final class ChatStore: ObservableObject {
         reasoningCharCount = 0
         contextNotice = nil
         lastError = nil
-        runtimeStatus = "Idle"
+        if !isGenerating {
+            runtimeStatus = "Idle"
+        }
         startFreshConversation()
     }
 
@@ -413,11 +489,18 @@ final class ChatStore: ObservableObject {
         reasoningCharCount = 0
         contextNotice = nil
         lastError = nil
-        runtimeStatus = "Idle"
+        if !isGenerating {
+            runtimeStatus = "Idle"
+        }
         loadConversation(conversation)
     }
 
     func deleteConversation(_ id: UUID) {
+        // A stream owns message and security-scope state for its conversation;
+        // request cancellation before removing that conversation from storage.
+        if activeConversationID == id {
+            cancel()
+        }
         conversations.removeAll { $0.id == id }
         if activeConversationID == id {
             if let next = conversations.max(by: { $0.updatedAt < $1.updatedAt }) {
@@ -448,6 +531,7 @@ final class ChatStore: ObservableObject {
     }
 
     private func saveConversations() {
+        guard persistsConversations else { return }
         guard let data = try? JSONEncoder().encode(conversations) else { return }
         ChatStore.defaults.set(data, forKey: DefaultsKey.conversations.rawValue)
     }
@@ -464,9 +548,13 @@ final class ChatStore: ObservableObject {
     /// conversations don't overflow the model window. Sets `contextNotice` when
     /// earlier messages were trimmed (a non-error status note).
     func messagesWithinBudget() -> [MotifChatMessage] {
+        messagesWithinBudget(tokenBudget: contextTokenBudget)
+    }
+
+    private func messagesWithinBudget(tokenBudget: Int) -> [MotifChatMessage] {
         switch compactionMode {
         case .slidingWindow:
-            let result = motifTrimMessagesToBudget(messages, budgetTokens: contextTokenBudget)
+            let result = motifTrimMessagesToBudget(messages, budgetTokens: tokenBudget)
             if result.dropped > 0 {
                 contextNotice = "Trimmed \(result.dropped) earlier message\(result.dropped == 1 ? "" : "s") to fit context"
             } else {
@@ -477,12 +565,10 @@ final class ChatStore: ObservableObject {
     }
 
     func cancel() {
-        generationTask?.cancel()
-        generationTask = nil
-        isGenerating = false
-        if runtimeStatus != "Idle" {
-            runtimeStatus = "Cancelled"
-        }
+        guard let generationTask,
+              generationLifecycle.owns(generationTask.id) else { return }
+        generationTask.task.cancel()
+        runtimeStatus = "Stopping…"
     }
 
     func send() {
@@ -494,34 +580,157 @@ final class ChatStore: ObservableObject {
         toolRoundsThisTurn = 0
         continuationsThisTurn = 0
         messages.append(.user(trimmed))
-        startGeneration()
+        _ = startGeneration(configuration: generationConfiguration())
     }
 
-    /// Drops the trailing assistant reply (if any) and re-runs the latest user
-    /// turn through the same streaming path as `send()`. No-op while generating
-    /// or when there is no user message to replay.
+    /// Drops the latest response bundle and re-runs its user prompt. The complete
+    /// prior response and its session-only presentation state are restored if
+    /// setup or streaming fails, or if the replacement is cancelled.
     func regenerateLast() {
-        guard !isGenerating else { return }
-        // Remove trailing assistant/tool messages so the latest turn is the
-        // user's — a tool round leaves [assistant(call), tool, assistant(answer)]
-        // after the user turn, and regenerate should replay from the user prompt.
-        while let last = messages.last, last.role == .assistant || last.role == .tool {
-            reasoningByMessage.removeValue(forKey: last.id)
-            truncatedMessages.remove(last.id)
-            messages.removeLast()
-        }
-        guard messages.last?.role == .user else { return }
+        guard !isGenerating,
+              let conversationID = activeConversationID,
+              let lastID = messages.last?.id,
+              let responseRange = Self.responseRange(containing: lastID, in: messages),
+              responseRange.upperBound == messages.endIndex else { return }
+
+        let removedMessages = Array(messages[responseRange])
+        let removedIDs = Set(removedMessages.map(\.id))
+        let removedReasoning = reasoningByMessage.filter { removedIDs.contains($0.key) }
+        let removedMetrics = metrics.filter { removedIDs.contains($0.key) }
+        let removedToolCalls = toolCalls.filter { removedIDs.contains($0.key) }
+        let removedTruncations = truncatedMessages.intersection(removedIDs)
+        let previousReasoningCharCount = reasoningCharCount
+        let previousToolRounds = toolRoundsThisTurn
+        let previousContinuations = continuationsThisTurn
+        let configuration = generationConfiguration()
+
+        pendingRegenerationBackup = RegenerationBackup(
+            conversationID: conversationID,
+            insertionIndex: responseRange.lowerBound,
+            messages: removedMessages,
+            reasoning: removedReasoning,
+            metrics: removedMetrics,
+            toolCalls: removedToolCalls,
+            truncatedMessageIDs: removedTruncations,
+            reasoningCharCount: previousReasoningCharCount,
+            toolRounds: previousToolRounds,
+            continuations: previousContinuations
+        )
+
+        removeTransientState(for: removedIDs)
+        messages.removeSubrange(responseRange)
         reasoningCharCount = 0
         toolRoundsThisTurn = 0
         continuationsThisTurn = 0
-        startGeneration()
+        guard !startGeneration(configuration: configuration) else { return }
+        restorePendingRegenerationBackup()
     }
 
-    /// Removes a single message by id. Disabled mid-stream so a delete can't race
-    /// the streaming placeholder it is appending into.
+    /// Returns the complete assistant/tool response bundle for the user turn
+    /// containing `id`. The originating user prompt is deliberately excluded.
+    /// This pure helper is internal so response-boundary behavior is testable.
+    nonisolated static func responseRange(
+        containing id: UUID,
+        in messages: [MotifChatMessage]
+    ) -> Range<Int>? {
+        guard let messageIndex = messages.firstIndex(where: { $0.id == id }),
+              messages[messageIndex].role == .assistant || messages[messageIndex].role == .tool,
+              let userIndex = messages[...messageIndex].lastIndex(where: { $0.role == .user }) else {
+            return nil
+        }
+
+        let responseStart = userIndex + 1
+        let responseEnd = messages.indices.first(where: {
+            $0 > responseStart && (messages[$0].role == .user || messages[$0].role == .system)
+        }) ?? messages.endIndex
+        guard responseStart < responseEnd, responseStart..<responseEnd ~= messageIndex else {
+            return nil
+        }
+        return responseStart..<responseEnd
+    }
+
+    /// Removes the whole response for a turn: tool call, tool result, follow-up
+    /// rounds, and final assistant answer. The user prompt remains available for
+    /// editing or regeneration.
+    func deleteResponse(containing id: UUID) {
+        guard !isGenerating,
+              let responseRange = Self.responseRange(containing: id, in: messages) else { return }
+        let removedIDs = Set(messages[responseRange].map(\.id))
+        removeTransientState(for: removedIDs)
+        messages.removeSubrange(responseRange)
+    }
+
+    /// Compatibility alias for existing message-row callers. Deletion is now
+    /// response-scoped rather than single-message-scoped to prevent orphaned
+    /// tool results or final answers.
     func deleteMessage(_ id: UUID) {
-        guard !isGenerating else { return }
-        messages.removeAll { $0.id == id }
+        deleteResponse(containing: id)
+    }
+
+    private func removeTransientState(for messageIDs: Set<UUID>) {
+        truncatedMessages.subtract(messageIDs)
+        for id in messageIDs {
+            reasoningByMessage.removeValue(forKey: id)
+            metrics.removeValue(forKey: id)
+            toolCalls.removeValue(forKey: id)
+        }
+    }
+
+    /// Restores the response replaced by an in-flight regeneration. The backup
+    /// survives every tool round and is resolved only when the full regenerated
+    /// turn succeeds, fails, or is cancelled.
+    @discardableResult
+    private func restorePendingRegenerationBackup() -> Bool {
+        guard let backup = pendingRegenerationBackup else { return false }
+        pendingRegenerationBackup = nil
+
+        if activeConversationID == backup.conversationID {
+            let insertionIndex = min(backup.insertionIndex, messages.endIndex)
+            let generatedIDs = Set(messages[insertionIndex...].map(\.id))
+            removeTransientState(for: generatedIDs)
+            messages.replaceSubrange(insertionIndex..., with: backup.messages)
+            reasoningCharCount = backup.reasoningCharCount
+            toolRoundsThisTurn = backup.toolRounds
+            continuationsThisTurn = backup.continuations
+            reasoningByMessage.merge(backup.reasoning) { _, restored in restored }
+            metrics.merge(backup.metrics) { _, restored in restored }
+            toolCalls.merge(backup.toolCalls) { _, restored in restored }
+            truncatedMessages.formUnion(backup.truncatedMessageIDs)
+        } else if let index = conversations.firstIndex(where: { $0.id == backup.conversationID }) {
+            var conversation = conversations[index]
+            let insertionIndex = min(backup.insertionIndex, conversation.messages.endIndex)
+            let generatedIDs = Set(conversation.messages[insertionIndex...].map(\.id))
+            removeTransientState(for: generatedIDs)
+            conversation.messages.replaceSubrange(insertionIndex..., with: backup.messages)
+            conversation.title = MotifConversation.deriveTitle(from: conversation.messages)
+            conversation.updatedAt = Date()
+            conversations[index] = conversation
+            reasoningByMessage.merge(backup.reasoning) { _, restored in restored }
+            metrics.merge(backup.metrics) { _, restored in restored }
+            toolCalls.merge(backup.toolCalls) { _, restored in restored }
+            truncatedMessages.formUnion(backup.truncatedMessageIDs)
+            saveConversations()
+        } else {
+            // The conversation itself was intentionally deleted while stopping.
+            return false
+        }
+        return true
+    }
+
+    private func generationConfiguration() -> GenerationConfiguration {
+        GenerationConfiguration(
+            backendMode: backendMode,
+            endpoint: endpoint,
+            nativeModelDirectory: nativeModelDirectory,
+            parameters: MotifGenerationParameters(
+                model: model,
+                maxTokens: maxTokens,
+                temperature: temperature,
+                thinkMode: thinkMode
+            ),
+            contextTokenBudget: contextTokenBudget,
+            toolsEnabled: toolsEnabled
+        )
     }
 
     /// Shared streaming machinery for `send()`/`regenerateLast()`. Assumes the
@@ -537,27 +746,34 @@ final class ChatStore: ObservableObject {
         + "repetition of what you already wrote. Pick up mid-sentence if that "
         + "is where the cut happened."
 
-    /// Drives one generation. When `continuationOf` is set, the run resumes a
-    /// truncated assistant turn: it streams into that existing message (rather
-    /// than a new bubble) and appends a request-only resume instruction so the
-    /// model picks up where it was cut off.
-    private func startGeneration(continuationOf continuationID: UUID? = nil) {
+    /// Drives one snapshotted generation round. When `continuationOf` is set,
+    /// the run resumes a truncated assistant turn in the existing bubble while
+    /// retaining the original turn's backend, model, parameters, and tool mode.
+    @discardableResult
+    private func startGeneration(
+        configuration: GenerationConfiguration,
+        continuationOf continuationID: UUID? = nil
+    ) -> Bool {
+        guard generationLifecycle.activeID == nil else { return false }
+        let generationID = UUID()
         let backend: any MotifChatBackend
         do {
-            backend = try makeBackend()
+            backend = try makeBackend(configuration: configuration)
         } catch {
             lastError = error.localizedDescription
             runtimeStatus = "Error"
-            return
+            return false
         }
 
+        lastGenerationOutcome = nil
         lastError = nil
-        runtimeStatus = backendMode == .nativeMLX ? "Loading native checkpoint…" : "Connecting to endpoint…"
+        runtimeStatus = configuration.backendMode == .nativeMLX
+            ? "Loading native checkpoint…" : "Connecting to endpoint…"
         // Build the request transcript before adding the streaming placeholder,
         // applying the context-budget guard so long chats don't overflow. When
         // tools are enabled, inject the demo-tools preamble into the leading
         // system message for this turn only (the stored transcript is untouched).
-        var requestMessages = messagesWithinBudget()
+        var requestMessages = messagesWithinBudget(tokenBudget: configuration.contextTokenBudget)
         // Parity with Python run_tool_loop: each assistant turn whose tool call
         // actually EXECUTED (marked by the tool-result turn right after it —
         // a persisted marker, unlike the session-only `toolCalls` dict) is
@@ -576,7 +792,7 @@ final class ChatStore: ObservableObject {
                 requestMessages[index].content = MotifToolCalling.canonicalToolCallJSON(call)
             }
         }
-        if toolsEnabled {
+        if configuration.toolsEnabled {
             let preamble = MotifToolCalling.buildToolsPreamble(MotifChatDemoTools.tools)
             if let first = requestMessages.first, first.role == .system {
                 requestMessages[0].content += "\n\n" + preamble
@@ -596,6 +812,8 @@ final class ChatStore: ObservableObject {
             messages.append(.assistant(""))
             assistantID = messages[messages.count - 1].id
         }
+        let conversationID = activeConversationID
+        generationLifecycle.begin(id: generationID)
         isGenerating = true
 
         // Reset per-turn decode-metrics scratch.
@@ -606,22 +824,18 @@ final class ChatStore: ObservableObject {
         liveTokenEstimate = 0
         let promptEstimate = requestMessages.reduce(0) { $0 + motifEstimatedTokenCount($1.content) }
 
-        let parameters = MotifGenerationParameters(
-            model: model,
-            maxTokens: maxTokens,
-            temperature: temperature,
-            thinkMode: thinkMode
-        )
-
-        generationTask = Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
+            var outcome = ChatGenerationOutcome.succeeded
             do {
                 for try await event in backend.streamResponse(
                     messages: Array(requestMessages),
-                    parameters: parameters
+                    parameters: configuration.parameters
                 ) {
                     try Task.checkCancellation()
                     await MainActor.run {
+                        guard self.generationLifecycle.owns(generationID),
+                              self.activeConversationID == conversationID else { return }
                         if self.runtimeStatus != "Generating…" {
                             self.runtimeStatus = "Generating…"
                         }
@@ -655,38 +869,91 @@ final class ChatStore: ObservableObject {
                             // Record truncation so the UI can offer to continue
                             // the turn. A prior truncation is cleared once the
                             // model reaches a natural stop.
-                            if finishReason == .length {
+                            switch finishReason {
+                            case .length:
                                 self.truncatedMessages.insert(assistantID)
-                            } else {
+                            case .stop, .cancelled:
                                 self.truncatedMessages.remove(assistantID)
+                            case .unknown:
+                                // Some SSE servers send a meaningful terminal
+                                // reason followed by a bare [DONE]. Do not let
+                                // that trailing unknown erase `.length`.
+                                break
                             }
                         }
                     }
                 }
+                try Task.checkCancellation()
             } catch is CancellationError {
+                outcome = .cancelled
                 await MainActor.run {
+                    guard self.generationLifecycle.owns(generationID),
+                          self.activeConversationID == conversationID else { return }
                     self.runtimeStatus = "Cancelled"
                     self.append("\n\n[Cancelled]", toAssistantMessage: assistantID)
                 }
             } catch {
-                await MainActor.run {
-                    self.runtimeStatus = "Error"
-                    self.lastError = error.localizedDescription
-                    self.append("\n\n[Error: \(error.localizedDescription)]", toAssistantMessage: assistantID)
-                    // Drop the (possibly half-loaded) backend so the next turn
-                    // rebuilds cleanly and the KV-cache starts fresh.
-                    self.invalidateBackend()
+                if Task.isCancelled {
+                    outcome = .cancelled
+                    await MainActor.run {
+                        guard self.generationLifecycle.owns(generationID),
+                              self.activeConversationID == conversationID else { return }
+                        self.runtimeStatus = "Cancelled"
+                        self.append("\n\n[Cancelled]", toAssistantMessage: assistantID)
+                    }
+                    // Some async backends surface cancellation as their own
+                    // transport error rather than `CancellationError`.
+                    // Treat it as cancellation and keep the backend reusable.
+                } else {
+                    outcome = .failed
+                    await MainActor.run {
+                        guard self.generationLifecycle.owns(generationID) else { return }
+                        self.invalidateBackend(matching: configuration.backendSignature)
+                        guard self.activeConversationID == conversationID else { return }
+                        self.runtimeStatus = "Error"
+                        self.lastError = error.localizedDescription
+                        self.append("\n\n[Error: \(error.localizedDescription)]", toAssistantMessage: assistantID)
+                    }
                 }
             }
 
             await MainActor.run {
-                // Release scoped access only after every file read for this load is
-                // done — this block runs on all completion paths (success/error/cancel).
-                self.releaseNativeDirectoryAccess()
+                guard self.generationLifecycle.finish(id: generationID) else { return }
+                self.lastGenerationOutcome = outcome
                 self.isGenerating = false
-                self.generationTask = nil
+                if self.generationTask?.id == generationID {
+                    self.generationTask = nil
+                }
                 self.liveTokensPerSecond = 0
                 self.liveTokenEstimate = 0
+                if outcome != .succeeded, self.restorePendingRegenerationBackup() {
+                    if self.activeConversationID != conversationID {
+                        self.runtimeStatus = "Idle"
+                    }
+                    return
+                }
+                guard self.activeConversationID == conversationID else {
+                    if self.runtimeStatus == "Stopping…" {
+                        self.runtimeStatus = "Idle"
+                    }
+                    return
+                }
+                // Resume a response cut off at the output-token limit before
+                // interpreting it as a tool call. The same turn configuration
+                // and regeneration backup survive every bounded continuation.
+                if outcome == .succeeded,
+                   self.truncatedMessages.contains(assistantID),
+                   self.continuationsThisTurn < Self.maxContinuations {
+                    self.continuationsThisTurn += 1
+                    self.runtimeStatus = "Continuing (\(self.continuationsThisTurn)/\(Self.maxContinuations))…"
+                    if !self.startGeneration(
+                        configuration: configuration,
+                        continuationOf: assistantID
+                    ) {
+                        self.restorePendingRegenerationBackup()
+                    }
+                    return
+                }
                 // If this turn emitted a tool call, capture it so the transcript
                 // renders it as a card instead of raw JSON — then EXECUTE the
                 // builtin, append the result as a tool turn, and continue
@@ -695,9 +962,7 @@ final class ChatStore: ObservableObject {
                 let content = self.messages.first(where: { $0.id == assistantID })?.content ?? ""
                 if let call = MotifToolCalling.parseToolCall(text: content, toolNames: MotifChatDemoTools.names) {
                     self.toolCalls[assistantID] = call
-                    let canExecute = self.toolsEnabled
-                        && self.lastError == nil
-                        && self.runtimeStatus != "Cancelled"
+                    let canExecute = configuration.toolsEnabled && outcome == .succeeded
                     if canExecute, self.toolRoundsThisTurn < Self.maxToolRounds {
                         self.toolRoundsThisTurn += 1
                         let result = MotifChatDemoTools.execute(call)
@@ -706,7 +971,9 @@ final class ChatStore: ObservableObject {
                         // The "Tool result (name):" framing is display-only.
                         self.messages.append(.tool(result, name: call.name))
                         self.runtimeStatus = "Running tool round \(self.toolRoundsThisTurn)…"
-                        self.startGeneration()
+                        if !self.startGeneration(configuration: configuration) {
+                            self.restorePendingRegenerationBackup()
+                        }
                         return
                     } else if canExecute {
                         // Budget exhausted while the model keeps calling tools.
@@ -719,23 +986,14 @@ final class ChatStore: ObservableObject {
                             "_Stopped after \(Self.maxToolRounds) tool rounds without a final answer._"))
                     }
                 }
-                // Auto-continue a response cut off at the token limit — resume
-                // streaming into the same bubble with no user action (Claude
-                // Code harness-style recovery), bounded so it can't loop forever.
-                if self.truncatedMessages.contains(assistantID),
-                   self.lastError == nil,
-                   self.runtimeStatus != "Cancelled",
-                   self.continuationsThisTurn < Self.maxContinuations {
-                    self.continuationsThisTurn += 1
-                    self.runtimeStatus = "Continuing (\(self.continuationsThisTurn)/\(Self.maxContinuations))…"
-                    self.startGeneration(continuationOf: assistantID)
-                    return
-                }
-                if self.lastError == nil, self.runtimeStatus != "Cancelled" {
+                if outcome == .succeeded {
+                    self.pendingRegenerationBackup = nil
                     self.runtimeStatus = "Idle"
                 }
             }
         }
+        generationTask = (generationID, task)
+        return true
     }
 
     func selectNativeModelDirectory(_ url: URL) {
@@ -754,6 +1012,7 @@ final class ChatStore: ObservableObject {
         nativeModelDirectory = path
         rememberNativeModelDirectory(path)
         backendMode = .nativeMLX
+        runtimeStatus = "Native checkpoint selected"
         lastError = nil
     }
 
@@ -772,13 +1031,15 @@ final class ChatStore: ObservableObject {
                 includingResourceValuesForKeys: nil,
                 relativeTo: nil
             )
-            ChatStore.defaults.set(
-                bookmark.base64EncodedString(),
-                forKey: DefaultsKey.nativeModelDirectoryBookmark.rawValue
-            )
+            var bookmarks = Self.storedNativeModelDirectoryBookmarks()
+            bookmarks[Self.canonicalModelDirectoryPath(url)] = bookmark.base64EncodedString()
+            ChatStore.defaults.set(bookmarks, forKey: DefaultsKey.nativeModelDirectoryBookmarks.rawValue)
         } catch {
-            // Drop any stale bookmark so resolution falls back to the path cleanly.
-            ChatStore.defaults.removeObject(forKey: DefaultsKey.nativeModelDirectoryBookmark.rawValue)
+            // Drop only this path's invalid entry; bookmarks for other imported
+            // model directories remain valid.
+            var bookmarks = Self.storedNativeModelDirectoryBookmarks()
+            bookmarks.removeValue(forKey: Self.canonicalModelDirectoryPath(url))
+            ChatStore.defaults.set(bookmarks, forKey: DefaultsKey.nativeModelDirectoryBookmarks.rawValue)
         }
     }
 
@@ -807,17 +1068,6 @@ final class ChatStore: ObservableObject {
         messages[index].content += text
     }
 
-    /// Config signature: when this is unchanged across turns we can safely reuse
-    /// the same backend instance (and its loaded runtime + KV-cache).
-    private var backendSignature: String {
-        switch backendMode {
-        case .openAICompatible:
-            return "openai:\(endpoint):\(model)"
-        case .nativeMLX:
-            return "native:\(nativeModelDirectory)"
-        }
-    }
-
     /// Discards the cached backend so the next turn rebuilds it (and resets the
     /// native KV-cache). Call when the backend config changes or after an error.
     private func invalidateBackend() {
@@ -825,39 +1075,57 @@ final class ChatStore: ObservableObject {
         cachedBackendSignature = nil
     }
 
-    private func makeBackend() throws -> any MotifChatBackend {
+    /// Invalidates only the backend used by the failing generation. A late
+    /// failure from an older task must not discard a newer task's backend.
+    private func invalidateBackend(matching signature: String) {
+        guard cachedBackendSignature == signature else { return }
+        invalidateBackend()
+    }
+
+    private func makeBackend(
+        configuration: GenerationConfiguration
+    ) throws -> any MotifChatBackend {
+        if let backendOverride { return backendOverride }
         // Reuse the backend across turns while its config is unchanged, so the
         // native runtime's KV-cache survives between messages.
-        if let cachedBackend, cachedBackendSignature == backendSignature {
+        if let cachedBackend, cachedBackendSignature == configuration.backendSignature {
             return cachedBackend
         }
         invalidateBackend()
 
-        let backend = try buildBackend()
+        let backend = try buildBackend(configuration: configuration)
         cachedBackend = backend
-        cachedBackendSignature = backendSignature
+        cachedBackendSignature = configuration.backendSignature
         return backend
     }
 
-    private func buildBackend() throws -> any MotifChatBackend {
-        switch backendMode {
+    private func buildBackend(
+        configuration: GenerationConfiguration
+    ) throws -> any MotifChatBackend {
+        switch configuration.backendMode {
         case .openAICompatible:
-            guard let baseURL = URL(string: endpoint) else {
+            guard let baseURL = Self.validatedEndpointURL(configuration.endpoint) else {
                 throw MotifChatStoreError.invalidEndpoint
             }
             return OpenAICompatibleMotifBackend(baseURL: baseURL)
 
         case .nativeMLX:
             #if MOTIFKIT_ENABLE_MLX
-            // The access started here is released in `releaseNativeDirectoryAccess()`
-            // once generation finishes, so it spans the actual file reads that the
-            // backend performs lazily during streaming — not just backend init.
-            let access = try acquireNativeModelDirectoryAccess()
-            nativeDirectoryAccess = access
+            let access = try acquireNativeModelDirectoryAccess(
+                modelDirectory: configuration.nativeModelDirectory
+            )
+            // Loading is lazy and the backend is cached across turns, so the
+            // backend—not the first consumer task—must own scoped directory
+            // access. The lease releases exactly once when that backend is
+            // invalidated and all in-flight producer work has let it go.
+            let lease = NativeDirectoryAccessLease(grant: access)
             do {
-                return try MotifMLXBackend(modelDirectory: access.url)
+                return try MotifMLXBackend(
+                    modelDirectory: lease.url,
+                    directoryAccessLease: lease
+                )
             } catch {
-                releaseNativeDirectoryAccess()
+                lease.stop()
                 throw error
             }
             #else
@@ -866,57 +1134,128 @@ final class ChatStore: ObservableObject {
         }
     }
 
-    /// Releases any active security-scoped access to the native model directory.
-    /// Safe to call when no access is held.
-    private func releaseNativeDirectoryAccess() {
-        nativeDirectoryAccess?.stop()
-        nativeDirectoryAccess = nil
+    /// Accept only absolute HTTP(S) endpoints with a real authority host.
+    /// Kept internal and pure so URL edge cases can be regression-tested.
+    nonisolated static func validatedEndpointURL(_ endpoint: String) -> URL? {
+        let trimmed = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let components = URLComponents(string: trimmed),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = components.host,
+              !host.isEmpty,
+              let url = components.url else {
+            return nil
+        }
+        return url
     }
 
     /// Resolves the native model directory, preferring a security-scoped bookmark so
-    /// reads succeed under App Sandbox and after relaunch. Starts scoped access when a
-    /// bookmark is available; the returned token's `stop` must be invoked once the
-    /// checkpoint load completes. Falls back to the plain path when no bookmark exists.
+    /// reads succeed under App Sandbox and after relaunch. Bookmarks are selected by
+    /// canonical model path; the returned grant is transferred to the cached native
+    /// backend so access spans its lazy load. Falls back to the plain path when no
+    /// matching bookmark exists.
     ///
     /// The decision/fallback logic lives in `NativeModelDirectoryResolver` (in
     /// MotifKit) so it is unit-testable headless; this method only wires the real
     /// Foundation bookmark / `UserDefaults` operations into that resolver.
-    private func acquireNativeModelDirectoryAccess() throws -> NativeDirectoryAccessGrant {
+    private func acquireNativeModelDirectoryAccess(
+        modelDirectory: String
+    ) throws -> NativeDirectoryAccessGrant {
+        let selectedURL = try resolvedNativeModelDirectoryFromPath(modelDirectory)
+        let selectedBookmark = bookmarkDataForSelectedDirectory(selectedURL)
         let resolver = NativeModelDirectoryResolver(
-            loadBookmark: {
-                guard
-                    let encoded = ChatStore.defaults.string(
-                        forKey: DefaultsKey.nativeModelDirectoryBookmark.rawValue
-                    ),
-                    let bookmark = Data(base64Encoded: encoded)
-                else {
-                    return nil
-                }
-                return bookmark
-            },
+            loadBookmark: { selectedBookmark },
             resolveBookmark: { bookmark, isStale in
                 #if os(macOS)
                 let options: URL.BookmarkResolutionOptions = [.withSecurityScope]
                 #else
                 let options: URL.BookmarkResolutionOptions = []
                 #endif
-                return try URL(
+                let resolvedURL = try URL(
                     resolvingBookmarkData: bookmark,
                     options: options,
                     relativeTo: nil,
                     bookmarkDataIsStale: &isStale
                 )
+                guard Self.bookmarkURL(resolvedURL, matches: selectedURL) else {
+                    throw MotifChatStoreError.nativeBookmarkPathMismatch
+                }
+                return resolvedURL
             },
             startAccess: { $0.startAccessingSecurityScopedResource() },
             stopAccess: { $0.stopAccessingSecurityScopedResource() },
             persistBookmark: { [weak self] url in self?.persistSecurityScopedBookmark(for: url) },
-            resolvePath: { try self.resolvedNativeModelDirectoryFromPath() }
+            resolvePath: { selectedURL }
         )
         return try resolver.acquire()
     }
 
-    private func resolvedNativeModelDirectoryFromPath() throws -> URL {
-        let trimmed = nativeModelDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// Retrieves only the bookmark associated with `selectedURL`. The legacy
+    /// single-bookmark key is accepted once when it resolves to the same path,
+    /// then migrated into the path-keyed dictionary. A legacy bookmark for A is
+    /// never allowed to shadow a selected path B.
+    private func bookmarkDataForSelectedDirectory(_ selectedURL: URL) -> Data? {
+        var bookmarks = Self.storedNativeModelDirectoryBookmarks()
+        if let bookmark = Self.bookmarkData(for: selectedURL, in: bookmarks) {
+            return bookmark
+        }
+
+        guard let legacyEncoded = ChatStore.defaults.string(
+            forKey: DefaultsKey.nativeModelDirectoryBookmark.rawValue
+        ), let legacyBookmark = Data(base64Encoded: legacyEncoded) else {
+            return nil
+        }
+
+        var isStale = false
+        #if os(macOS)
+        let options: URL.BookmarkResolutionOptions = [.withSecurityScope]
+        #else
+        let options: URL.BookmarkResolutionOptions = []
+        #endif
+        guard let legacyURL = try? URL(
+            resolvingBookmarkData: legacyBookmark,
+            options: options,
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ), Self.bookmarkURL(legacyURL, matches: selectedURL) else {
+            return nil
+        }
+
+        bookmarks[Self.canonicalModelDirectoryPath(selectedURL)] = legacyEncoded
+        ChatStore.defaults.set(bookmarks, forKey: DefaultsKey.nativeModelDirectoryBookmarks.rawValue)
+        return legacyBookmark
+    }
+
+    /// Stable dictionary key for a selected model directory.
+    nonisolated static func canonicalModelDirectoryPath(_ url: URL) -> String {
+        url.standardizedFileURL.path
+    }
+
+    /// Pure lookup seam used by tests to prove that selecting B cannot reuse
+    /// the stored security bookmark for A.
+    nonisolated static func bookmarkData(
+        for selectedURL: URL,
+        in encodedBookmarks: [String: String]
+    ) -> Data? {
+        guard let encoded = encodedBookmarks[canonicalModelDirectoryPath(selectedURL)] else {
+            return nil
+        }
+        return Data(base64Encoded: encoded)
+    }
+
+    nonisolated static func bookmarkURL(_ resolvedURL: URL, matches selectedURL: URL) -> Bool {
+        canonicalModelDirectoryPath(resolvedURL) == canonicalModelDirectoryPath(selectedURL)
+    }
+
+    private static func storedNativeModelDirectoryBookmarks() -> [String: String] {
+        guard let stored = defaults.dictionary(
+            forKey: DefaultsKey.nativeModelDirectoryBookmarks.rawValue
+        ) else { return [:] }
+        return stored.compactMapValues { $0 as? String }
+    }
+
+    private func resolvedNativeModelDirectoryFromPath(_ modelDirectory: String) throws -> URL {
+        let trimmed = modelDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw NativeModelDirectoryError.emptyPath }
 
         let expanded: String
@@ -997,6 +1336,7 @@ private enum DefaultsKey: String, CaseIterable {
     case model = "motif.chat.model"
     case nativeModelDirectory = "motif.chat.nativeModelDirectory"
     case nativeModelDirectoryBookmark = "motif.chat.nativeModelDirectoryBookmark"
+    case nativeModelDirectoryBookmarks = "motif.chat.nativeModelDirectoryBookmarks"
     case thinkMode = "motif.chat.thinkMode"
     case maxTokens = "motif.chat.maxTokens"
     case temperature = "motif.chat.temperature"
@@ -1008,12 +1348,15 @@ private enum DefaultsKey: String, CaseIterable {
 
 private enum MotifChatStoreError: Error, LocalizedError {
     case invalidEndpoint
+    case nativeBookmarkPathMismatch
     case nativeMLXNotCompiled
 
     var errorDescription: String? {
         switch self {
         case .invalidEndpoint:
-            "Endpoint must be a valid URL."
+            "Endpoint must be an absolute HTTP or HTTPS URL with a host."
+        case .nativeBookmarkPathMismatch:
+            "The saved folder access does not match the selected native model directory. Re-select the folder."
         case .nativeMLXNotCompiled:
             "Native MLX chat is not compiled into this app build. Rebuild with MOTIFKIT_ENABLE_MLX=1."
         }

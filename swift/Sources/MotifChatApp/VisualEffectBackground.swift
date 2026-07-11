@@ -25,7 +25,7 @@ struct VisualEffectBackground: NSViewRepresentable {
     let view = NSVisualEffectView()
     view.material = material
     view.blendingMode = blendingMode
-    view.state = .active
+    view.state = .followsWindowActiveState
     // Ensure the window itself is non-opaque so .behindWindow can sample the
     // desktop rather than a black backing.
     DispatchQueue.main.async { [weak view] in
@@ -38,6 +38,6 @@ struct VisualEffectBackground: NSViewRepresentable {
   func updateNSView(_ view: NSVisualEffectView, context: Context) {
     view.material = material
     view.blendingMode = blendingMode
-    view.state = .active
+    view.state = .followsWindowActiveState
   }
 }

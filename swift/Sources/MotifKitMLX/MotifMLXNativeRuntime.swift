@@ -161,11 +161,21 @@ public struct MotifMLXChatInputProcessor: UserInputProcessor {
     }
 }
 
+struct MotifMLXGenerationSession: Sendable {
+    let events: AsyncThrowingStream<MotifGenerationEvent, any Error>
+    let producerCompletion: Task<Void, Never>
+
+    func cancel() {
+        producerCompletion.cancel()
+    }
+}
+
 public final class MotifMLXNativeRuntime: @unchecked Sendable {
     public let bundle: MotifModelBundle
     public let modelConfiguration: ModelConfiguration
     public let generationContext: ModelContext
     public let inputProcessor: MotifMLXChatInputProcessor
+    private let generationQueue = NativeGenerationQueue()
 
     /// Persistent KV-cache carried across turns of a single conversation.
     ///
@@ -398,6 +408,47 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
+                    try await self.generationQueue.run {
+                        let session = self.generationSession(
+                            messages: messages,
+                            parameters: parameters
+                        )
+                        do {
+                            for try await event in session.events {
+                                try Task.checkCancellation()
+                                continuation.yield(event)
+                            }
+                            try Task.checkCancellation()
+                            await session.producerCompletion.value
+                        } catch {
+                            // A stream consumer can terminate before its nested
+                            // producer finishes cache/GPU cleanup. Keep the queue
+                            // slot until that producer is actually quiescent.
+                            session.cancel()
+                            await session.producerCompletion.value
+                            throw error
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Builds one unqueued producer session plus its explicit completion barrier.
+    /// `streamResponse` is the sole caller and holds the runtime queue until this
+    /// producer's cancellation/cache cleanup has actually finished.
+    private func generationSession(
+        messages: [MotifChatMessage],
+        parameters: MotifGenerationParameters
+    ) -> MotifMLXGenerationSession {
+        let pair = AsyncThrowingStream<MotifGenerationEvent, any Error>.makeStream()
+        let continuation = pair.continuation
+        let task = Task {
+                do {
                     let lmInput = try inputProcessor.prepare(motifMessages: messages)
                     let generationParameters = GenerateParameters(
                         maxTokens: parameters.maxTokens,
@@ -613,12 +664,15 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                     resetCache()
                     continuation.finish(throwing: error)
                 }
-            }
-            // Propagate consumer cancellation (UI stop / dropped iterator) into
-            // the generation task so an aborted chat turn stops GPU work instead
-            // of decoding to maxTokens/EOS.
-            continuation.onTermination = { _ in task.cancel() }
         }
+        // Propagate consumer cancellation (UI stop / dropped iterator) into the
+        // generation task so an aborted chat turn stops GPU work instead of
+        // decoding to maxTokens/EOS.
+        continuation.onTermination = { _ in task.cancel() }
+        return MotifMLXGenerationSession(
+            events: pair.stream,
+            producerCompletion: task
+        )
     }
 
     public func perplexity(

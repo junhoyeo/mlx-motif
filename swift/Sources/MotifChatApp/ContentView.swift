@@ -1,29 +1,32 @@
+import Accessibility
 import MotifKit
 import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var store = ChatStore()
-    @State private var selectedPanel: SidebarPanel? = .chat
+    @State private var selection: SidebarDestination?
 
     var body: some View {
         NavigationSplitView {
-            SidebarView(store: store, selectedPanel: $selectedPanel)
+            SidebarView(store: store, selection: $selection)
                 .navigationTitle("Motif")
                 .toolbar {
-                    Button(action: store.newChat) {
+                    Button(action: startNewChat) {
                         Label("New Chat", systemImage: "square.and.pencil")
                     }
+                    .disabled(store.isGenerating)
+                    .help(store.isGenerating ? "Stop the current response before starting a new chat" : "New chat")
                 }
                 // Make the toolbar chrome read as a distinct glass/material
                 // surface over the translucent window (on macOS 26 the toolbar
                 // adopts Liquid Glass; older OSes get a bar material).
                 .toolbarBackground(.visible, for: .windowToolbar)
         } detail: {
-            switch selectedPanel {
+            switch selection {
             case .runtime:
                 RuntimeView(store: store)
-            case .chat, .none:
+            case .conversation, .none:
                 ChatView(store: store)
             }
         }
@@ -35,30 +38,93 @@ struct ContentView: View {
         // the desktop shows through the chrome (the glass has content to refract).
         .background(VisualEffectBackground(material: .hudWindow).ignoresSafeArea())
         .onReceive(NotificationCenter.default.publisher(for: .newMotifChatRequested)) { _ in
-            store.newChat()
-            selectedPanel = .chat
+            guard !store.isGenerating else { return }
+            startNewChat()
+        }
+        .onAppear {
+            if let id = store.activeConversationID {
+                selection = .conversation(id)
+            }
+        }
+        .onChange(of: selection) { _, destination in
+            switch destination {
+            case .conversation(let id):
+                store.selectConversation(id)
+            case .runtime, .none:
+                break
+            }
+        }
+        .onChange(of: store.activeConversationID) { _, id in
+            guard selection != .runtime, let id else { return }
+            selection = .conversation(id)
+        }
+    }
+
+    private func startNewChat() {
+        store.newChat()
+        if let id = store.activeConversationID {
+            selection = .conversation(id)
+        } else {
+            selection = nil
         }
     }
 }
 
-private enum SidebarPanel: Hashable {
-    case chat
+private enum SidebarDestination: Hashable {
     case runtime
+    case conversation(UUID)
+}
+
+/// Pure scheduling rules for transcript auto-follow. The queued callback must
+/// still be the newest request and the reader must still be near the bottom;
+/// explicit "Jump to Latest" actions are the only forced requests.
+struct TranscriptScrollRequest: Equatable {
+    let id: UUID
+    let forced: Bool
+}
+
+enum TranscriptScrollPolicy {
+    static func request(
+        isNearBottom: Bool,
+        forced: Bool,
+        id: UUID = UUID()
+    ) -> TranscriptScrollRequest? {
+        guard forced || isNearBottom else { return nil }
+        return TranscriptScrollRequest(id: id, forced: forced)
+    }
+
+    static func shouldPerform(
+        _ request: TranscriptScrollRequest,
+        pending: TranscriptScrollRequest?,
+        isNearBottom: Bool
+    ) -> Bool {
+        pending == request && (request.forced || isNearBottom)
+    }
+
+    static func prioritized(
+        pending: TranscriptScrollRequest?,
+        new request: TranscriptScrollRequest
+    ) -> TranscriptScrollRequest {
+        if let pending, pending.forced, !request.forced {
+            return pending
+        }
+        return request
+    }
 }
 
 // MARK: - Sidebar (Part 4: conversation history)
 
 private struct SidebarView: View {
     @ObservedObject var store: ChatStore
-    @Binding var selectedPanel: SidebarPanel?
+    @Binding var selection: SidebarDestination?
+    @State private var conversationsPendingDeletion: [MotifConversation] = []
 
     var body: some View {
-        List(selection: $selectedPanel) {
+        List(selection: $selection) {
             Section {
-                Label("Chat", systemImage: "bubble.left.and.bubble.right")
-                    .tag(SidebarPanel.chat)
-                Label("Runtime", systemImage: "speedometer")
-                    .tag(SidebarPanel.runtime)
+                NavigationLink(value: SidebarDestination.runtime) {
+                    Label("Runtime", systemImage: "speedometer")
+                }
             }
 
             Section {
@@ -68,27 +134,24 @@ private struct SidebarView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     ForEach(sortedConversations) { conversation in
-                        ConversationRow(
-                            conversation: conversation,
-                            isActive: conversation.id == store.activeConversationID
-                        )
-                        .contentShape(Rectangle())
-                        .onTapGesture {
-                            store.selectConversation(conversation.id)
-                            selectedPanel = .chat
+                        NavigationLink(value: SidebarDestination.conversation(conversation.id)) {
+                            ConversationRow(
+                                conversation: conversation,
+                                isActive: conversation.id == store.activeConversationID
+                            )
                         }
                         .contextMenu {
                             Button(role: .destructive) {
-                                store.deleteConversation(conversation.id)
+                                conversationsPendingDeletion = [conversation]
                             } label: {
                                 Label("Delete", systemImage: "trash")
                             }
+                            .disabled(store.isGenerating)
                         }
                     }
                     .onDelete { offsets in
-                        for index in offsets {
-                            store.deleteConversation(sortedConversations[index].id)
-                        }
+                        guard !store.isGenerating else { return }
+                        conversationsPendingDeletion = offsets.map { sortedConversations[$0] }
                     }
                 }
             } header: {
@@ -97,12 +160,16 @@ private struct SidebarView: View {
                     Spacer()
                     Button {
                         store.newChat()
-                        selectedPanel = .chat
+                        if let id = store.activeConversationID {
+                            selection = .conversation(id)
+                        }
                     } label: {
                         Label("New", systemImage: "plus")
                             .labelStyle(.iconOnly)
                     }
                     .buttonStyle(.borderless)
+                    .disabled(store.isGenerating)
+                    .help(store.isGenerating ? "Stop the current response before starting a new chat" : "New chat")
                     // Keep the + off the sidebar's right edge.
                     .padding(.trailing, 8)
                 }
@@ -115,10 +182,45 @@ private struct SidebarView: View {
         // here (Apple's rule). Grouped so it blends with the toolbar glass above.
         .background(EmptyView().motifGlassChrome().ignoresSafeArea())
         .motifGlassGroup()
+        .alert(
+            conversationsPendingDeletion.count == 1 ? "Delete conversation?" : "Delete conversations?",
+            isPresented: deleteConfirmationPresented
+        ) {
+            Button("Cancel", role: .cancel) {
+                conversationsPendingDeletion.removeAll()
+            }
+            Button(
+                conversationsPendingDeletion.count == 1 ? "Delete" : "Delete All",
+                role: .destructive
+            ) {
+                let ids = conversationsPendingDeletion.map(\.id)
+                conversationsPendingDeletion.removeAll()
+                for id in ids {
+                    store.deleteConversation(id)
+                }
+            }
+        } message: {
+            Text(deleteConfirmationMessage)
+        }
     }
 
     private var sortedConversations: [MotifConversation] {
         store.conversations.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private var deleteConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { !conversationsPendingDeletion.isEmpty },
+            set: { if !$0 { conversationsPendingDeletion.removeAll() } }
+        )
+    }
+
+    private var deleteConfirmationMessage: String {
+        guard conversationsPendingDeletion.count == 1,
+              let conversation = conversationsPendingDeletion.first else {
+            return "This permanently removes the selected conversations and their messages."
+        }
+        return "\u{201c}\(conversation.title)\u{201d} and all of its messages will be permanently removed."
     }
 }
 
@@ -127,15 +229,30 @@ private struct ConversationRow: View {
     let isActive: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(conversation.title)
-                .lineLimit(1)
-                .fontWeight(isActive ? .semibold : .regular)
-            Text(conversation.updatedAt, format: .relative(presentation: .named))
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(conversation.title)
+                    .lineLimit(1)
+                    .fontWeight(isActive ? .semibold : .regular)
+                Text(conversation.updatedAt, format: .relative(presentation: .named))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            if isActive {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
+            }
         }
         .padding(.vertical, 2)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(conversation.title)
+        .accessibilityValue(
+            "\(isActive ? "Current conversation, " : "")updated \(conversation.updatedAt.formatted(.relative(presentation: .named)))"
+        )
+        .help(conversation.title)
     }
 }
 
@@ -143,7 +260,11 @@ private struct ConversationRow: View {
 
 private struct ChatView: View {
     @ObservedObject var store: ChatStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var showingModelDirImporter = false
+    @State private var isNearBottom = true
+    @State private var bottomInsetHeight: CGFloat = 0
+    @State private var pendingScrollRequest: TranscriptScrollRequest?
 
     private var visibleMessages: [MotifChatMessage] {
         store.messages.filter { $0.role != .system }
@@ -162,6 +283,8 @@ private struct ChatView: View {
                 // like Xcode's scheme selector, rather than sitting centered.
                 ToolbarItem(placement: .navigation) {
                     BackendMenu(store: store, showingImporter: $showingModelDirImporter)
+                        .disabled(store.isGenerating)
+                        .help(store.isGenerating ? "Backend settings are locked for the current response" : "Choose backend and model")
                 }
                 // Separate ToolbarItems (NOT one ToolbarItemGroup): a group merges
                 // its children into a single shared capsule, which broke the
@@ -181,6 +304,11 @@ private struct ChatView: View {
                         }
                         .padding(.horizontal, 16)
                         .padding(.vertical, 5)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel("Generation speed")
+                        .accessibilityValue(
+                            "\(String(format: "%.0f", store.liveTokensPerSecond)) tokens per second, \(store.liveTokenEstimate) tokens generated"
+                        )
                         .accessibilityIdentifier("motif.chat.tokrate")
                     }
                 }
@@ -204,6 +332,28 @@ private struct ChatView: View {
                     store.lastError = error.localizedDescription
                 }
             }
+            .onChange(of: store.isGenerating) { wasGenerating, isGenerating in
+                let announcement: String
+                if isGenerating {
+                    announcement = "Motif is generating a response"
+                } else if wasGenerating {
+                    switch store.lastGenerationOutcome {
+                    case .cancelled:
+                        announcement = "Response stopped"
+                    case .failed:
+                        announcement = "Response failed"
+                    case .succeeded, .none:
+                        announcement = "Response complete"
+                    }
+                } else {
+                    return
+                }
+                AccessibilityNotification.Announcement(announcement).post()
+            }
+            .onChange(of: store.lastError) { _, error in
+                guard let error, !error.isEmpty else { return }
+                AccessibilityNotification.Announcement("Generation error: \(error)").post()
+            }
     }
 
     // Stable id for an invisible element pinned to the very bottom of the
@@ -211,82 +361,170 @@ private struct ChatView: View {
     // view pinned even as trailing content — a streaming message or the captured
     // reasoning disclosure — grows.
     private static let bottomAnchor = "motif.chat.bottomAnchor"
+    private static let scrollCoordinateSpace = "motif.chat.transcriptScroll"
+    private static let transcriptMaxWidth: CGFloat = 880
 
     private var chatSurface: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                if visibleMessages.isEmpty {
-                    EmptyChatState(store: store)
-                        .frame(maxWidth: .infinity, minHeight: 420)
-                } else {
-                    LazyVStack(alignment: .leading, spacing: 16) {
-                        ForEach(Array(visibleMessages.enumerated()), id: \.element.id) { index, message in
-                            TranscriptRow(
-                                store: store,
-                                message: message,
-                                isLast: message.id == visibleMessages.last?.id,
-                                executedToolFollows: index + 1 < visibleMessages.count
-                                    && visibleMessages[index + 1].role == .tool
-                            )
-                            .id(message.id)
-                        }
+        GeometryReader { viewport in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    if visibleMessages.isEmpty {
+                        EmptyChatState(store: store)
+                            .frame(maxWidth: Self.transcriptMaxWidth, minHeight: 420)
+                            .frame(maxWidth: .infinity)
+                    } else {
+                        LazyVStack(alignment: .leading, spacing: 16) {
+                            ForEach(Array(visibleMessages.enumerated()), id: \.element.id) { index, message in
+                                TranscriptRow(
+                                    store: store,
+                                    message: message,
+                                    isLast: message.id == visibleMessages.last?.id,
+                                    executedToolFollows: index + 1 < visibleMessages.count
+                                        && visibleMessages[index + 1].role == .tool
+                                )
+                                .id(message.id)
+                            }
 
-                        // Bottom scroll target. The input bar's height is handled
-                        // by `.safeAreaInset` below, so no magic bottom padding is
-                        // needed here — content is measured, never guessed.
-                        Color.clear
-                            .frame(height: 1)
-                            .id(Self.bottomAnchor)
+                            Color.clear
+                                .frame(height: 1)
+                                .background {
+                                    GeometryReader { anchor in
+                                        Color.clear.preference(
+                                            key: TranscriptBottomPreferenceKey.self,
+                                            value: anchor.frame(in: .named(Self.scrollCoordinateSpace)).maxY
+                                        )
+                                    }
+                                }
+                                .id(Self.bottomAnchor)
+                        }
+                        .frame(maxWidth: Self.transcriptMaxWidth)
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 20)
                     }
-                    .padding(20)
                 }
-            }
-            // Let the behind-window vibrancy show through the transcript.
-            .scrollContentBackground(.hidden)
-            // Start pinned to the newest message (scrollview skill: Controlling
-            // Scroll Position).
-            .defaultScrollAnchor(.bottom)
-            // Fade transcript content cleanly under the toolbar / input bar glass
-            // (Liquid Glass: scrollEdgeEffectStyle).
-            .motifScrollEdgeSoft()
-            // Follow the transcript to the bottom both when a new message is
-            // appended AND while a single assistant message streams token by
-            // token — `liveTokenEstimate` ticks on every decoded token, so the
-            // view tracks the growing text instead of only reacting to the
-            // messages array changing.
-            .onChange(of: store.messages) { _, _ in
-                scrollToBottom(proxy, animated: true)
-            }
-            .onChange(of: store.liveTokenEstimate) { _, _ in
-                scrollToBottom(proxy, animated: false)
-            }
-            // Follow the captured-reasoning stream too — it arrives before any
-            // answer text, so `liveTokenEstimate` alone wouldn't track it.
-            .onChange(of: store.reasoningCharCount) { _, _ in
-                scrollToBottom(proxy, animated: false)
-            }
-            // The input bar is a real bottom inset of the scroll view: content is
-            // inset by the bar's measured height (never hidden under it), yet the
-            // scroll content still passes *behind* the floating glass bar so the
-            // Liquid Glass has live, scrolling content to refract.
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                InputBar(store: store)
+                .coordinateSpace(name: Self.scrollCoordinateSpace)
+                .scrollContentBackground(.hidden)
+                .defaultScrollAnchor(.bottom)
+                .motifScrollEdgeSoft()
+                .onPreferenceChange(TranscriptBottomPreferenceKey.self) { anchorY in
+                    guard anchorY.isFinite else { return }
+                    let scrollViewportHeight = max(0, viewport.size.height - bottomInsetHeight)
+                    let nearBottom = anchorY >= 0 && anchorY <= scrollViewportHeight + 72
+                    if nearBottom != isNearBottom {
+                        isNearBottom = nearBottom
+                    }
+                }
+                .onPreferenceChange(TranscriptBottomInsetPreferenceKey.self) { height in
+                    bottomInsetHeight = height
+                }
+                .onChange(of: store.activeConversationID) { _, _ in
+                    isNearBottom = true
+                    requestScrollToBottom(proxy, animated: false, forced: true)
+                }
+                .onChange(of: store.messages) { _, _ in
+                    followLatestIfNeeded(proxy, animated: !store.isGenerating)
+                }
+                .onChange(of: store.reasoningCharCount) { _, _ in
+                    followLatestIfNeeded(proxy, animated: false)
+                }
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    VStack(spacing: 0) {
+                        if !isNearBottom && !visibleMessages.isEmpty {
+                            HStack {
+                                Spacer()
+                                Button {
+                                    isNearBottom = true
+                                    requestScrollToBottom(proxy, animated: true, forced: true)
+                                } label: {
+                                    Label("Jump to Latest", systemImage: "arrow.down")
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .help("Return to the newest message and resume automatic scrolling")
+                                .accessibilityHint("Resumes following the response as it streams")
+                                .padding(.horizontal, 24)
+                                .padding(.bottom, 8)
+                            }
+                            .frame(maxWidth: Self.transcriptMaxWidth)
+                            .frame(maxWidth: .infinity)
+                        }
+                        InputBar(store: store, maxWidth: Self.transcriptMaxWidth)
+                    }
+                    .background {
+                        GeometryReader { inset in
+                            Color.clear.preference(
+                                key: TranscriptBottomInsetPreferenceKey.self,
+                                value: inset.size.height
+                            )
+                        }
+                    }
+                }
             }
         }
     }
 
-    /// Pin the transcript to its bottom anchor. Animated for discrete message
-    /// changes; unanimated while streaming so rapid per-token updates don't stack
-    /// competing animations (which reads as jitter).
-    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+    private func followLatestIfNeeded(_ proxy: ScrollViewProxy, animated: Bool) {
+        requestScrollToBottom(proxy, animated: animated, forced: false)
+    }
+
+    /// Coalesce queued follow requests and re-check the current follow state at
+    /// execution time. This prevents an already-queued token update from pulling
+    /// the reader back down after they manually scroll away from the bottom.
+    private func requestScrollToBottom(
+        _ proxy: ScrollViewProxy,
+        animated: Bool,
+        forced: Bool
+    ) {
         guard !visibleMessages.isEmpty else { return }
-        if animated {
-            withAnimation(.easeOut(duration: 0.18)) {
+        guard let request = TranscriptScrollPolicy.request(
+            isNearBottom: isNearBottom,
+            forced: forced
+        ) else { return }
+        guard TranscriptScrollPolicy.prioritized(
+            pending: pendingScrollRequest,
+            new: request
+        ) == request else {
+            return
+        }
+        pendingScrollRequest = request
+
+        DispatchQueue.main.async {
+            guard TranscriptScrollPolicy.shouldPerform(
+                request,
+                pending: pendingScrollRequest,
+                isNearBottom: isNearBottom
+            ) else {
+                if pendingScrollRequest == request {
+                    pendingScrollRequest = nil
+                }
+                return
+            }
+            pendingScrollRequest = nil
+            if animated && !reduceMotion {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
+                }
+            } else {
                 proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
             }
-        } else {
-            proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
         }
+    }
+}
+
+private struct TranscriptBottomPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = .infinity
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct TranscriptBottomInsetPreferenceKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 
@@ -340,6 +578,7 @@ private struct EmptyChatState: View {
 private struct ReasoningDisclosure: View {
     let text: String
     var isStreaming: Bool = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     // Auto-expanded while the model is thinking so the stream is visible, then
     // collapsed to a tidy summary once the answer starts. The user can still
@@ -370,14 +609,19 @@ private struct ReasoningDisclosure: View {
         )
         .onAppear { expanded = isStreaming }
         .onChange(of: isStreaming) { _, streaming in
-            // Expand when a new think stream starts; collapse when it finishes.
-            withAnimation(.easeInOut(duration: 0.2)) { expanded = streaming }
+            if reduceMotion {
+                expanded = streaming
+            } else {
+                withAnimation(.easeInOut(duration: 0.2)) { expanded = streaming }
+            }
         }
     }
 }
 
 private struct InputBar: View {
     @ObservedObject var store: ChatStore
+    let maxWidth: CGFloat
+    @FocusState private var composerFocused: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -385,10 +629,13 @@ private struct InputBar: View {
                 HStack(spacing: 6) {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Generating…")
+                    Text(store.runtimeStatus)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Response status")
+                .accessibilityValue(store.runtimeStatus)
                 .accessibilityIdentifier("motif.chat.generating")
             }
             if let notice = store.contextNotice {
@@ -406,6 +653,8 @@ private struct InputBar: View {
                 Text(lastError)
                     .font(.caption)
                     .foregroundStyle(.red)
+                    .accessibilityLabel("Generation error")
+                    .accessibilityValue(lastError)
             }
 
             // Claude-style layout: the text field spans the full bar width, and
@@ -416,7 +665,9 @@ private struct InputBar: View {
                     .textFieldStyle(.plain)
                     .lineLimit(1...8)
                     .onSubmit { store.send() }
+                    .focused($composerFocused)
                     .accessibilityLabel("Message Motif")
+                    .accessibilityHint("Press Command Return to send")
                     .accessibilityIdentifier("motif.chat.input")
 
                 HStack(spacing: 14) {
@@ -427,11 +678,17 @@ private struct InputBar: View {
 
                     if store.isGenerating {
                         Button(role: .cancel, action: store.cancel) {
-                            Label("Stop", systemImage: "stop.fill").labelStyle(.iconOnly)
+                            Label(
+                                store.runtimeStatus == "Stopping…" ? "Stopping" : "Stop",
+                                systemImage: "stop.fill"
+                            )
+                            .labelStyle(.iconOnly)
                         }
                         .motifGlassButton()
                         .tint(.red)
                         .keyboardShortcut(".", modifiers: [.command])
+                        .disabled(store.runtimeStatus == "Stopping…")
+                        .help(store.runtimeStatus == "Stopping…" ? "Stopping response" : "Stop response")
                         .accessibilityIdentifier("motif.chat.stop")
                     } else {
                         Button(action: store.send) {
@@ -453,7 +710,20 @@ private struct InputBar: View {
             .motifGlassSurface(cornerRadius: 22)
             .motifGlassGroup()
         }
-        .padding(16)
+        .frame(maxWidth: maxWidth)
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+        .onAppear { composerFocused = true }
+        .onChange(of: store.activeConversationID) { _, _ in
+            guard !store.isGenerating else { return }
+            composerFocused = true
+        }
+        .onChange(of: store.isGenerating) { wasGenerating, isGenerating in
+            if wasGenerating && !isGenerating {
+                composerFocused = true
+            }
+        }
     }
 }
 
@@ -509,6 +779,7 @@ private struct MessageBubble: View {
     let executedToolFollows: Bool
 
     @State private var didCopy = false
+    @State private var pendingDestructiveAction: MessageDestructiveAction?
 
     private var isUser: Bool { message.role == .user }
     private var isAssistant: Bool { message.role == .assistant }
@@ -567,10 +838,10 @@ private struct MessageBubble: View {
                     .foregroundStyle(.secondary)
             } else {
                 HStack(alignment: .bottom, spacing: 4) {
+                    MarkdownMessageView(content: message.content)
                     if isStreaming {
                         StreamingCaret()
                     }
-                    MarkdownMessageView(content: message.content)
                 }
             }
 
@@ -607,6 +878,34 @@ private struct MessageBubble: View {
         .frame(maxWidth: 680, alignment: isUser ? .trailing : .leading)
         // Single alignment step: push the bubble to its side of the transcript.
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+        .alert(
+            pendingDestructiveAction == .regenerate ? "Regenerate response?" : "Delete response?",
+            isPresented: destructiveConfirmationPresented
+        ) {
+            Button("Cancel", role: .cancel) {
+                pendingDestructiveAction = nil
+            }
+            switch pendingDestructiveAction {
+            case .regenerate:
+                Button("Regenerate", role: .destructive) {
+                    pendingDestructiveAction = nil
+                    store.regenerateLast()
+                }
+            case .delete:
+                Button("Delete", role: .destructive) {
+                    pendingDestructiveAction = nil
+                    store.deleteMessage(message.id)
+                }
+            case .none:
+                EmptyView()
+            }
+        } message: {
+            Text(
+                pendingDestructiveAction == .regenerate
+                    ? "Motif will retry the latest prompt and replace this response."
+                    : "This permanently removes the response from the conversation."
+            )
+        }
     }
 
     /// Content alignment inside the bubble: user turns hang from the trailing
@@ -629,7 +928,7 @@ private struct MessageBubble: View {
             // older turn would discard everything after it.
             if isLast {
                 Button {
-                    store.regenerateLast()
+                    pendingDestructiveAction = .regenerate
                 } label: {
                     Label("Regenerate", systemImage: "arrow.clockwise")
                         .font(.caption2)
@@ -638,12 +937,12 @@ private struct MessageBubble: View {
             }
 
             Button(role: .destructive) {
-                store.deleteMessage(message.id)
+                pendingDestructiveAction = .delete
             } label: {
                 Label("Delete", systemImage: "trash")
                     .font(.caption2)
             }
-            .help("Delete this message")
+            .help("Delete this response")
         }
         .buttonStyle(.borderless)
         .labelStyle(.titleAndIcon)
@@ -652,21 +951,36 @@ private struct MessageBubble: View {
         .disabled(store.isGenerating)
     }
 
+    private var destructiveConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { pendingDestructiveAction != nil },
+            set: { if !$0 { pendingDestructiveAction = nil } }
+        )
+    }
+
     private var bubbleBackground: AnyShapeStyle {
         // Materials only (per Apple, never glass on message content).
         isUser ? AnyShapeStyle(.blue.opacity(0.16)) : AnyShapeStyle(.ultraThinMaterial)
     }
 }
 
+private enum MessageDestructiveAction {
+    case regenerate
+    case delete
+}
+
 /// Subtle blinking caret shown at the end of the streaming assistant message.
 private struct StreamingCaret: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var visible = true
 
     var body: some View {
         Text("▌")
             .foregroundStyle(.secondary)
-            .opacity(visible ? 1 : 0.15)
+            .opacity(reduceMotion || visible ? 1 : 0.15)
+            .accessibilityHidden(true)
             .onAppear {
+                guard !reduceMotion else { return }
                 withAnimation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true)) {
                     visible.toggle()
                 }
@@ -679,9 +993,23 @@ private struct StreamingCaret: View {
 private struct RuntimeView: View {
     @ObservedObject var store: ChatStore
     @State private var showingModelDirectoryImporter = false
+    @State private var showingResetConfirmation = false
 
     var body: some View {
         Form {
+            if store.isGenerating {
+                Section {
+                    Label(
+                        "Settings are locked until the current response finishes",
+                        systemImage: "lock.fill"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Runtime settings locked")
+                    .accessibilityValue("The current response is using the settings shown below")
+                }
+            }
+
             Section("Backend") {
                 Picker("Chat path", selection: $store.backendMode) {
                     ForEach(MotifChatBackendMode.allCases) { mode in
@@ -715,10 +1043,18 @@ private struct RuntimeView: View {
                     }
                 }
             }
+            .disabled(store.isGenerating)
 
             Section("App status") {
                 Label("Active chat path: \(store.backendMode.label)", systemImage: store.backendMode.systemImage)
                 Label("Runtime status: \(store.runtimeStatus)", systemImage: statusIcon)
+                if let lastError = store.lastError {
+                    Label(lastError, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
+                        .accessibilityLabel("Runtime error")
+                        .accessibilityValue(lastError)
+                }
                 Label(
                     store.nativeMLXCompiledIn
                         ? "Native in-process MLX generation is compiled into this build"
@@ -738,6 +1074,7 @@ private struct RuntimeView: View {
                 Text("Temperature: \(store.temperature, specifier: "%.2f")")
                     .foregroundStyle(.secondary)
             }
+            .disabled(store.isGenerating)
 
             Section("Context") {
                 Picker("Compaction", selection: $store.compactionMode) {
@@ -755,18 +1092,20 @@ private struct RuntimeView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            .disabled(store.isGenerating)
 
             Section("Native MLX status") {
                 Label("MotifKitMLX overlay is gated behind MOTIFKIT_ENABLE_MLX=1 for lightweight default builds", systemImage: "shippingbox")
                 Label("Native path: tokenizer/chat template, checkpoint loading, q4 cache, and custom Metal", systemImage: "checklist")
-                Label("Remaining: speculative decoding", systemImage: "wrench.and.screwdriver")
+                Label("Speculative decoding is implemented; practical speedup requires a smaller draft model", systemImage: "checkmark.seal")
                 Label("Evidence: docs/benchmarks/swift-python-hard-parity-20260526T091532Z.md", systemImage: "speedometer")
             }
 
             Section("Settings") {
                 Button("Reset runtime settings", role: .destructive) {
-                    store.resetRuntimeSettings()
+                    showingResetConfirmation = true
                 }
+                .disabled(store.isGenerating)
             }
         }
         .formStyle(.grouped)
@@ -793,6 +1132,14 @@ private struct RuntimeView: View {
         // Mask the toolbar strip like the chat tab — without this the empty
         // unified-toolbar band above the form reads as dead gray space.
         .toolbarBackground(.visible, for: .windowToolbar)
+        .alert("Reset runtime settings?", isPresented: $showingResetConfirmation) {
+            Button("Cancel", role: .cancel) {}
+            Button("Reset", role: .destructive) {
+                store.resetRuntimeSettings()
+            }
+        } message: {
+            Text("Backend, model, generation, context, thinking, and tool settings will return to their defaults. Conversation history is preserved.")
+        }
         .fileImporter(
             isPresented: $showingModelDirectoryImporter,
             allowedContentTypes: [.folder],
@@ -819,7 +1166,7 @@ private struct RuntimeView: View {
     private var statusIcon: String {
         switch store.runtimeStatus {
         case "Idle":
-            "checkmark.circle"
+            "circle"
         case "Error":
             "exclamationmark.triangle"
         case "Cancelled":
@@ -840,107 +1187,109 @@ private struct BackendMenu: View {
     @Binding var showingImporter: Bool
 
     var body: some View {
-        HStack(spacing: 12) {
-            Menu {
-                Section("Backend") {
-                    Button {
-                        store.backendMode = .nativeMLX
-                    } label: {
-                        Label(
-                            "Native MLX checkpoint",
-                            systemImage: store.backendMode == .nativeMLX ? "checkmark" : "cpu"
-                        )
-                    }
-                    Button {
-                        store.backendMode = .openAICompatible
-                    } label: {
-                        Label(
-                            "Endpoint · \(store.endpoint)",
-                            systemImage: store.backendMode == .openAICompatible ? "checkmark" : "network"
-                        )
-                    }
+        Menu {
+            Section("Backend") {
+                Button {
+                    store.backendMode = .nativeMLX
+                } label: {
+                    Label(
+                        "Native MLX checkpoint",
+                        systemImage: store.backendMode == .nativeMLX ? "checkmark" : "cpu"
+                    )
                 }
-                if store.backendMode == .nativeMLX {
-                    Section("Checkpoint") {
-                        ForEach(store.discoveredModelDirectories, id: \.self) { dir in
-                            Button {
-                                store.selectNativeModelDirectoryPath(dir)
-                            } label: {
-                                Label(
-                                    (dir as NSString).lastPathComponent,
-                                    systemImage: dir == store.nativeModelDirectory ? "checkmark" : "folder"
-                                )
-                            }
-                        }
+                Button {
+                    store.backendMode = .openAICompatible
+                } label: {
+                    Label(
+                        "Endpoint · \(store.endpoint)",
+                        systemImage: store.backendMode == .openAICompatible ? "checkmark" : "network"
+                    )
+                }
+            }
+            if store.backendMode == .nativeMLX {
+                Section("Checkpoint") {
+                    ForEach(store.discoveredModelDirectories, id: \.self) { dir in
                         Button {
-                            showingImporter = true
+                            store.selectNativeModelDirectoryPath(dir)
                         } label: {
-                            Label("Choose…", systemImage: "folder.badge.plus")
+                            Label(
+                                (dir as NSString).lastPathComponent,
+                                systemImage: dir == store.nativeModelDirectory ? "checkmark" : "folder"
+                            )
                         }
                     }
-                }
-            } label: {
-                HStack(spacing: 8) {
-                    StatusDot(store: store)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(store.backendDisplayName)
-                            .font(.subheadline).fontWeight(.semibold).lineLimit(1)
-                        Text(store.backendMode == .nativeMLX ? "native MLX" : "endpoint")
-                            .font(.caption2).foregroundStyle(.secondary)
+                    Button {
+                        showingImporter = true
+                    } label: {
+                        Label("Choose…", systemImage: "folder.badge.plus")
                     }
-                    Image(systemName: "chevron.down").font(.caption2).foregroundStyle(.secondary)
                 }
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .accessibilityIdentifier("motif.chat.model")
-
-            // Endpoint mode edits its host + model id inline in the header — the
-            // active target is a dev-tool detail that shouldn't require opening
-            // the Runtime panel.
-            if store.backendMode == .openAICompatible {
-                HStack(spacing: 6) {
-                    Image(systemName: "network").font(.caption2).foregroundStyle(.secondary)
-                    TextField("endpoint", text: $store.endpoint)
-                        .textFieldStyle(.plain)
-                        .font(.caption)
-                        .frame(minWidth: 150, maxWidth: 240)
-                        .accessibilityIdentifier("motif.chat.endpoint")
-                    Divider().frame(height: 12)
-                    TextField("model", text: $store.model)
-                        .textFieldStyle(.plain)
-                        .font(.caption)
-                        .frame(minWidth: 60, maxWidth: 120)
-                        .accessibilityIdentifier("motif.chat.modelid")
+        } label: {
+            HStack(spacing: 8) {
+                StatusDot(store: store)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(store.backendDisplayName)
+                        .font(.subheadline).fontWeight(.semibold).lineLimit(1)
+                    Text(store.backendMode == .nativeMLX ? "native MLX" : "endpoint")
+                        .font(.caption2).foregroundStyle(.secondary)
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(.quaternary.opacity(0.5), in: Capsule())
+                Image(systemName: "chevron.down").font(.caption2).foregroundStyle(.secondary)
             }
-
         }
-        // Breathing room inside the toolbar's auto glass pill. Applied at the
-        // ITEM ROOT (not on the Menu, not inside its label — the capsule wraps
-        // the item's bounds and ignores label padding) so BOTH modes stay
-        // uniformly padded: native (menu only) and endpoint (menu + inline
-        // fields, which previously sat flush against the capsule's right edge).
-        .padding(.horizontal, 16)
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Backend and model")
+        .accessibilityValue("\(store.backendDisplayName), \(store.backendMode.label), runtime \(store.runtimeStatus)")
+        .accessibilityIdentifier("motif.chat.model")
+        .padding(.horizontal, 12)
         .padding(.vertical, 5)
     }
 }
 
-/// Green idle / yellow generating / red on error.
+/// A shape-and-color runtime indicator. Idle stays neutral because a configured
+/// backend is not validated until the user sends a request.
 private struct StatusDot: View {
     @ObservedObject var store: ChatStore
+
     var body: some View {
-        Circle().fill(color).frame(width: 8, height: 8)
-            .help(store.runtimeStatus)
+        Image(systemName: icon)
+            .font(.caption)
+            .foregroundStyle(color)
+            .help(accessibilityValue)
+            .accessibilityLabel("Runtime status")
+            .accessibilityValue(accessibilityValue)
     }
+
+    private var icon: String {
+        if store.lastError != nil || store.runtimeStatus == "Error" {
+            return "exclamationmark.circle.fill"
+        }
+        if store.isGenerating {
+            return "ellipsis.circle.fill"
+        }
+        if store.runtimeStatus == "Cancelled" {
+            return "stop.circle"
+        }
+        if store.runtimeStatus == "Idle" {
+            return "circle"
+        }
+        return "info.circle.fill"
+    }
+
     private var color: Color {
-        if store.lastError != nil { return .red }
-        if store.isGenerating { return .yellow }
-        return .green
+        if store.lastError != nil || store.runtimeStatus == "Error" { return .red }
+        if store.isGenerating { return .orange }
+        if store.runtimeStatus == "Idle" || store.runtimeStatus == "Cancelled" { return .secondary }
+        return .accentColor
+    }
+
+    private var accessibilityValue: String {
+        store.runtimeStatus == "Idle"
+            ? "Idle; backend will be checked when a message is sent"
+            : store.runtimeStatus
     }
 }
 
@@ -966,6 +1315,11 @@ private struct ContextMeter: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 5)
         .help("Context usage (estimated tokens) vs budget")
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Context usage")
+        .accessibilityValue(
+            "\(store.currentContextTokens) of \(store.contextTokenBudget) estimated tokens, \(Int(fraction * 100)) percent"
+        )
         .accessibilityIdentifier("motif.chat.context")
     }
     private func compact(_ n: Int) -> String {
@@ -991,6 +1345,10 @@ private struct ThinkModeMenu: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("Reasoning trace: \(store.thinkMode.rawValue)")
+        .disabled(store.isGenerating)
+        .accessibilityLabel("Reasoning trace")
+        .accessibilityValue(store.thinkMode.rawValue.capitalized)
+        .accessibilityHint("Applies to the next response")
         .accessibilityIdentifier("motif.chat.thinkmode")
     }
 }
@@ -1009,6 +1367,10 @@ private struct ToolsToggle: View {
         .help(store.toolsEnabled
             ? "Demo tools ON (get_current_time, calculator)"
             : "Enable demo tools")
+        .disabled(store.isGenerating)
+        .accessibilityLabel("Demo tools")
+        .accessibilityValue(store.toolsEnabled ? "Enabled" : "Disabled")
+        .accessibilityHint("Applies to the next response")
         .accessibilityIdentifier("motif.chat.tools")
     }
 }

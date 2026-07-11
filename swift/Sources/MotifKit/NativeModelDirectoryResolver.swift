@@ -40,6 +40,39 @@ public struct NativeDirectoryAccessGrant {
     }
 }
 
+/// Owns a native-directory access grant for the lifetime of a lazy-loading
+/// backend. Explicit and deinitialization-driven release share the same
+/// exactly-once path, so callers may stop the lease defensively without risking
+/// an unbalanced security-scope release.
+public final class NativeDirectoryAccessLease: @unchecked Sendable {
+    public let url: URL
+
+    private let lock = NSLock()
+    private var grant: NativeDirectoryAccessGrant?
+
+    public init(grant: NativeDirectoryAccessGrant) {
+        self.url = grant.url
+        self.grant = grant
+    }
+
+    /// Releases the owned grant at most once. The callback runs outside the
+    /// lock so an injected stop implementation cannot deadlock by re-entering
+    /// lease-owned code.
+    public func stop() {
+        let grantToStop: NativeDirectoryAccessGrant?
+        lock.lock()
+        grantToStop = grant
+        grant = nil
+        lock.unlock()
+
+        grantToStop?.stop()
+    }
+
+    deinit {
+        stop()
+    }
+}
+
 /// Pure decision logic for acquiring access to the native model checkpoint
 /// directory.
 ///

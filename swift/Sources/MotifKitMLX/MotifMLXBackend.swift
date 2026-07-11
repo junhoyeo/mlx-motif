@@ -14,7 +14,15 @@ public actor MotifMLXBackend: MotifChatBackend {
     public nonisolated let decoderGraphPlan: MotifMLXDecoderGraphPlan?
     public nonisolated let modelDirectory: URL?
 
+    /// Keeps security-scoped directory access alive through deferred runtime
+    /// loading and every subsequent backend read. Releasing the backend releases
+    /// the lease; callers that do not need scoped access can continue omitting it.
+    private let directoryAccessLease: NativeDirectoryAccessLease?
     private var nativeRuntime: MotifMLXNativeRuntime?
+    private var nativeRuntimeLoad: (
+        id: UUID,
+        task: Task<MotifMLXNativeRuntime, Error>
+    )?
 
     public init(
         configuration: MotifModelConfiguration? = nil,
@@ -23,6 +31,7 @@ public actor MotifMLXBackend: MotifChatBackend {
         self.configuration = configuration
         self.featureFlags = featureFlags
         self.modelDirectory = nil
+        self.directoryAccessLease = nil
         let plan = configuration.map {
             MotifMLXLoadPlan(configuration: $0, featureFlags: featureFlags)
         }
@@ -33,12 +42,14 @@ public actor MotifMLXBackend: MotifChatBackend {
 
     public init(
         modelDirectory: URL,
-        featureFlags: MotifRuntimeFeatureFlags = .fromEnvironment()
+        featureFlags: MotifRuntimeFeatureFlags = .fromEnvironment(),
+        directoryAccessLease: NativeDirectoryAccessLease? = nil
     ) throws {
         let bundle = try MotifModelBundle(directoryURL: modelDirectory)
         self.configuration = bundle.configuration
         self.featureFlags = featureFlags
         self.modelDirectory = modelDirectory
+        self.directoryAccessLease = directoryAccessLease
         let plan = MotifMLXModelRegistry.loadPlan(for: bundle, featureFlags: featureFlags)
         self.loadPlan = plan
         self.layerPlan = plan.layerPlan
@@ -69,8 +80,10 @@ public actor MotifMLXBackend: MotifChatBackend {
             let task = Task {
                 do {
                     let runtime = try await self.runtime(modelDirectory: modelDirectory)
+                    try Task.checkCancellation()
                     let stream = runtime.streamResponse(messages: messages, parameters: parameters)
                     for try await event in stream {
+                        try Task.checkCancellation()
                         continuation.yield(event)
                     }
                     continuation.finish()
@@ -89,9 +102,42 @@ public actor MotifMLXBackend: MotifChatBackend {
 
     private func runtime(modelDirectory: URL) async throws -> MotifMLXNativeRuntime {
         if let nativeRuntime { return nativeRuntime }
-        let loaded = try await MotifMLXNativeRuntime.load(modelDirectory: modelDirectory, featureFlags: featureFlags)
-        nativeRuntime = loaded
-        return loaded
+        if let nativeRuntimeLoad {
+            return try await finishRuntimeLoad(nativeRuntimeLoad)
+        }
+
+        // Runtime loading may outlive a cancelled response consumer. Keep one
+        // producer task cached so a replacement turn joins the same filesystem
+        // work instead of starting a second checkpoint load.
+        let loadID = UUID()
+        let featureFlags = featureFlags
+        let loadTask = Task {
+            try await MotifMLXNativeRuntime.load(
+                modelDirectory: modelDirectory,
+                featureFlags: featureFlags
+            )
+        }
+        let load = (id: loadID, task: loadTask)
+        nativeRuntimeLoad = load
+        return try await finishRuntimeLoad(load)
+    }
+
+    private func finishRuntimeLoad(
+        _ load: (id: UUID, task: Task<MotifMLXNativeRuntime, Error>)
+    ) async throws -> MotifMLXNativeRuntime {
+        do {
+            let loaded = try await load.task.value
+            if nativeRuntimeLoad?.id == load.id {
+                nativeRuntime = loaded
+                nativeRuntimeLoad = nil
+            }
+            return nativeRuntime ?? loaded
+        } catch {
+            if nativeRuntimeLoad?.id == load.id {
+                nativeRuntimeLoad = nil
+            }
+            throw error
+        }
     }
 
     private nonisolated func unavailableStream(

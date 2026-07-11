@@ -44,6 +44,11 @@ var targets: [Target] = [
             .process("Fixtures"),
         ]
     ),
+    .testTarget(
+        name: "MotifChatAppTests",
+        dependencies: ["MotifChatApp", "MotifKit"],
+        path: "Tests/MotifChatAppTests"
+    ),
 ]
 
 if Context.environment["MOTIFKIT_ENABLE_MLX"] == "1" {

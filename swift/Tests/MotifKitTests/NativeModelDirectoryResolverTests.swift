@@ -61,6 +61,54 @@ final class NativeModelDirectoryResolverTests: XCTestCase {
         XCTAssertEqual(stoppedURLs, [bookmarkURL], "stop must release the resolved bookmark URL")
     }
 
+    func testLeaseExplicitStopReleasesOwnedGrant() {
+        let recorder = StopRecorder()
+        var lease: NativeDirectoryAccessLease? = NativeDirectoryAccessLease(
+            grant: NativeDirectoryAccessGrant(url: bookmarkURL) {
+                recorder.recordStop()
+            }
+        )
+
+        XCTAssertEqual(lease?.url, bookmarkURL)
+        XCTAssertEqual(recorder.count, 0)
+        lease?.stop()
+        XCTAssertEqual(recorder.count, 1)
+
+        lease = nil
+        XCTAssertEqual(recorder.count, 1, "deinit after explicit stop must not release twice")
+    }
+
+    func testLeaseStopIsIdempotentUnderConcurrentCallers() {
+        let recorder = StopRecorder()
+        let lease = NativeDirectoryAccessLease(
+            grant: NativeDirectoryAccessGrant(url: bookmarkURL) {
+                recorder.recordStop()
+            }
+        )
+
+        DispatchQueue.concurrentPerform(iterations: 64) { _ in
+            lease.stop()
+        }
+        lease.stop()
+        XCTAssertEqual(recorder.count, 1)
+    }
+
+    func testLeaseDeinitReleasesOwnedGrant() {
+        let recorder = StopRecorder()
+        weak var weakLease: NativeDirectoryAccessLease?
+        var lease: NativeDirectoryAccessLease? = NativeDirectoryAccessLease(
+            grant: NativeDirectoryAccessGrant(url: bookmarkURL) {
+                recorder.recordStop()
+            }
+        )
+        weakLease = lease
+
+        lease = nil
+
+        XCTAssertNil(weakLease)
+        XCTAssertEqual(recorder.count, 1)
+    }
+
     // MARK: - Missing-bookmark fallback to path-based behavior
 
     func testMissingBookmarkFallsBackToPathWithNoOpStop() throws {
@@ -182,5 +230,22 @@ final class NativeModelDirectoryResolverTests: XCTestCase {
             persistBookmark: persistBookmark,
             resolvePath: resolvePath
         )
+    }
+}
+
+private final class StopRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stopCount = 0
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stopCount
+    }
+
+    func recordStop() {
+        lock.lock()
+        stopCount += 1
+        lock.unlock()
     }
 }

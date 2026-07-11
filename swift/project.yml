@@ -24,7 +24,7 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "6.0"
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "0.1.1"
     CURRENT_PROJECT_VERSION: "1"
     # Ad-hoc sign locally so the test runner can attach; no provisioning profile.
     CODE_SIGN_IDENTITY: "-"

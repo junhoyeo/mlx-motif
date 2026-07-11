@@ -777,14 +777,16 @@ private struct BackendMenu: View {
                     }
                     Image(systemName: "chevron.down").font(.caption2).foregroundStyle(.secondary)
                 }
-                // Breathing room inside the toolbar's auto glass pill — without
-                // this the label sits flush against the capsule edge.
-                .padding(.horizontal, 16)
-                .padding(.vertical, 5)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
+            // Breathing room inside the toolbar's auto glass pill. Must sit
+            // OUTSIDE the Menu: the capsule wraps the Menu control's bounds and
+            // ignores padding applied to its label, so label padding left this
+            // pill visibly tighter than the (plain-view) context-meter pill.
+            .padding(.horizontal, 16)
+            .padding(.vertical, 5)
             .accessibilityIdentifier("motif.chat.model")
 
             // Endpoint mode edits its host + model id inline in the header — the

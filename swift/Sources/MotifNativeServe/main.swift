@@ -108,6 +108,14 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         listener?.cancel()
     }
 
+    /// Upper bound on a single accumulated HTTP request (headers + body). The
+    /// receive loop appends every chunk until the request is complete, and
+    /// `Content-Length` comes straight from the (untrusted) client — so without
+    /// a cap a request that declares or streams an oversized body grows this
+    /// buffer without limit and can exhaust memory. 16 MiB is far above any real
+    /// chat payload (~4M chars) while bounding the worst case.
+    private static let maxRequestBytes = 16 * 1024 * 1024
+
     private func receive(connection: NWConnection, accumulated: Data) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 20) { [weak self] data, _, isComplete, error in
             guard let self else { return }
@@ -115,6 +123,19 @@ private final class NativeOpenAIServer: @unchecked Sendable {
             if let data { buffer.append(data) }
             if error != nil || isComplete {
                 connection.cancel()
+                return
+            }
+            if buffer.count > Self.maxRequestBytes {
+                // Reject before recursing again so an oversized/never-complete
+                // request cannot grow the accumulation buffer unbounded.
+                Task {
+                    try? await sendJSON(
+                        connection,
+                        status: 413,
+                        payload: ["error": ["message": "request too large (limit \(Self.maxRequestBytes) bytes)"]]
+                    )
+                    connection.cancel()
+                }
                 return
             }
             if let request = HTTPRequest(data: buffer), request.isComplete {
@@ -455,6 +476,7 @@ private func reasonPhrase(for status: Int) -> String {
     case 200: return "OK"
     case 400: return "Bad Request"
     case 404: return "Not Found"
+    case 413: return "Payload Too Large"
     case 500: return "Internal Server Error"
     default: return "OK"
     }

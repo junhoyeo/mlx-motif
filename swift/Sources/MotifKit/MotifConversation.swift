@@ -15,6 +15,11 @@ public struct MotifConversation: Identifiable, Codable, Equatable, Sendable {
   /// display-only and never replayed into the model request. Optional so
   /// conversations persisted before this field still decode.
   public var reasoningByMessage: [String: String]?
+  /// True once a title has been produced by the lightweight title model, which
+  /// makes it sticky: `deriveTitle` (the transient first-prompt title) stops
+  /// overwriting it as the conversation grows. Optional so conversations
+  /// persisted before this field still decode (treated as not-yet-generated).
+  public var titleGenerated: Bool?
 
   public init(
     id: UUID = UUID(),
@@ -22,7 +27,8 @@ public struct MotifConversation: Identifiable, Codable, Equatable, Sendable {
     messages: [MotifChatMessage],
     createdAt: Date = Date(),
     updatedAt: Date = Date(),
-    reasoningByMessage: [String: String]? = nil
+    reasoningByMessage: [String: String]? = nil,
+    titleGenerated: Bool? = nil
   ) {
     self.id = id
     self.title = title
@@ -30,6 +36,7 @@ public struct MotifConversation: Identifiable, Codable, Equatable, Sendable {
     self.createdAt = createdAt
     self.updatedAt = updatedAt
     self.reasoningByMessage = reasoningByMessage
+    self.titleGenerated = titleGenerated
   }
 
   /// Placeholder shown until the first user message names the conversation.

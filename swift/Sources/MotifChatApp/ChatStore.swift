@@ -595,7 +595,11 @@ final class ChatStore: ObservableObject {
               let index = conversations.firstIndex(where: { $0.id == id }) else { return }
         conversations[index].messages = messages
         conversations[index].reasoningByMessage = encodedReasoningForPersistence()
-        conversations[index].title = MotifConversation.deriveTitle(from: messages)
+        // Keep a live first-prompt title until the lightweight title model has
+        // produced one; then it is sticky (see generateTitleIfNeeded).
+        if conversations[index].titleGenerated != true {
+            conversations[index].title = MotifConversation.deriveTitle(from: messages)
+        }
         conversations[index].updatedAt = Date()
         saveConversations()
     }
@@ -795,7 +799,9 @@ final class ChatStore: ObservableObject {
             let generatedIDs = Set(conversation.messages[insertionIndex...].map(\.id))
             removeTransientState(for: generatedIDs)
             conversation.messages.replaceSubrange(insertionIndex..., with: backup.messages)
-            conversation.title = MotifConversation.deriveTitle(from: conversation.messages)
+            if conversation.titleGenerated != true {
+                conversation.title = MotifConversation.deriveTitle(from: conversation.messages)
+            }
             conversation.updatedAt = Date()
             conversations[index] = conversation
             reasoningByMessage.merge(backup.reasoning) { _, restored in restored }
@@ -1121,12 +1127,115 @@ final class ChatStore: ObservableObject {
                 if outcome == .succeeded {
                     self.pendingRegenerationBackup = nil
                     self.runtimeStatus = "Idle"
+                    // First settled turn of a conversation: name it with the
+                    // lightweight title model (fire-and-forget; keeps the live
+                    // first-prompt title until it lands).
+                    if let conversationID {
+                        self.generateTitleIfNeeded(conversationID: conversationID)
+                    }
                 }
             }
         }
         generationTask = (generationID, task)
         return true
     }
+
+    // MARK: - Title generation
+
+    /// Lightweight checkpoint used to name conversations, independent of the
+    /// chat backend so a title is always produced by the small model even when
+    /// the user is chatting with a larger model or a remote endpoint. Defaults to
+    /// the 2.6B native checkpoint; `MOTIF_TITLE_MODEL_DIR` overrides it.
+    private static var titleModelDirectory: String {
+        ProcessInfo.processInfo.environment["MOTIF_TITLE_MODEL_DIR"] ?? "~/.models/motif-2.6b-mlx-q4"
+    }
+
+    /// Names a conversation from its first user message using the lightweight
+    /// title model, once, on a background task. No-op when a title was already
+    /// generated, when there is no user message yet, when MLX is not compiled in,
+    /// or when the title checkpoint is missing — the transient `deriveTitle`
+    /// first-prompt title then remains.
+    private func generateTitleIfNeeded(conversationID: UUID) {
+        #if MOTIFKIT_ENABLE_MLX
+        guard let conversation = conversations.first(where: { $0.id == conversationID }),
+              conversation.titleGenerated != true,
+              let firstUser = conversation.messages.first(where: { $0.role == .user }) else { return }
+        let userText = firstUser.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !userText.isEmpty else { return }
+
+        let expanded = Self.expandPath(Self.titleModelDirectory)
+        guard FileManager.default.fileExists(atPath: expanded.path) else { return }
+        let fallback = MotifConversation.deriveTitle(from: conversation.messages)
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let backend = try await MainActor.run { try self.titleBackend(modelDirectory: expanded) }
+                var collected = ""
+                for try await event in backend.streamResponse(
+                    messages: [
+                        .system(MotifTitleGeneration.systemPrompt()),
+                        .user(userText),
+                    ],
+                    // Greedy + tiny budget: a title is a few tokens and must be
+                    // deterministic (same reasoning as tool calling).
+                    parameters: MotifGenerationParameters(
+                        maxTokens: 24,
+                        temperature: 0,
+                        thinkMode: .hidden
+                    )
+                ) {
+                    if case .text(let text) = event { collected += text }
+                }
+                let title = MotifTitleGeneration.sanitize(collected, fallback: fallback)
+                await MainActor.run { self.applyGeneratedTitle(title, to: conversationID) }
+            } catch {
+                // Leave the derived first-prompt title in place on any failure.
+            }
+        }
+        #endif
+    }
+
+    /// Commits a model-generated title and marks it sticky so the transient
+    /// first-prompt derivation stops overwriting it.
+    private func applyGeneratedTitle(_ title: String, to conversationID: UUID) {
+        guard let index = conversations.firstIndex(where: { $0.id == conversationID }),
+              conversations[index].titleGenerated != true else { return }
+        conversations[index].title = title
+        conversations[index].titleGenerated = true
+        conversations[index].updatedAt = Date()
+        saveConversations()
+    }
+
+    private static func expandPath(_ path: String) -> URL {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == "~" {
+            return FileManager.default.homeDirectoryForCurrentUser
+        }
+        if trimmed.hasPrefix("~/") {
+            return FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(String(trimmed.dropFirst(2)))
+        }
+        return URL(fileURLWithPath: trimmed)
+    }
+
+    #if MOTIFKIT_ENABLE_MLX
+    /// Lazily-loaded, cached title-model backend. Kept separate from the chat
+    /// `cachedBackend` so titling never contends with or disturbs the active
+    /// chat runtime's KV-cache. Model weights load lazily on first stream.
+    private var titleBackendCache: MotifMLXBackend?
+    private var titleBackendDirectory: URL?
+
+    private func titleBackend(modelDirectory: URL) throws -> MotifMLXBackend {
+        if let cached = titleBackendCache, titleBackendDirectory == modelDirectory {
+            return cached
+        }
+        let backend = try MotifMLXBackend(modelDirectory: modelDirectory)
+        titleBackendCache = backend
+        titleBackendDirectory = modelDirectory
+        return backend
+    }
+    #endif
 
     func selectNativeModelDirectory(_ url: URL) {
         nativeModelDirectory = url.path

@@ -989,8 +989,14 @@ final class ChatStore: ObservableObject {
                 self.liveTokensPerSecond = 0
                 self.liveTokenEstimate = 0
                 // Flush captured reasoning for this settled turn so it is durable
-                // even when reasoning was the only thing streamed.
-                self.persistReasoning()
+                // even when reasoning was the only thing streamed (e.g. a
+                // reasoning model that fills the token budget before answering).
+                // Only when this turn's conversation is still active — a
+                // switched-away turn's reasoning was already gated out of the
+                // live map during streaming, so there is nothing to flush.
+                if self.activeConversationID == conversationID {
+                    self.persistReasoning()
+                }
                 if outcome != .succeeded, self.restorePendingRegenerationBackup() {
                     if self.activeConversationID != conversationID {
                         self.runtimeStatus = "Idle"

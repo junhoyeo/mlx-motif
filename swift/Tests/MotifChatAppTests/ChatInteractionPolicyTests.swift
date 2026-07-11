@@ -497,6 +497,93 @@ final class ChatInteractionPolicyTests: XCTestCase {
     }
 
     @MainActor
+    func testToolCallLoopExecutesBuiltinAndContinuesWithResult() async throws {
+        // Step 1 emits the exact pretty-printed tool_call JSON Motif-2.6B and
+        // Motif-2-12.7B-Reasoning both produce; step 2 is the model's final
+        // answer after it sees the tool result.
+        let toolCallJSON = """
+        {
+          "tool_call": {
+            "name": "calculator",
+            "arguments": {
+              "expression": "37 * 41"
+            }
+          }
+        }
+        """
+        let backend = ScriptedBackend([
+            .events([.text(toolCallJSON), .completed(usage: nil, finishReason: .stop)]),
+            .events([.text("37 times 41 is 1517."), .completed(usage: nil, finishReason: .stop)]),
+        ])
+        let store = ChatStore(backendOverride: backend, loadsPersistedConversations: false)
+        store.toolsEnabled = true
+        store.prompt = "What is 37 * 41?"
+        store.send()
+        await waitUntil { backend.requests.count == 2 && !store.isGenerating }
+
+        // The calculator actually ran (safe parser: 37 * 41 = 1517) and its
+        // result was appended as a real tool turn.
+        let toolTurn = try XCTUnwrap(store.messages.first(where: { $0.role == .tool }))
+        XCTAssertEqual(toolTurn.content, "1517")
+        XCTAssertEqual(toolTurn.name, "calculator")
+
+        // The parsed call was recorded so the transcript can render a card.
+        let callAssistantID = try XCTUnwrap(store.messages.first(where: { $0.role == .assistant })?.id)
+        XCTAssertEqual(store.toolCalls[callAssistantID]?.name, "calculator")
+
+        // The continuation request carried the tool result back to the model...
+        XCTAssertTrue(
+            backend.requests.last?.messages.contains { $0.content.contains("1517") } == true,
+            "continuation request must include the tool result"
+        )
+        // ...and the turn ended with the model's final answer, idle.
+        XCTAssertEqual(store.messages.last?.content, "37 times 41 is 1517.")
+        XCTAssertFalse(store.isGenerating)
+        XCTAssertEqual(store.runtimeStatus, "Idle")
+    }
+
+    @MainActor
+    func testToolCallLoopStopsAfterMaxToolRounds() async throws {
+        // A model that keeps calling a tool every round must not loop forever.
+        // ScriptedBackend repeats its last step, so this one always tool-calls.
+        let toolCall = #"{"tool_call": {"name": "calculator", "arguments": {"expression": "1 + 1"}}}"#
+        let backend = ScriptedBackend([
+            .events([.text(toolCall), .completed(usage: nil, finishReason: .stop)]),
+        ])
+        let store = ChatStore(backendOverride: backend, loadsPersistedConversations: false)
+        store.toolsEnabled = true
+        store.prompt = "loop"
+        store.send()
+        await waitUntil { !store.isGenerating }
+
+        // maxToolRounds == 3: three executed rounds -> four model turns, then a
+        // visible stop note instead of a dead-ended bare tool-call card.
+        XCTAssertEqual(backend.requests.count, 4)
+        XCTAssertEqual(store.messages.filter { $0.role == .tool }.count, 3)
+        XCTAssertTrue(store.messages.last?.content.contains("Stopped after") == true)
+        XCTAssertFalse(store.isGenerating)
+    }
+
+    @MainActor
+    func testToolCallNotExecutedWhenToolsDisabled() async throws {
+        let toolCall = #"{"tool_call": {"name": "calculator", "arguments": {"expression": "2 + 2"}}}"#
+        let backend = ScriptedBackend([
+            .events([.text(toolCall), .completed(usage: nil, finishReason: .stop)]),
+        ])
+        let store = ChatStore(backendOverride: backend, loadsPersistedConversations: false)
+        store.toolsEnabled = false
+        store.prompt = "add"
+        store.send()
+        await waitUntil { !store.isGenerating }
+
+        // With tools off, the JSON is parsed for card rendering but never
+        // executed, and the turn does not continue.
+        XCTAssertEqual(backend.requests.count, 1)
+        XCTAssertFalse(store.messages.contains { $0.role == .tool })
+        XCTAssertEqual(store.runtimeStatus, "Idle")
+    }
+
+    @MainActor
     private func waitUntil(
         attempts: Int = 200,
         _ predicate: @escaping @MainActor () -> Bool

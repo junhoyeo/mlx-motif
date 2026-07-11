@@ -163,17 +163,26 @@ private struct ChatView: View {
                 ToolbarItem(placement: .navigation) {
                     BackendMenu(store: store, showingImporter: $showingModelDirImporter)
                 }
-                ToolbarItemGroup(placement: .primaryAction) {
-                    if store.isGenerating {
+                // Separate ToolbarItems (NOT one ToolbarItemGroup): a group merges
+                // its children into a single shared capsule, which broke the
+                // interior padding whenever the tok/s readout appeared next to
+                // the meter. One item per pill, each with matched padding.
+                // Order: context gauge first, live speed to its RIGHT.
+                ToolbarItem(placement: .primaryAction) {
+                    ContextMeter(store: store)
+                }
+                if store.isGenerating {
+                    ToolbarItem(placement: .primaryAction) {
                         HStack(spacing: 5) {
                             Image(systemName: "bolt.fill").font(.caption2).foregroundStyle(.yellow)
                             Text("\(store.liveTokensPerSecond, specifier: "%.0f") tok/s · \(store.liveTokenEstimate) tok")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 5)
                         .accessibilityIdentifier("motif.chat.tokrate")
                     }
-                    ContextMeter(store: store)
                 }
             }
             // Give the unified toolbar a visible (glass on macOS 26) background so
@@ -781,12 +790,6 @@ private struct BackendMenu: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
-            // Breathing room inside the toolbar's auto glass pill. Must sit
-            // OUTSIDE the Menu: the capsule wraps the Menu control's bounds and
-            // ignores padding applied to its label, so label padding left this
-            // pill visibly tighter than the (plain-view) context-meter pill.
-            .padding(.horizontal, 16)
-            .padding(.vertical, 5)
             .accessibilityIdentifier("motif.chat.model")
 
             // Endpoint mode edits its host + model id inline in the header — the
@@ -813,6 +816,13 @@ private struct BackendMenu: View {
             }
 
         }
+        // Breathing room inside the toolbar's auto glass pill. Applied at the
+        // ITEM ROOT (not on the Menu, not inside its label — the capsule wraps
+        // the item's bounds and ignores label padding) so BOTH modes stay
+        // uniformly padded: native (menu only) and endpoint (menu + inline
+        // fields, which previously sat flush against the capsule's right edge).
+        .padding(.horizontal, 16)
+        .padding(.vertical, 5)
     }
 }
 

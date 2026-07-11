@@ -40,7 +40,7 @@ private struct ProseView: View {
     let id = UUID()
     let kind: Kind
     let text: String
-    enum Kind { case paragraph, bullet, numbered(String) }
+    enum Kind { case paragraph, bullet, numbered(String), heading(Int) }
   }
 
   private var blocks: [Block] {
@@ -50,6 +50,18 @@ private struct ProseView: View {
       let trimmed = line.trimmingCharacters(in: .whitespaces)
       if trimmed.isEmpty { continue }
 
+      // Heading: 1–6 leading #s followed by a space ("### Title").
+      if trimmed.hasPrefix("#") {
+        let hashes = trimmed.prefix(while: { $0 == "#" })
+        let rest = trimmed.dropFirst(hashes.count)
+        if (1...6).contains(hashes.count), rest.first == " " {
+          result.append(.init(
+            kind: .heading(hashes.count),
+            text: rest.trimmingCharacters(in: .whitespaces)
+          ))
+          continue
+        }
+      }
       // Bullet: -, *, or • followed by a space.
       if let marker = ["- ", "* ", "• "].first(where: { trimmed.hasPrefix($0) }) {
         result.append(.init(kind: .bullet, text: String(trimmed.dropFirst(marker.count))))
@@ -73,6 +85,13 @@ private struct ProseView: View {
         switch block.kind {
         case .paragraph:
           inlineText(block.text)
+        case .heading(let level):
+          inlineText(block.text)
+            .font(headingFont(level))
+            .fontWeight(.semibold)
+            // Extra air above a heading separates sections without needing
+            // markdown's blank-line semantics (blank lines are dropped here).
+            .padding(.top, 6)
         case .bullet:
           HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text("•").foregroundStyle(.secondary)
@@ -85,6 +104,15 @@ private struct ProseView: View {
           }
         }
       }
+    }
+  }
+
+  /// Heading sizes step down with level; H4+ clamp to headline-weight body.
+  private func headingFont(_ level: Int) -> Font {
+    switch level {
+    case 1: .title2
+    case 2: .title3
+    default: .headline
     }
   }
 

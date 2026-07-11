@@ -1,0 +1,87 @@
+# XcodeGen spec for the XCUITest UI-automation harness.
+#
+# The SwiftPM package (Package.swift) remains the source of truth for building
+# and unit-testing the app. This project exists ONLY to host an XCUITest UI
+# Testing bundle, which SwiftPM cannot host. It is intentionally the lightweight
+# (no-MLX) build: the app links the MotifKit product from the local package and
+# compiles the MotifChatApp sources directly, so the native path resolves to the
+# `nativeMLXNotCompiled` branch — which is itself one of the automated tests.
+#
+# Regenerate with:  scripts/ui_test_swift_chat_app.sh   (runs `xcodegen generate`)
+# The generated MotifChatApp.xcodeproj is gitignored; project.yml is the source.
+name: MotifChatApp
+
+options:
+  bundleIdPrefix: io.junho.motif
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+packages:
+  SwiftMotif:
+    path: .
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    # Ad-hoc sign locally so the test runner can attach; no provisioning profile.
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGNING_ALLOWED: "YES"
+
+# NOTE: the app target is named `MotifChatUIHost`, NOT `MotifChatApp`.
+# The local Swift package (Package.swift) declares an EXECUTABLE product named
+# `MotifChatApp`; if the Xcode app target shared that name, `xcodebuild test`
+# would resolve TEST_TARGET_NAME to the package's bare executable product
+# (Build/Products/Debug/MotifChatApp, no `.app`) instead of this app bundle and
+# fail with "The bundle identifier for MotifChatApp couldn't be read". A distinct
+# target/product name avoids the collision. The user-facing name stays "Motif
+# Chat" via CFBundleDisplayName.
+targets:
+  MotifChatUIHost:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/MotifChatApp
+    dependencies:
+      - package: SwiftMotif
+        product: MotifKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.junho.motif.MotifChatUIHost
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_CFBundleDisplayName: Motif Chat
+        # A plain window app (not an agent) so XCUIApplication gets a window.
+        INFOPLIST_KEY_LSUIElement: "NO"
+        ENABLE_HARDENED_RUNTIME: "NO"
+
+  MotifChatAppUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: MotifChatAppUITests
+    dependencies:
+      - target: MotifChatUIHost
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.junho.motif.MotifChatAppUITests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_TARGET_NAME: MotifChatUIHost
+
+schemes:
+  MotifChatApp:
+    build:
+      targets:
+        MotifChatUIHost: all
+        MotifChatAppUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      gatherCoverageData: false
+      targets:
+        - MotifChatAppUITests

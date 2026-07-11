@@ -57,8 +57,10 @@ private struct SidebarView: View {
             Section {
                 Label("Chat", systemImage: "bubble.left.and.bubble.right")
                     .tag(SidebarPanel.chat)
+                    .accessibilityIdentifier("motif.sidebar.chat")
                 Label("Runtime", systemImage: "speedometer")
                     .tag(SidebarPanel.runtime)
+                    .accessibilityIdentifier("motif.sidebar.runtime")
             }
 
             Section {
@@ -362,6 +364,7 @@ private struct ReasoningDisclosure: View {
                 }
             }
         }
+        .accessibilityIdentifier("motif.chat.reasoning")
         .padding(12)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
         .overlay(
@@ -406,6 +409,7 @@ private struct InputBar: View {
                 Text(lastError)
                     .font(.caption)
                     .foregroundStyle(.red)
+                    .accessibilityIdentifier("motif.chat.error")
             }
 
             // Claude-style layout: the text field spans the full bar width, and
@@ -571,6 +575,8 @@ private struct MessageBubble: View {
                         StreamingCaret()
                     }
                     MarkdownMessageView(content: message.content)
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("motif.chat.message.text")
                 }
             }
 
@@ -607,6 +613,7 @@ private struct MessageBubble: View {
         .frame(maxWidth: 680, alignment: isUser ? .trailing : .leading)
         // Single alignment step: push the bubble to its side of the transcript.
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
+        .accessibilityIdentifier(isUser ? "motif.chat.bubble.user" : "motif.chat.bubble.assistant")
     }
 
     /// Content alignment inside the bubble: user turns hang from the trailing
@@ -688,11 +695,13 @@ private struct RuntimeView: View {
                         Label(mode.label, systemImage: mode.systemImage).tag(mode)
                     }
                 }
+                .accessibilityIdentifier("motif.runtime.backendPicker")
 
                 switch store.backendMode {
                 case .openAICompatible:
                     TextField("OpenAI-compatible endpoint", text: $store.endpoint)
                         .textFieldStyle(.roundedBorder)
+                        .accessibilityIdentifier("motif.runtime.endpoint")
                     TextField("Model ID", text: $store.model)
                         .textFieldStyle(.roundedBorder)
 
@@ -714,11 +723,13 @@ private struct RuntimeView: View {
                         Text(mode.rawValue.capitalized).tag(mode)
                     }
                 }
+                .accessibilityIdentifier("motif.runtime.thinkPicker")
             }
 
             Section("App status") {
                 Label("Active chat path: \(store.backendMode.label)", systemImage: store.backendMode.systemImage)
                 Label("Runtime status: \(store.runtimeStatus)", systemImage: statusIcon)
+                    .accessibilityIdentifier("motif.runtime.status")
                 Label(
                     store.nativeMLXCompiledIn
                         ? "Native in-process MLX generation is compiled into this build"
@@ -732,6 +743,7 @@ private struct RuntimeView: View {
 
             Section("Generation") {
                 Stepper("Max tokens: \(store.maxTokens)", value: $store.maxTokens, in: 1...8192, step: 64)
+                    .accessibilityIdentifier("motif.runtime.maxTokens")
                 Slider(value: $store.temperature, in: 0...2) {
                     Text("Temperature")
                 }

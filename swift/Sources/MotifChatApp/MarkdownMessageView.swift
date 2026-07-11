@@ -40,7 +40,7 @@ private struct ProseView: View {
     let id = UUID()
     let kind: Kind
     let text: String
-    enum Kind { case paragraph, bullet, numbered(String), heading(Int) }
+    enum Kind { case paragraph, bullet, numbered(String), heading(Int), divider, quote }
   }
 
   private var blocks: [Block] {
@@ -50,6 +50,12 @@ private struct ProseView: View {
       let trimmed = line.trimmingCharacters(in: .whitespaces)
       if trimmed.isEmpty { continue }
 
+      // Horizontal rule: a line that is only 3+ dashes/asterisks/underscores.
+      if trimmed.count >= 3, trimmed.allSatisfy({ $0 == "-" || $0 == "*" || $0 == "_" }),
+         Set(trimmed).count == 1 {
+        result.append(.init(kind: .divider, text: ""))
+        continue
+      }
       // Heading: 1–6 leading #s followed by a space ("### Title").
       if trimmed.hasPrefix("#") {
         let hashes = trimmed.prefix(while: { $0 == "#" })
@@ -61,6 +67,12 @@ private struct ProseView: View {
           ))
           continue
         }
+      }
+      // Blockquote: "> " prefix (single level; nested markers collapse).
+      if trimmed.hasPrefix(">") {
+        let body = trimmed.drop(while: { $0 == ">" || $0 == " " })
+        result.append(.init(kind: .quote, text: String(body)))
+        continue
       }
       // Bullet: -, *, or • followed by a space.
       if let marker = ["- ", "* ", "• "].first(where: { trimmed.hasPrefix($0) }) {
@@ -92,6 +104,17 @@ private struct ProseView: View {
             // Extra air above a heading separates sections without needing
             // markdown's blank-line semantics (blank lines are dropped here).
             .padding(.top, 6)
+        case .divider:
+          Divider().padding(.vertical, 4)
+        case .quote:
+          HStack(alignment: .top, spacing: 8) {
+            RoundedRectangle(cornerRadius: 1.5)
+              .fill(.quaternary)
+              .frame(width: 3)
+            inlineText(block.text)
+              .foregroundStyle(.secondary)
+          }
+          .fixedSize(horizontal: false, vertical: true)
         case .bullet:
           HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text("•").foregroundStyle(.secondary)

@@ -505,21 +505,26 @@ public final class MotifMLXAttentionScaffold: Module {
         }
     }
 
-    // V-cache head-ordering invariant (Swift vs Python divergence):
+    // V-cache head-ordering invariant (mirrors Python `_forward_vanilla` in
+    // src/mlx_motif/model.py):
     //
-    // Unlike the Python reference (`_forward_vanilla` in src/mlx_motif/model.py),
-    // this Swift path stores V in the KV cache in the projection's *paired* head
-    // order [v0_a, v0_b, v1_a, v1_b, ...] — the raw `valueProjection` output is
-    // written straight to `cache.update`. The reshape → transpose → reshape into
-    // a 2*headDim-wide per-KV-head V happens AFTER fetch, on the full cached V.
-    // So the Swift vanilla V cache is HF-ordered and does NOT carry the Python
-    // side's *slab* head-order trap; no ordering marker is needed here, and the
-    // `KVCache` type is correct as-is.
+    // This path stores V in the KV cache in *slab* head order
+    // [va_0..va_{Hk-1}, vb_0..vb_{Hk-1}] — the `valueProjection` output is
+    // reordered on the head axis at PROJECTION time (a fused reshape/transpose
+    // on the new tokens only, O(S)=O(1) at decode) before `cache.update`. After
+    // fetch the two head_dim-wide value slabs are contiguous head-axis slices
+    // (`v[:, :Hk]`, `v[:, Hk:]`), zero-copy. This replaced the old paired-order
+    // storage, which needed a reshape→transpose→reshape over the ENTIRE cached V
+    // after every fetch — an O(context) copy per layer per token (~12 MB/
+    // layer/token at 3k ctx) that was the dominant Swift-vs-Python decode
+    // deficit (see docs/benchmarks + memory swift-decode-perf-gap).
     //
-    // DIRECTIVE: if this path is ever reworked to the Python-style per-slab SDPA
-    // (which stores V slab-ordered [va_0..va_{Hk-1}, vb_0..vb_{Hk-1}] at
-    // projection time), mirror the Python `MotifVanillaKVCache` marker/accessor
-    // here so the non-standard V ordering cannot leak silently.
+    // TRAP: the slab order is NOT HF paired order. No current Swift consumer
+    // reads the raw vanilla V cache expecting HF order (cache reuse/trim operate
+    // on the seq axis and token IDs, orthogonal to head order), so no marker
+    // type is introduced. DIRECTIVE: if any consumer is added that reads raw V
+    // head-ordering, mirror Python's `MotifVanillaKVCache` marker/`hf_ordered_
+    // values()` accessor so this ordering cannot leak silently.
     private func forwardVanilla(
         _ x: MLXArray,
         mask: MLXFast.ScaledDotProductAttentionMaskMode,
@@ -537,9 +542,15 @@ public final class MotifMLXAttentionScaffold: Module {
         var k = keyProjection(x)
             .reshaped([batch, sequenceLength, 2 * effectiveKVHeads, layout.headDim])
             .transposed(0, 2, 1, 3)
+        // Reorder V into slab head order at projection time (O(S) on the new
+        // tokens; S=1 at decode) so the value slabs are zero-copy head-axis
+        // slices after fetch — instead of an O(context) reshape/transpose over
+        // the whole cached V every step. Mirrors Python model.py `_forward_vanilla`
+        // (`v_proj(x).reshape(B,S,Hk,2,d).transpose(0,3,2,1,4).reshape(B,2*Hk,S,d)`).
         var v = valueProjection(x)
-            .reshaped([batch, sequenceLength, 2 * effectiveKVHeads, layout.headDim])
-            .transposed(0, 2, 1, 3)
+            .reshaped([batch, sequenceLength, effectiveKVHeads, 2, layout.headDim])
+            .transposed(0, 3, 2, 1, 4)
+            .reshaped([batch, 2 * effectiveKVHeads, sequenceLength, layout.headDim])
 
         q = rope(q, offset: offset)
         k = rope(k, offset: offset)
@@ -547,10 +558,13 @@ public final class MotifMLXAttentionScaffold: Module {
             (k, v) = cache.update(keys: k, values: v)
         }
         let kvSequenceLength = k.dim(2)
-        v = v.reshaped([batch, effectiveKVHeads, 2, kvSequenceLength, layout.headDim])
-            .transposed(0, 1, 3, 2, 4)
-            .reshaped([batch, effectiveKVHeads, kvSequenceLength, 2 * layout.headDim])
-        v = repeatHeadsIfNeeded(v, count: layout.keyValueRepeat)
+
+        // Value slabs: contiguous head-axis slices, [B, Hk, kvSeq, d] each.
+        let va = repeatHeadsIfNeeded(
+            v[0..., 0 ..< effectiveKVHeads, 0..., 0...], count: layout.keyValueRepeat)
+        let vb = repeatHeadsIfNeeded(
+            v[0..., effectiveKVHeads ..< (2 * effectiveKVHeads), 0..., 0...],
+            count: layout.keyValueRepeat)
 
         let qPairs = q.reshaped([batch, effectiveHeads, 2, sequenceLength, layout.headDim])
         let kPairs = k.reshaped([batch, effectiveKVHeads, 2, kvSequenceLength, layout.headDim])
@@ -559,21 +573,17 @@ public final class MotifMLXAttentionScaffold: Module {
         let k1 = repeatHeadsIfNeeded(kPairs[0..., 0..., 0, 0..., 0...], count: layout.keyValueRepeat)
         let k2 = repeatHeadsIfNeeded(kPairs[0..., 0..., 1, 0..., 0...], count: layout.keyValueRepeat)
 
-        let out1 = MLXFast.scaledDotProductAttention(
-            queries: q1,
-            keys: k1,
-            values: v,
-            scale: scale,
-            mask: mask
-        )
-        let out2 = MLXFast.scaledDotProductAttention(
-            queries: q2,
-            keys: k2,
-            values: v,
-            scale: scale,
-            mask: mask
-        )
-        let differential = out1 - lambdaFull(dtype: out1.dtype) * out2
+        // Four narrow (head_dim-wide) SDPA calls hit MLX's fast attention
+        // templates (query_dim == value_dim == d); the old 2·d-wide V forced the
+        // slow generic O(S²) SDPA. By linearity of ·V this is exactly equivalent
+        // to the two wide calls: SDPA(q,k,[va|vb]) = [SDPA(q,k,va) | SDPA(q,k,vb)],
+        // so the differential is assembled slab-wise (mirrors Python model.py).
+        let o1a = MLXFast.scaledDotProductAttention(queries: q1, keys: k1, values: va, scale: scale, mask: mask)
+        let o1b = MLXFast.scaledDotProductAttention(queries: q1, keys: k1, values: vb, scale: scale, mask: mask)
+        let o2a = MLXFast.scaledDotProductAttention(queries: q2, keys: k2, values: va, scale: scale, mask: mask)
+        let o2b = MLXFast.scaledDotProductAttention(queries: q2, keys: k2, values: vb, scale: scale, mask: mask)
+        let lam = lambdaFull(dtype: o1a.dtype)
+        let differential = concatenated([o1a - lam * o2a, o1b - lam * o2b], axis: -1)
         let normalized = MLXFast.rmsNorm(
             differential,
             weight: subLayerNorm.weight.asType(differential.dtype),

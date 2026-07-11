@@ -14,23 +14,31 @@ public struct MotifChatMessage: Identifiable, Codable, Equatable, Sendable {
     public var role: MotifRole
     public var content: String
     public var createdAt: Date
+    /// Tool name for `.tool` turns (mirrors the OpenAI-style `name` field on
+    /// Python's tool-result messages). `nil` for every other role; optional so
+    /// previously persisted conversations still decode.
+    public var name: String?
 
     public init(
         id: UUID = UUID(),
         role: MotifRole,
         content: String,
-        createdAt: Date = Date()
+        createdAt: Date = Date(),
+        name: String? = nil
     ) {
         self.id = id
         self.role = role
         self.content = content
         self.createdAt = createdAt
+        self.name = name
     }
 
     public static func system(_ content: String) -> Self { .init(role: .system, content: content) }
     public static func user(_ content: String) -> Self { .init(role: .user, content: content) }
     public static func assistant(_ content: String) -> Self { .init(role: .assistant, content: content) }
-    public static func tool(_ content: String) -> Self { .init(role: .tool, content: content) }
+    public static func tool(_ content: String, name: String? = nil) -> Self {
+        .init(role: .tool, content: content, name: name)
+    }
 }
 
 public enum MotifThinkMode: String, Codable, Sendable, CaseIterable {

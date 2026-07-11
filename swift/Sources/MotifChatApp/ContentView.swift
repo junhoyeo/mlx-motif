@@ -220,14 +220,19 @@ private struct ChatView: View {
                         .frame(maxWidth: .infinity, minHeight: 420)
                 } else {
                     LazyVStack(alignment: .leading, spacing: 16) {
-                        ForEach(visibleMessages) { message in
+                        ForEach(Array(visibleMessages.enumerated()), id: \.element.id) { index, message in
                             MessageBubble(
                                 store: store,
                                 message: message,
                                 isStreaming: store.isGenerating
                                     && message.id == visibleMessages.last?.id
                                     && message.role == .assistant,
-                                isLast: message.id == visibleMessages.last?.id
+                                isLast: message.id == visibleMessages.last?.id,
+                                // A following tool turn is the PERSISTED marker
+                                // that this assistant turn executed a tool —
+                                // survives relaunch, unlike store.toolCalls.
+                                executedToolFollows: index + 1 < visibleMessages.count
+                                    && visibleMessages[index + 1].role == .tool
                             )
                             .id(message.id)
                         }
@@ -448,12 +453,26 @@ private struct MessageBubble: View {
     let message: MotifChatMessage
     let isStreaming: Bool
     let isLast: Bool
+    /// True when the next transcript message is a `.tool` result — the
+    /// persisted marker that this assistant turn's tool call actually ran.
+    let executedToolFollows: Bool
 
-    @State private var isHovering = false
     @State private var didCopy = false
 
     private var isUser: Bool { message.role == .user }
     private var isAssistant: Bool { message.role == .assistant }
+
+    /// Parsed tool call to render as a card. The in-memory `store.toolCalls`
+    /// covers the live session; after a relaunch that dict is empty, so a
+    /// restored executed-call turn (marked by its following tool result)
+    /// re-parses its content on the fly.
+    private var displayedToolCall: MotifToolCalling.ParsedToolCall? {
+        store.toolCalls[message.id]
+            ?? (executedToolFollows
+                ? MotifToolCalling.parseToolCall(
+                    text: message.content, toolNames: MotifChatDemoTools.names)
+                : nil)
+    }
 
     var body: some View {
         // ONE alignment mechanism (hstack/vstack + ui-patterns skills): the
@@ -462,25 +481,13 @@ private struct MessageBubble: View {
         // correct side of the transcript — no HStack+Spacer *and* outer frame
         // fighting each other.
         VStack(alignment: bubbleAlignment, spacing: 6) {
-            HStack(spacing: 6) {
-                Text(message.role.rawValue.capitalized)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if isHovering {
-                    Button {
-                        copyToPasteboard(message.content)
-                        didCopy = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { didCopy = false }
-                    } label: {
-                        Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
-                            .font(.caption2)
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Copy message")
-                }
-            }
+            // Role label only — copy lives in the always-visible actions row
+            // below (one copy affordance per message, not two).
+            Text(message.role.rawValue.capitalized)
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
-            if let call = store.toolCalls[message.id] {
+            if let call = displayedToolCall {
                 ToolCallCard(call: call)
             } else if message.role == .tool {
                 // Executed-tool result feeding the next round — compact and
@@ -489,7 +496,9 @@ private struct MessageBubble: View {
                     Image(systemName: "checkmark.circle.fill")
                         .foregroundStyle(.green)
                         .font(.callout)
-                    Text(message.content)
+                    // Content is the bare result exactly as the model sees it;
+                    // the "Tool result (name)" framing is display-only.
+                    Text("Tool result (\(message.name ?? "tool")): \(message.content)")
                         .font(.callout)
                         .textSelection(.enabled)
                 }
@@ -519,14 +528,11 @@ private struct MessageBubble: View {
                 MetricsLine(metrics: m)
             }
 
-            // Per-message actions on assistant turns. Revealed on hover (kept
-            // mounted but hidden so layout doesn't jump) and never while the
-            // message is mid-stream. Materials/plain controls only — no glass
-            // on message content.
+            // Per-message actions on assistant turns — always visible (no
+            // hover reveal), never while the message is mid-stream.
+            // Materials/plain controls only — no glass on message content.
             if isAssistant && !isStreaming {
                 actionsRow
-                    .opacity(isHovering ? 1 : 0)
-                    .allowsHitTesting(isHovering)
             }
         }
         .padding(12)
@@ -535,7 +541,6 @@ private struct MessageBubble: View {
         .frame(maxWidth: 680, alignment: isUser ? .trailing : .leading)
         // Single alignment step: push the bubble to its side of the transcript.
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
-        .onHover { isHovering = $0 }
     }
 
     /// Content alignment inside the bubble: user turns hang from the trailing

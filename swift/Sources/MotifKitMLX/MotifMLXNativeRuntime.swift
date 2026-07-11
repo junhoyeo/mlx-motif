@@ -49,9 +49,31 @@ public struct MotifMLXChatInputProcessor: UserInputProcessor {
     }
 
     public func promptText(for messages: [MotifChatMessage]) throws -> String {
-        let generated = messageGenerator.generate(messages: messages.map(Self.chatMessage(from:)))
-        let tokenIDs = try tokenIDs(for: generated, tools: nil)
+        let tokenIDs = try tokenIDs(for: Self.templateMessages(from: messages), tools: nil)
         return tokenizer.decode(tokens: tokenIDs)
+    }
+
+    /// Role-faithful template messages. Motif's chat template renders ANY role
+    /// string generically (`<|startofturn|><|{role}|>`), so `.tool` turns must
+    /// reach it as `role: "tool"` — exactly what Python's `run_tool_loop`
+    /// sends. The `Chat.Message` round-trip (`chatMessage(from:)`) cannot do
+    /// this because MLXLMCommon has no tool case and would downgrade the turn
+    /// to `<|user|>`, which reads to the model as a fresh conversational turn.
+    public static func templateMessages(from messages: [MotifChatMessage]) -> [Message] {
+        messages.map { message in
+            var dict: Message = ["role": message.role.rawValue, "content": message.content]
+            if let name = message.name {
+                dict["name"] = name
+            }
+            return dict
+        }
+    }
+
+    /// Prepares model input directly from Motif messages, preserving the tool
+    /// role through templating (see `templateMessages(from:)`).
+    public func prepare(motifMessages: [MotifChatMessage]) throws -> LMInput {
+        let tokenIDs = try tokenIDs(for: Self.templateMessages(from: motifMessages), tools: nil)
+        return LMInput(tokens: MLXArray(tokenIDs))
     }
 
     private func tokenIDs(for messages: [Message], tools: [ToolSpec]?) throws -> [Int] {
@@ -376,8 +398,7 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    let input = MotifMLXChatInputProcessor.userInput(from: messages)
-                    let lmInput = try await inputProcessor.prepare(input: input)
+                    let lmInput = try inputProcessor.prepare(motifMessages: messages)
                     let generationParameters = GenerateParameters(
                         maxTokens: parameters.maxTokens,
                         temperature: Float(parameters.temperature)
@@ -654,8 +675,7 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
         temperature: Double = 0
     ) async throws -> MotifMLXGenerationBenchmark {
         let started = Date()
-        let input = MotifMLXChatInputProcessor.userInput(from: messages)
-        let lmInput = try await inputProcessor.prepare(input: input)
+        let lmInput = try inputProcessor.prepare(motifMessages: messages)
         let stream = try generateTokens(
             input: lmInput,
             parameters: GenerateParameters(maxTokens: maxTokens, temperature: Float(temperature)),

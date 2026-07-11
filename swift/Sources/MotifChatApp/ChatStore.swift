@@ -520,6 +520,24 @@ final class ChatStore: ObservableObject {
         // tools are enabled, inject the demo-tools preamble into the leading
         // system message for this turn only (the stored transcript is untouched).
         var requestMessages = messagesWithinBudget()
+        // Parity with Python run_tool_loop: each assistant turn whose tool call
+        // actually EXECUTED (marked by the tool-result turn right after it —
+        // a persisted marker, unlike the session-only `toolCalls` dict) is
+        // sent to the model as the single canonical {"tool_call": ...} JSON,
+        // not the raw output (which may repeat the JSON or carry think
+        // blocks). Display keeps the raw content.
+        for index in requestMessages.indices where requestMessages[index].role == .assistant {
+            guard index + 1 < requestMessages.count,
+                  requestMessages[index + 1].role == .tool else { continue }
+            let call = toolCalls[requestMessages[index].id]
+                ?? MotifToolCalling.parseToolCall(
+                    text: requestMessages[index].content,
+                    toolNames: MotifChatDemoTools.names
+                )
+            if let call {
+                requestMessages[index].content = MotifToolCalling.canonicalToolCallJSON(call)
+            }
+        }
         if toolsEnabled {
             let preamble = MotifToolCalling.buildToolsPreamble(MotifChatDemoTools.tools)
             if let first = requestMessages.first, first.role == .system {
@@ -626,7 +644,10 @@ final class ChatStore: ObservableObject {
                        self.toolRoundsThisTurn < Self.maxToolRounds {
                         self.toolRoundsThisTurn += 1
                         let result = MotifChatDemoTools.execute(call)
-                        self.messages.append(.tool("Tool result (\(call.name)): \(result)"))
+                        // Bare result as a real `tool` turn (rendered <|tool|>
+                        // by the template) — parity with Python run_tool_loop.
+                        // The "Tool result (name):" framing is display-only.
+                        self.messages.append(.tool(result, name: call.name))
                         self.runtimeStatus = "Running tool round \(self.toolRoundsThisTurn)…"
                         self.startGeneration()
                         return

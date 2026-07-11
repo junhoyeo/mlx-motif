@@ -94,6 +94,19 @@ public enum MotifToolCalling {
         return nil
     }
 
+    /// Canonical assistant-turn content for a parsed tool call — the Swift
+    /// mirror of Python `run_tool_loop`'s normalisation
+    /// (`json.dumps({"tool_call": call})`): the growing conversation carries
+    /// one tidy JSON object per call instead of the small model's raw output
+    /// (which may repeat the JSON or include think blocks). Argument keys are
+    /// serialized sorted (CanonicalJSON) rather than in source order — a
+    /// deliberate, documented divergence from `json.dumps`'s insertion order.
+    public static func canonicalToolCallJSON(_ call: ParsedToolCall) -> String {
+        let args = CanonicalJSON.serialize(call.arguments.mapValues { $0.anyValue })
+        return "{\"tool_call\": {\"name\": " + CanonicalJSON.serializeString(call.name)
+            + ", \"arguments\": " + args + "}}"
+    }
+
     /// Convenience: derive the allowed tool-name set from a decoded `tools`
     /// array (or `nil` to accept any name).
     public static func toolNames(from tools: [Any]?) -> Set<String>? {

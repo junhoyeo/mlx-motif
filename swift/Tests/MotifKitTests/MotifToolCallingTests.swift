@@ -100,6 +100,30 @@ final class MotifToolCallingTests: XCTestCase {
         XCTAssertNil(MotifToolCalling.parseToolCall(text: "", toolNames: weatherToolNames))
     }
 
+    // MARK: - Canonical tool-call JSON (run_tool_loop assistant-turn parity)
+
+    func testCanonicalToolCallJSONRoundTripsThroughParser() {
+        let raw = #"noise before {"tool_call": {"name": "calculator", "arguments": {"expression": "37 * 41"}}} noise after"#
+        let call = MotifToolCalling.parseToolCall(text: raw, toolNames: ["calculator"])!
+        let canonical = MotifToolCalling.canonicalToolCallJSON(call)
+        XCTAssertEqual(
+            canonical,
+            #"{"tool_call": {"name": "calculator", "arguments": {"expression": "37 * 41"}}}"#
+        )
+        // Normalising must be idempotent: re-parsing the canonical form yields
+        // the same call, so a normalised transcript re-normalises unchanged.
+        XCTAssertEqual(MotifToolCalling.parseToolCall(text: canonical, toolNames: ["calculator"]), call)
+    }
+
+    func testCanonicalToolCallJSONSortsArgumentKeys() {
+        let raw = #"{"tool_call": {"name": "t", "arguments": {"b": 2, "a": 1}}}"#
+        let call = MotifToolCalling.parseToolCall(text: raw, toolNames: nil)!
+        XCTAssertEqual(
+            MotifToolCalling.canonicalToolCallJSON(call),
+            #"{"tool_call": {"name": "t", "arguments": {"a": 1, "b": 2}}}"#
+        )
+    }
+
     // MARK: - Fixture loading + helpers
 
     private func loadPreambleCases() throws -> [Any] {

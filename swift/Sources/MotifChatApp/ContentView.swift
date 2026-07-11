@@ -687,8 +687,14 @@ private struct RuntimeView: View {
             }
         }
         .formStyle(.grouped)
-        .padding()
+        // No extra .padding(): the grouped form carries its own content
+        // insets, and stacking more read as broken top padding on this tab.
+        // Let the sections float on the translucent window like the chat pane.
+        .scrollContentBackground(.hidden)
         .navigationTitle("Runtime")
+        // Mask the toolbar strip like the chat tab — without this the empty
+        // unified-toolbar band above the form reads as dead gray space.
+        .toolbarBackground(.visible, for: .windowToolbar)
         .fileImporter(
             isPresented: $showingModelDirectoryImporter,
             allowedContentTypes: [.folder],

@@ -234,12 +234,13 @@ private final class NativeOpenAIServer: @unchecked Sendable {
                 // the app); accumulate so the terminal `reasoning` field still
                 // carries the full captured think block.
                 capturedReasoning = (capturedReasoning ?? "") + reasoning
-            case .completed(let usage):
+            case .completed(let usage, let modelFinishReason):
                 terminalUsage = usage
                 // Tools declared: parse the buffered output. If a tool call is
                 // found, emit a tool_calls delta chunk and finish with
                 // finish_reason "tool_calls"; otherwise flush the buffered text.
-                var finishReason = "stop"
+                // A truncated generation reports OpenAI's "length".
+                var finishReason = modelFinishReason == .length ? "length" : "stop"
                 if let buffered = toolBuffer {
                     if let call = MotifToolCalling.parseToolCall(text: buffered, toolNames: toolNames) {
                         let arguments = argumentsJSONString(call.arguments)
@@ -301,6 +302,7 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         var content = ""
         var reasoning: String?
         var usage: MotifGenerationUsage?
+        var modelFinishReason: MotifFinishReason = .unknown
         let stream = runtime.streamResponse(messages: messages, parameters: parameters)
         for try await event in stream {
             switch event {
@@ -312,7 +314,9 @@ private final class NativeOpenAIServer: @unchecked Sendable {
             // (sourced from MLX's `generate(...)` `.info` completion). Match the
             // Python `usage` shape exactly (prompt_tokens / completion_tokens /
             // total_tokens). See docs/server-parity.md.
-            case .completed(let completedUsage): usage = completedUsage
+            case .completed(let completedUsage, let reason):
+                usage = completedUsage
+                modelFinishReason = reason
             }
         }
         let resolvedUsage = usage ?? MotifGenerationUsage(promptTokens: 0, completionTokens: 0)
@@ -322,7 +326,7 @@ private final class NativeOpenAIServer: @unchecked Sendable {
         // looping) output and shape it as OpenAI `tool_calls` with
         // finish_reason "tool_calls". Falls back to a normal content response.
         var message: [String: Any] = ["role": "assistant", "content": content]
-        var finishReason = "stop"
+        var finishReason = modelFinishReason == .length ? "length" : "stop"
         if !tools.isEmpty,
            let call = MotifToolCalling.parseToolCall(text: content, toolNames: MotifToolCalling.toolNames(from: tools)) {
             message = [

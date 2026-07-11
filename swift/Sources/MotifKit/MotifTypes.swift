@@ -41,6 +41,19 @@ public struct MotifChatMessage: Identifiable, Codable, Equatable, Sendable {
     }
 }
 
+/// Why generation stopped. Lets the UI tell a complete answer apart from one
+/// truncated at the output-token ceiling (which it can continue).
+public enum MotifFinishReason: String, Codable, Sendable {
+    /// Natural end of the turn (EOS / stop token).
+    case stop
+    /// Hit the max output-token limit — the response is truncated.
+    case length
+    /// Cancelled, or the stream ended early.
+    case cancelled
+    /// The backend did not report a reason.
+    case unknown
+}
+
 public enum MotifThinkMode: String, Codable, Sendable, CaseIterable {
     case visible
     case hidden
@@ -91,9 +104,9 @@ public enum MotifGenerationEvent: Equatable, Sendable {
     /// Terminal event. Carries token-usage accounting when the backend can
     /// surface it (the native MLX runtime does); `nil` for backends that do
     /// not report counts (e.g. the remote OpenAI-compatible SSE client, whose
-    /// upstream stream omits `usage`). Existing `case .completed:` patterns
-    /// continue to match and may ignore the payload.
-    case completed(usage: MotifGenerationUsage?)
+    /// upstream stream omits `usage`). `finishReason` tells a complete answer
+    /// apart from one truncated at the token limit (`.length`).
+    case completed(usage: MotifGenerationUsage?, finishReason: MotifFinishReason)
 }
 
 public protocol MotifChatBackend: Sendable {

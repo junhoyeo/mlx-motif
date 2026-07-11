@@ -574,7 +574,28 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
                                 promptTokens: promptTokens.count,
                                 completionTokens: completion.generationTokenCount
                             )
-                            continuation.yield(.completed(usage: usage))
+                            // Truncation detection. MLXLMCommon's stop reason is
+                            // unreliable at the token cap — it reports `.stop`
+                            // (or `.cancelled`) even when the run was cut off,
+                            // because its post-loop `.length` check reads a stale
+                            // `iterator.tokenCount`. The dependable signal is the
+                            // budget itself: reaching `maxTokens` generated
+                            // tokens means the answer was cut. A natural EOS
+                            // stops the model *before* the cap, so this only
+                            // misfires on an exact-fit stop (negligible), where
+                            // offering to continue is harmless.
+                            let finishReason: MotifFinishReason
+                            if parameters.maxTokens > 0,
+                               completion.generationTokenCount >= parameters.maxTokens {
+                                finishReason = .length
+                            } else {
+                                switch completion.stopReason {
+                                case .stop: finishReason = .stop
+                                case .length: finishReason = .length
+                                case .cancelled: finishReason = .cancelled
+                                }
+                            }
+                            continuation.yield(.completed(usage: usage, finishReason: finishReason))
                         }
                     }
                     if Task.isCancelled {

@@ -210,7 +210,7 @@ final class ChatStore: ObservableObject {
     @Published var thinkMode: MotifThinkMode = ChatStore.storedThinkMode() {
         didSet { ChatStore.defaults.set(thinkMode.rawValue, forKey: DefaultsKey.thinkMode.rawValue) }
     }
-    @Published var maxTokens = ChatStore.storedInt(.maxTokens, defaultValue: 512) {
+    @Published var maxTokens = ChatStore.storedInt(.maxTokens, defaultValue: 4096) {
         didSet { ChatStore.defaults.set(maxTokens, forKey: DefaultsKey.maxTokens.rawValue) }
     }
     @Published var temperature = ChatStore.storedDouble(.temperature, defaultValue: 0.6) {
@@ -247,11 +247,21 @@ final class ChatStore: ObservableObject {
     @Published var metrics: [UUID: MessageMetrics] = [:]
     /// Parsed tool call per assistant message id, when the turn emitted one.
     @Published var toolCalls: [UUID: MotifToolCalling.ParsedToolCall] = [:]
+    /// Assistant messages truncated at the output-token limit (finish reason
+    /// `.length`). The UI offers a Continue affordance for these; cleared once
+    /// a continued turn reaches a natural stop. Session-only.
+    @Published var truncatedMessages: Set<UUID> = []
     /// Tool-execution rounds consumed by the CURRENT user turn (reset on every
     /// send/regenerate). Bounds the execute→continue loop like Python's
     /// run_tool_loop max_rounds so a looping model can't spin forever.
     private var toolRoundsThisTurn = 0
     private static let maxToolRounds = 3
+    /// Automatic continuations consumed by the CURRENT user turn (reset on every
+    /// send/regenerate). Bounds the auto-resume-on-truncation loop like the
+    /// Claude Code harness's `MAX_OUTPUT_TOKENS_RECOVERY_LIMIT` so a runaway
+    /// generation can't resume forever.
+    private var continuationsThisTurn = 0
+    private static let maxContinuations = 3
     /// When enabled, the demo tools preamble is injected for each turn.
     @Published var toolsEnabled: Bool = ChatStore.storedBool(.toolsEnabled, defaultValue: false) {
         didSet { ChatStore.defaults.set(toolsEnabled, forKey: DefaultsKey.toolsEnabled.rawValue) }
@@ -371,6 +381,7 @@ final class ChatStore: ObservableObject {
         cancel()
         prompt = ""
         reasoningByMessage.removeAll()
+        truncatedMessages.removeAll()
         reasoningCharCount = 0
         contextNotice = nil
         lastError = nil
@@ -398,6 +409,7 @@ final class ChatStore: ObservableObject {
         cancel()
         prompt = ""
         reasoningByMessage.removeAll()
+        truncatedMessages.removeAll()
         reasoningCharCount = 0
         contextNotice = nil
         lastError = nil
@@ -480,6 +492,7 @@ final class ChatStore: ObservableObject {
         reasoningCharCount = 0
         prompt = ""
         toolRoundsThisTurn = 0
+        continuationsThisTurn = 0
         messages.append(.user(trimmed))
         startGeneration()
     }
@@ -494,11 +507,13 @@ final class ChatStore: ObservableObject {
         // after the user turn, and regenerate should replay from the user prompt.
         while let last = messages.last, last.role == .assistant || last.role == .tool {
             reasoningByMessage.removeValue(forKey: last.id)
+            truncatedMessages.remove(last.id)
             messages.removeLast()
         }
         guard messages.last?.role == .user else { return }
         reasoningCharCount = 0
         toolRoundsThisTurn = 0
+        continuationsThisTurn = 0
         startGeneration()
     }
 
@@ -513,7 +528,20 @@ final class ChatStore: ObservableObject {
     /// latest user turn is already the last message; builds the budgeted request
     /// transcript, appends a streaming assistant placeholder, and drives the
     /// backend stream into it.
-    private func startGeneration() {
+    /// Request-only instruction (never persisted) that continues a response cut
+    /// off at the output-token limit. Adapted from the Claude Code harness's
+    /// max-tokens recovery message.
+    private static let resumeInstruction =
+        "Your previous response was cut off at the output-token limit. "
+        + "Continue exactly where you left off — no apology, no recap, no "
+        + "repetition of what you already wrote. Pick up mid-sentence if that "
+        + "is where the cut happened."
+
+    /// Drives one generation. When `continuationOf` is set, the run resumes a
+    /// truncated assistant turn: it streams into that existing message (rather
+    /// than a new bubble) and appends a request-only resume instruction so the
+    /// model picks up where it was cut off.
+    private func startGeneration(continuationOf continuationID: UUID? = nil) {
         let backend: any MotifChatBackend
         do {
             backend = try makeBackend()
@@ -556,8 +584,18 @@ final class ChatStore: ObservableObject {
                 requestMessages.insert(.system(preamble), at: 0)
             }
         }
-        messages.append(.assistant(""))
-        let assistantID = messages[messages.count - 1].id
+        let assistantID: UUID
+        if let continuationID {
+            // Resume: keep streaming into the truncated message; add the
+            // request-only resume instruction as the final turn so the model
+            // continues after it. Not persisted, so future turns stay clean.
+            requestMessages.append(.user(Self.resumeInstruction))
+            assistantID = continuationID
+            truncatedMessages.remove(continuationID)
+        } else {
+            messages.append(.assistant(""))
+            assistantID = messages[messages.count - 1].id
+        }
         isGenerating = true
 
         // Reset per-turn decode-metrics scratch.
@@ -600,7 +638,7 @@ final class ChatStore: ObservableObject {
                         case .reasoning(let reasoning):
                             self.reasoningByMessage[assistantID, default: ""] += reasoning
                             self.reasoningCharCount += reasoning.count
-                        case .completed(let usage):
+                        case .completed(let usage, let finishReason):
                             let now = Date()
                             let content = self.messages.first(where: { $0.id == assistantID })?.content ?? ""
                             let completion = usage?.completionTokens ?? motifEstimatedTokenCount(content)
@@ -614,6 +652,14 @@ final class ChatStore: ObservableObject {
                                 elapsed: now.timeIntervalSince(started),
                                 estimated: usage == nil
                             )
+                            // Record truncation so the UI can offer to continue
+                            // the turn. A prior truncation is cleared once the
+                            // model reaches a natural stop.
+                            if finishReason == .length {
+                                self.truncatedMessages.insert(assistantID)
+                            } else {
+                                self.truncatedMessages.remove(assistantID)
+                            }
                         }
                     }
                 }
@@ -672,6 +718,18 @@ final class ChatStore: ObservableObject {
                         self.messages.append(.assistant(
                             "_Stopped after \(Self.maxToolRounds) tool rounds without a final answer._"))
                     }
+                }
+                // Auto-continue a response cut off at the token limit — resume
+                // streaming into the same bubble with no user action (Claude
+                // Code harness-style recovery), bounded so it can't loop forever.
+                if self.truncatedMessages.contains(assistantID),
+                   self.lastError == nil,
+                   self.runtimeStatus != "Cancelled",
+                   self.continuationsThisTurn < Self.maxContinuations {
+                    self.continuationsThisTurn += 1
+                    self.runtimeStatus = "Continuing (\(self.continuationsThisTurn)/\(Self.maxContinuations))…"
+                    self.startGeneration(continuationOf: assistantID)
+                    return
                 }
                 if self.lastError == nil, self.runtimeStatus != "Cancelled" {
                     self.runtimeStatus = "Idle"
@@ -735,7 +793,7 @@ final class ChatStore: ObservableObject {
         model = "motif"
         nativeModelDirectory = ChatStore.defaultNativeModelDirectory
         thinkMode = .captured
-        maxTokens = 512
+        maxTokens = 4096
         temperature = 0.6
         contextTokenBudget = 12000
         toolsEnabled = false

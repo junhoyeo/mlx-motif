@@ -80,7 +80,7 @@ struct MotifNativeGenerateCommand {
                 fflush(stdout)
             case .reasoning(let reasoning):
                 FileHandle.standardError.write(Data("\n[reasoning]\n\(reasoning)\n".utf8))
-            case .completed(let usage):
+            case .completed(let usage, _):
                 print("")
                 // Surface the authoritative terminal token counts to stderr so
                 // the CLI matches the Python generate path's usage reporting;

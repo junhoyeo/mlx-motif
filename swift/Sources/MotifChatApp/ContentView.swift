@@ -579,6 +579,21 @@ private struct MessageBubble: View {
                 MetricsLine(metrics: m)
             }
 
+            // A truncated turn auto-resumes into this same bubble (no user
+            // action). If the flag still shows once generation is idle, the
+            // auto-continue budget was exhausted — surface a terminal note so
+            // the cut-off isn't silent.
+            if isAssistant && !isStreaming && store.truncatedMessages.contains(message.id) {
+                HStack(spacing: 6) {
+                    Image(systemName: "scissors")
+                        .foregroundStyle(.orange)
+                    Text("Still cut off after auto-continuing — raise Max tokens in Runtime")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+                .accessibilityIdentifier("motif.chat.truncated")
+            }
+
             // Per-message actions on assistant turns — always visible (no
             // hover reveal), never while the message is mid-stream.
             // Materials/plain controls only — no glass on message content.

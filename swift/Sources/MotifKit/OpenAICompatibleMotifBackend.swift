@@ -42,14 +42,14 @@ public struct OpenAICompatibleMotifBackend: MotifChatBackend {
                         guard line.hasPrefix("data:") else { continue }
                         let payload = line.dropFirst("data:".count).trimmingCharacters(in: .whitespaces)
                         if payload == "[DONE]" {
-                            continuation.yield(.completed(usage: nil))
+                            continuation.yield(.completed(usage: nil, finishReason: .unknown))
                             continuation.finish()
                             return
                         }
                         try emit(payload: payload, continuation: continuation)
                     }
 
-                    continuation.yield(.completed(usage: nil))
+                    continuation.yield(.completed(usage: nil, finishReason: .unknown))
                     continuation.finish()
                 } catch is CancellationError {
                     continuation.finish()
@@ -105,7 +105,10 @@ public struct OpenAICompatibleMotifBackend: MotifChatBackend {
         if let finishReason = firstChoice["finish_reason"] as? String,
            !finishReason.isEmpty,
            finishReason != "null" {
-            continuation.yield(.completed(usage: nil))
+            // OpenAI uses "length" for a max-tokens truncation; map the rest to
+            // a natural stop (tool_calls/stop/content_filter all end the turn).
+            let reason: MotifFinishReason = finishReason == "length" ? .length : .stop
+            continuation.yield(.completed(usage: nil, finishReason: reason))
         }
     }
 }

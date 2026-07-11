@@ -129,6 +129,12 @@ public struct MotifMLXChatInputProcessor: UserInputProcessor {
             .user(message.content)
         case .assistant:
             .assistant(message.content)
+        case .tool:
+            // MLXLMCommon's Chat.Message has no tool case; Motif's template has
+            // no native tool tokens either (prompt-based protocol), so a tool
+            // result is presented as a user turn. Content is self-describing
+            // ("Tool result (calculator): 1517").
+            .user(message.content)
         }
     }
 }

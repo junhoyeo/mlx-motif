@@ -95,6 +95,102 @@ enum MotifChatDemoTools {
     }
 
     static let names: Set<String> = MotifToolCalling.toolNames(from: tools) ?? []
+
+    /// Executes one of the two SAFE builtin demo tools. Errors are returned as
+    /// strings (never thrown) so they feed back to the model as a tool result
+    /// rather than crashing the turn. No eval/exec anywhere — the calculator is
+    /// a closed-form recursive-descent parser over numbers and + - * / ( ).
+    static func execute(_ call: MotifToolCalling.ParsedToolCall) -> String {
+        switch call.name {
+        case "get_current_time":
+            let fmt = DateFormatter()
+            fmt.dateFormat = "yyyy-MM-dd HH:mm:ss zzz"
+            return fmt.string(from: Date())
+        case "calculator":
+            guard let expr = call.arguments["expression"]?.anyValue as? String else {
+                return "error: missing 'expression' argument"
+            }
+            guard let value = SafeArithmetic.evaluate(expr) else {
+                return "error: invalid arithmetic expression"
+            }
+            // Render integers without a trailing .0 (37 * 41 -> 1517).
+            return value == value.rounded() && abs(value) < 1e15
+                ? String(Int64(value)) : String(value)
+        default:
+            return "error: unknown tool '\(call.name)'"
+        }
+    }
+}
+
+/// Minimal arithmetic evaluator for the calculator demo tool: numbers,
+/// + - * / and parentheses with unary minus. A hand-rolled recursive-descent
+/// parser (the Swift mirror of Python's AST-whitelisted `safe_arithmetic`) —
+/// deliberately NOT NSExpression, which can raise ObjC exceptions and evaluate
+/// more than arithmetic.
+enum SafeArithmetic {
+    static func evaluate(_ expression: String) -> Double? {
+        var parser = Parser(Array(expression.unicodeScalars))
+        guard let value = parser.parseExpression(), parser.atEnd, value.isFinite else {
+            return nil
+        }
+        return value
+    }
+
+    private struct Parser {
+        let chars: [Unicode.Scalar]
+        var pos = 0
+        init(_ chars: [Unicode.Scalar]) { self.chars = chars }
+
+        var atEnd: Bool {
+            var p = pos
+            while p < chars.count, chars[p] == " " { p += 1 }
+            return p == chars.count
+        }
+
+        mutating func skipSpaces() { while pos < chars.count, chars[pos] == " " { pos += 1 } }
+
+        mutating func parseExpression() -> Double? {
+            guard var lhs = parseTerm() else { return nil }
+            while true {
+                skipSpaces()
+                guard pos < chars.count, chars[pos] == "+" || chars[pos] == "-" else { return lhs }
+                let op = chars[pos]; pos += 1
+                guard let rhs = parseTerm() else { return nil }
+                lhs = op == "+" ? lhs + rhs : lhs - rhs
+            }
+        }
+
+        mutating func parseTerm() -> Double? {
+            guard var lhs = parseFactor() else { return nil }
+            while true {
+                skipSpaces()
+                guard pos < chars.count, chars[pos] == "*" || chars[pos] == "/" else { return lhs }
+                let op = chars[pos]; pos += 1
+                guard let rhs = parseFactor() else { return nil }
+                lhs = op == "*" ? lhs * rhs : lhs / rhs
+            }
+        }
+
+        mutating func parseFactor() -> Double? {
+            skipSpaces()
+            guard pos < chars.count else { return nil }
+            if chars[pos] == "-" { pos += 1; return parseFactor().map { -$0 } }
+            if chars[pos] == "(" {
+                pos += 1
+                guard let inner = parseExpression() else { return nil }
+                skipSpaces()
+                guard pos < chars.count, chars[pos] == ")" else { return nil }
+                pos += 1
+                return inner
+            }
+            var digits = ""
+            while pos < chars.count,
+                  chars[pos] == "." || (chars[pos].value >= 48 && chars[pos].value <= 57) {
+                digits.unicodeScalars.append(chars[pos]); pos += 1
+            }
+            return digits.isEmpty ? nil : Double(digits)
+        }
+    }
 }
 
 @MainActor
@@ -144,6 +240,11 @@ final class ChatStore: ObservableObject {
     @Published var metrics: [UUID: MessageMetrics] = [:]
     /// Parsed tool call per assistant message id, when the turn emitted one.
     @Published var toolCalls: [UUID: MotifToolCalling.ParsedToolCall] = [:]
+    /// Tool-execution rounds consumed by the CURRENT user turn (reset on every
+    /// send/regenerate). Bounds the execute→continue loop like Python's
+    /// run_tool_loop max_rounds so a looping model can't spin forever.
+    private var toolRoundsThisTurn = 0
+    private static let maxToolRounds = 3
     /// When enabled, the demo tools preamble is injected for each turn.
     @Published var toolsEnabled: Bool = ChatStore.storedBool(.toolsEnabled, defaultValue: false) {
         didSet { ChatStore.defaults.set(toolsEnabled, forKey: DefaultsKey.toolsEnabled.rawValue) }
@@ -369,6 +470,7 @@ final class ChatStore: ObservableObject {
 
         capturedReasoning = ""
         prompt = ""
+        toolRoundsThisTurn = 0
         messages.append(.user(trimmed))
         startGeneration()
     }
@@ -378,12 +480,15 @@ final class ChatStore: ObservableObject {
     /// or when there is no user message to replay.
     func regenerateLast() {
         guard !isGenerating else { return }
-        // Remove a trailing assistant message so the latest turn is the user's.
-        if let last = messages.last, last.role == .assistant {
+        // Remove trailing assistant/tool messages so the latest turn is the
+        // user's — a tool round leaves [assistant(call), tool, assistant(answer)]
+        // after the user turn, and regenerate should replay from the user prompt.
+        while let last = messages.last, last.role == .assistant || last.role == .tool {
             messages.removeLast()
         }
         guard messages.last?.role == .user else { return }
         capturedReasoning = ""
+        toolRoundsThisTurn = 0
         startGeneration()
     }
 
@@ -508,10 +613,24 @@ final class ChatStore: ObservableObject {
                 self.liveTokensPerSecond = 0
                 self.liveTokenEstimate = 0
                 // If this turn emitted a tool call, capture it so the transcript
-                // renders it as a card instead of raw JSON.
+                // renders it as a card instead of raw JSON — then EXECUTE the
+                // builtin, append the result as a tool turn, and continue
+                // generating so the model can answer with the result (bounded;
+                // mirrors Python's run_tool_loop).
                 let content = self.messages.first(where: { $0.id == assistantID })?.content ?? ""
                 if let call = MotifToolCalling.parseToolCall(text: content, toolNames: MotifChatDemoTools.names) {
                     self.toolCalls[assistantID] = call
+                    if self.toolsEnabled,
+                       self.lastError == nil,
+                       self.runtimeStatus != "Cancelled",
+                       self.toolRoundsThisTurn < Self.maxToolRounds {
+                        self.toolRoundsThisTurn += 1
+                        let result = MotifChatDemoTools.execute(call)
+                        self.messages.append(.tool("Tool result (\(call.name)): \(result)"))
+                        self.runtimeStatus = "Running tool round \(self.toolRoundsThisTurn)…"
+                        self.startGeneration()
+                        return
+                    }
                 }
                 if self.lastError == nil, self.runtimeStatus != "Cancelled" {
                     self.runtimeStatus = "Idle"

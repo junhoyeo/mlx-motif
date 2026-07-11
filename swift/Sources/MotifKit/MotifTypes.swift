@@ -4,6 +4,9 @@ public enum MotifRole: String, Codable, Sendable, CaseIterable {
     case system
     case user
     case assistant
+    /// A tool-execution result fed back into the conversation (prompt-based
+    /// tool calling; mirrors the Python `run_tool_loop`'s `tool` turns).
+    case tool
 }
 
 public struct MotifChatMessage: Identifiable, Codable, Equatable, Sendable {
@@ -27,6 +30,7 @@ public struct MotifChatMessage: Identifiable, Codable, Equatable, Sendable {
     public static func system(_ content: String) -> Self { .init(role: .system, content: content) }
     public static func user(_ content: String) -> Self { .init(role: .user, content: content) }
     public static func assistant(_ content: String) -> Self { .init(role: .assistant, content: content) }
+    public static func tool(_ content: String) -> Self { .init(role: .tool, content: content) }
 }
 
 public enum MotifThinkMode: String, Codable, Sendable, CaseIterable {

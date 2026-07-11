@@ -482,6 +482,18 @@ private struct MessageBubble: View {
 
             if let call = store.toolCalls[message.id] {
                 ToolCallCard(call: call)
+            } else if message.role == .tool {
+                // Executed-tool result feeding the next round — compact and
+                // distinct from prose so the loop is visible at a glance.
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.callout)
+                    Text(message.content)
+                        .font(.callout)
+                        .textSelection(.enabled)
+                }
+                .accessibilityIdentifier("motif.chat.toolresult")
             } else if isStreaming && message.content.contains("\"tool_call\"") {
                 HStack(spacing: 6) {
                     Image(systemName: "wrench.and.screwdriver.fill")

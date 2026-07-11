@@ -298,7 +298,9 @@ final class ChatStore: ObservableObject {
     private var continuationsThisTurn = 0
     private static let maxContinuations = 3
     /// When enabled, the demo tools preamble is injected for each turn.
-    @Published var toolsEnabled: Bool = ChatStore.storedBool(.toolsEnabled, defaultValue: false) {
+    @Published var toolsEnabled: Bool = ChatStore.uiTestArgumentValue("-UITestEnableTools") == "1"
+        ? true
+        : ChatStore.storedBool(.toolsEnabled, defaultValue: false) {
         didSet { ChatStore.defaults.set(toolsEnabled, forKey: DefaultsKey.toolsEnabled.rawValue) }
     }
     /// Recently-selected native checkpoint directories (most-recent first),
@@ -380,6 +382,35 @@ final class ChatStore: ObservableObject {
         }
         return suite
     }()
+
+    /// Diagnostic sink: when `MOTIF_UITEST_DEBUG_LOG` names a file, append a
+    /// timestamped line. Used to trace the live tool-loop from a UI-test run
+    /// (no-op in normal use). Best-effort; never throws into the turn.
+    nonisolated static func debugLog(_ line: @autoclosure () -> String) {
+        guard let path = ProcessInfo.processInfo.environment["MOTIF_UITEST_DEBUG_LOG"] else { return }
+        let stamp = ProcessInfo.processInfo.systemUptime
+        let entry = String(format: "[%.2f] %@\n", stamp, line())
+        if let data = entry.data(using: .utf8) {
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            } else {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+        }
+    }
+
+    /// Value of a `-Flag <value>` launch argument, or nil if absent. Used by the
+    /// UI-test hooks below to preset state that is otherwise only reachable via
+    /// pop-up menus / toggles — those interactions are unreliable when a foreign
+    /// app window holds macOS key focus (a SwiftUI Picker's NSMenu opens and then
+    /// instantly closes), so a live-model UI test presets the backend directly.
+    private static func uiTestArgumentValue(_ flag: String) -> String? {
+        let args = ProcessInfo.processInfo.arguments
+        guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
+        return args[i + 1]
+    }
     private static let defaultSystemPrompt = "You are Motif accessed through the configured local runtime. Be concise and helpful."
 
     var nativeMLXCompiledIn: Bool {
@@ -787,7 +818,17 @@ final class ChatStore: ObservableObject {
             parameters: MotifGenerationParameters(
                 model: model,
                 maxTokens: maxTokens,
-                temperature: temperature,
+                // Tool calling needs an EXACT `{"tool_call": ...}` JSON. With
+                // sampling on (temperature > 0) a small model intermittently
+                // rambles instead of emitting a clean call; that turn then never
+                // parses as a tool call, runs to the token budget, and the
+                // auto-continue loop compounds it into a multi-minute stall
+                // (observed: temp 0.6 on 2.6B → 400s+ with no result). Greedy
+                // decoding makes tool_call emission deterministic and fast, which
+                // is also what the Python reference `run_tool_loop` uses. Only
+                // the tool-active path is forced; normal chat keeps the user's
+                // temperature.
+                temperature: toolsEnabled ? 0 : temperature,
                 thinkMode: thinkMode
             ),
             contextTokenBudget: contextTokenBudget,
@@ -885,6 +926,12 @@ final class ChatStore: ObservableObject {
         liveTokensPerSecond = 0
         liveTokenEstimate = 0
         let promptEstimate = requestMessages.reduce(0) { $0 + motifEstimatedTokenCount($1.content) }
+        Self.debugLog(
+            "startGeneration continuation=\(continuationID != nil) msgs=\(requestMessages.count) "
+            + "roles=[\(requestMessages.map { $0.role.rawValue }.joined(separator: ","))] "
+            + "promptEst=\(promptEstimate) maxTokens=\(configuration.parameters.maxTokens) "
+            + "temp=\(configuration.parameters.temperature) think=\(configuration.parameters.thinkMode.rawValue) "
+            + "toolRounds=\(toolRoundsThisTurn) continuations=\(continuationsThisTurn)")
 
         let task = Task { [weak self] in
             guard let self else { return }
@@ -918,6 +965,10 @@ final class ChatStore: ObservableObject {
                             let now = Date()
                             let content = self.messages.first(where: { $0.id == assistantID })?.content ?? ""
                             let completion = usage?.completionTokens ?? motifEstimatedTokenCount(content)
+                            Self.debugLog(
+                                "completed finish=\(String(describing: finishReason)) "
+                                + "completionTokens=\(completion) contentLen=\(content.count) "
+                                + "contentTail=\(String(content.suffix(80)).replacingOccurrences(of: "\n", with: "\\n"))")
                             let decodeStart = self.genFirstTokenAt ?? started
                             let decodeElapsed = max(now.timeIntervalSince(decodeStart), 1e-6)
                             self.metrics[assistantID] = MessageMetrics(
@@ -1034,7 +1085,14 @@ final class ChatStore: ObservableObject {
                 // generating so the model can answer with the result (bounded;
                 // mirrors Python's run_tool_loop).
                 let content = self.messages.first(where: { $0.id == assistantID })?.content ?? ""
-                if let call = MotifToolCalling.parseToolCall(text: content, toolNames: MotifChatDemoTools.names) {
+                let parsedCall = MotifToolCalling.parseToolCall(text: content, toolNames: MotifChatDemoTools.names)
+                Self.debugLog(
+                    "settle outcome=\(String(describing: outcome)) contentLen=\(content.count) "
+                    + "truncated=\(self.truncatedMessages.contains(assistantID)) "
+                    + "toolParsed=\(parsedCall.map { $0.name } ?? "nil") "
+                    + "toolRounds=\(self.toolRoundsThisTurn)/\(Self.maxToolRounds) "
+                    + "continuations=\(self.continuationsThisTurn)/\(Self.maxContinuations)")
+                if let call = parsedCall {
                     self.toolCalls[assistantID] = call
                     let canExecute = configuration.toolsEnabled && outcome == .succeeded
                     if canExecute, self.toolRoundsThisTurn < Self.maxToolRounds {
@@ -1363,6 +1421,12 @@ final class ChatStore: ObservableObject {
     }
 
     private static func storedBackendMode() -> MotifChatBackendMode {
+        // UI-test hook: `-UITestBackendMode <raw>` forces the backend at launch so
+        // a test never has to drive the backend Picker's pop-up menu.
+        if let forced = uiTestArgumentValue("-UITestBackendMode"),
+           let mode = MotifChatBackendMode(rawValue: forced) {
+            return mode
+        }
         guard let rawValue = defaults.string(forKey: DefaultsKey.backendMode.rawValue) else {
             return .openAICompatible
         }

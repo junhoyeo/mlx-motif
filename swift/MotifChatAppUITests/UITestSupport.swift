@@ -10,6 +10,8 @@ enum A11y {
     static let send = "motif.chat.send"
     static let stop = "motif.chat.stop"
     static let generating = "motif.chat.generating"
+    static let tools = "motif.chat.tools"
+    static let toolResult = "motif.chat.toolresult"
     static let error = "motif.chat.error"
     static let bubbleAssistant = "motif.chat.bubble.assistant"
     static let messageText = "motif.chat.message.text"
@@ -27,6 +29,11 @@ enum LaunchFlag {
     static let fakeBackend = "-UITestFakeBackend"
     static let defaultsSuite = "-UITestDefaultsSuite"
     static let resetDefaults = "-UITestResetDefaults"
+    // Value flags: `-UITestBackendMode <MotifChatBackendMode raw>` forces the
+    // backend at launch; `-UITestEnableTools 1` enables the demo tools. Both let
+    // a test skip pop-up-menu / toggle interactions (see LiveToolRoundTripUITests).
+    static let backendMode = "-UITestBackendMode"
+    static let enableTools = "-UITestEnableTools"
 }
 
 @MainActor
@@ -44,7 +51,8 @@ extension XCUIApplication {
         fakeBackend: Bool = false,
         defaultsSuite: String? = nil,
         resetDefaults: Bool = false,
-        fakeConfig: [String: String] = [:]
+        fakeConfig: [String: String] = [:],
+        extraArguments: [String] = []
     ) -> XCUIApplication {
         var args: [String] = []
         if fakeBackend { args.append(LaunchFlag.fakeBackend) }
@@ -53,6 +61,7 @@ extension XCUIApplication {
             args.append(suite)
             if resetDefaults { args.append(LaunchFlag.resetDefaults) }
         }
+        args.append(contentsOf: extraArguments)
         launchArguments = args
         for (k, v) in fakeConfig { launchEnvironment[k] = v }
         launch()

@@ -72,6 +72,55 @@ targets:
         GENERATE_INFOPLIST_FILE: "YES"
         TEST_TARGET_NAME: MotifChatUIHost
 
+  # ---- Live-MLX host + UI test (opt-in) ----------------------------------
+  # A second app host compiled WITH MOTIFKIT_ENABLE_MLX so a UI test can drive
+  # the real native backend against a converted checkpoint end to end
+  # (model -> app -> tool execute -> model). Build/run only via the MotifChatMLX
+  # scheme, and only with the manifest env set so the package exposes MotifKitMLX:
+  #   MOTIFKIT_ENABLE_MLX=1 xcodebuild test -scheme MotifChatMLX ...
+  # (scripts/ui_test_swift_chat_app_mlx.sh wraps this.)
+  MotifChatMLXHost:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/MotifChatApp
+    dependencies:
+      - package: SwiftMotif
+        product: MotifKit
+      - package: SwiftMotif
+        product: MotifKitMLX
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.junho.motif.MotifChatMLXHost
+        GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_CFBundleDisplayName: Motif Chat (MLX)
+        INFOPLIST_KEY_LSUIElement: "NO"
+        ENABLE_HARDENED_RUNTIME: "NO"
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: MOTIFKIT_ENABLE_MLX
+    # NOTE: no metallib copy phase. mlx-swift's SwiftPM build already produces
+    # Contents/Resources/mlx-swift_Cmlx.bundle/Contents/Resources/default.metallib,
+    # which the runtime finds via load_swiftpm_library (SWIFTPM_BUNDLE lookup).
+    # Copying a loose mlx.metallib into Contents/MacOS/ (as scripts/
+    # build_mlx_swift_metallib.sh does for `swift run`) is both redundant here AND
+    # breaks the bundle code signature: codesign treats any non-Mach-O file
+    # directly under Contents/MacOS/ as an unsigned subcomponent and fails the
+    # whole .app with "code object is not signed at all". So the app relies on the
+    # Cmlx resource bundle instead.
+
+  MotifChatMLXUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: MotifChatMLXUITests
+      - path: MotifChatAppUITests/UITestSupport.swift
+    dependencies:
+      - target: MotifChatMLXHost
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.junho.motif.MotifChatMLXUITests
+        GENERATE_INFOPLIST_FILE: "YES"
+        TEST_TARGET_NAME: MotifChatMLXHost
+
 schemes:
   MotifChatApp:
     build:
@@ -85,3 +134,16 @@ schemes:
       gatherCoverageData: false
       targets:
         - MotifChatAppUITests
+
+  MotifChatMLX:
+    build:
+      targets:
+        MotifChatMLXHost: all
+        MotifChatMLXUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      gatherCoverageData: false
+      targets:
+        - MotifChatMLXUITests

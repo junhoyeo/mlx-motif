@@ -436,9 +436,42 @@ final class ChatInteractionPolicyTests: XCTestCase {
         let request = backend.request
         XCTAssertEqual(request?.parameters.model, "original-model")
         XCTAssertEqual(request?.parameters.maxTokens, 321)
-        XCTAssertEqual(request?.parameters.temperature, 0.25)
+        // Tools are enabled here, so the turn is forced to greedy decoding
+        // (temperature 0) for deterministic tool_call emission — see
+        // generationConfiguration(). This still proves the snapshot ignores the
+        // post-send mutation to 1.5; the value used is the send-time tool
+        // override, not the later edit. Greedy-with-tools is covered directly by
+        // testToolsEnabledForcesGreedyDecoding.
+        XCTAssertEqual(request?.parameters.temperature, 0.0)
         XCTAssertEqual(request?.parameters.thinkMode, .captured)
         XCTAssertTrue(request?.messages.first?.content.contains("get_current_time") == true)
+    }
+
+    /// Tool calling needs an exact `{"tool_call": ...}` JSON; sampling makes a
+    /// small model intermittently ramble instead of emitting a clean call, which
+    /// then runs to the token budget and stalls the loop. The turn config forces
+    /// greedy decoding whenever tools are active, while normal chat keeps the
+    /// user's temperature.
+    @MainActor
+    func testToolsEnabledForcesGreedyDecoding() async {
+        let backend = RecordingBackend()
+        let store = ChatStore(backendOverride: backend, loadsPersistedConversations: false)
+        store.temperature = 0.6
+        store.toolsEnabled = true
+        store.prompt = "Hello"
+        store.send()
+        await waitUntil { backend.request != nil && !store.isGenerating }
+        XCTAssertEqual(backend.request?.parameters.temperature, 0.0)
+
+        // With tools OFF the user's temperature is preserved.
+        let backend2 = RecordingBackend()
+        let store2 = ChatStore(backendOverride: backend2, loadsPersistedConversations: false)
+        store2.temperature = 0.6
+        store2.toolsEnabled = false
+        store2.prompt = "Hello"
+        store2.send()
+        await waitUntil { backend2.request != nil && !store2.isGenerating }
+        XCTAssertEqual(backend2.request?.parameters.temperature, 0.6)
     }
 
     @MainActor

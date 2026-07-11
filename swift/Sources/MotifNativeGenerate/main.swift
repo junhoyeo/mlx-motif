@@ -22,6 +22,11 @@ struct MotifNativeGenerateCommand {
         }
         let modelDirectory = URL(fileURLWithPath: arguments[modelIndex + 1])
         let prompt = value(after: "--prompt", in: arguments) ?? "Hello"
+        // Optional leading system turn, so a probe can reproduce the app's exact
+        // request shape ([.system(sysprompt+preamble), .user(question)]).
+        let systemMessage = value(after: "--system", in: arguments)
+        let requestMessages: [MotifChatMessage] =
+            (systemMessage.map { [MotifChatMessage.system($0)] } ?? []) + [.user(prompt)]
         let maxTokens = Int(value(after: "--max-tokens", in: arguments) ?? "128") ?? 128
         let temperature = Double(value(after: "--temperature", in: arguments) ?? "0") ?? 0
         let thinkMode = MotifThinkMode(rawValue: value(after: "--think-mode", in: arguments) ?? "hidden") ?? .hidden
@@ -66,7 +71,7 @@ struct MotifNativeGenerateCommand {
 
         let backend = try MotifMLXBackend(modelDirectory: modelDirectory)
         let stream = backend.streamResponse(
-            messages: [.user(prompt)],
+            messages: requestMessages,
             parameters: MotifGenerationParameters(
                 maxTokens: maxTokens,
                 temperature: temperature,

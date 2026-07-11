@@ -21,7 +21,10 @@ struct MarkdownMessageView: View {
         }
       }
     }
-    .frame(maxWidth: .infinity, alignment: .leading)
+    // Left-align blocks via the stack's alignment guide, but let the content hug
+    // its natural width (up to the enclosing bubble's max-width cap) rather than
+    // greedily filling — otherwise every bubble stretches to the cap regardless
+    // of how little it contains. (vstack skill.)
   }
 }
 
@@ -83,7 +86,6 @@ private struct ProseView: View {
         }
       }
     }
-    .frame(maxWidth: .infinity, alignment: .leading)
   }
 
   /// One line with inline markdown (bold/italic/inline-code) applied.
@@ -95,7 +97,7 @@ private struct ProseView: View {
     )) ?? AttributedString(line)
     Text(attributed)
       .textSelection(.enabled)
-      .frame(maxWidth: .infinity, alignment: .leading)
+      .fixedSize(horizontal: false, vertical: true)
   }
 }
 
@@ -132,7 +134,9 @@ private struct CodeBlockView: View {
 
       ScrollView(.horizontal, showsIndicators: false) {
         Text(code)
-          .font(.system(.body, design: .monospaced))
+          // One step below body — code blocks read better slightly smaller
+          // than prose (mono stays: this is literal code content).
+          .font(.system(.callout, design: .monospaced))
           .textSelection(.enabled)
           .padding(10)
           .frame(maxWidth: .infinity, alignment: .leading)

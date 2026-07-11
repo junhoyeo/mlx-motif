@@ -22,9 +22,12 @@ extension View {
   func motifGlassSurface(cornerRadius: CGFloat = 22) -> some View {
     #if compiler(>=6.2)
     if #available(macOS 26.0, *) {
-      // `.clear` (high transparency) reads better than `.regular` over a dark,
-      // bold backdrop — per Apple's guidance for bright/dark content.
-      self.glassEffect(.clear, in: .rect(cornerRadius: cornerRadius))
+      // `.regular` (frosted) — the input bar is a standard control that floats
+      // over the *scrolling transcript*, so it must stay legible: `.clear` let
+      // the text behind bleed through and collide with the field's placeholder.
+      // Per the Liquid Glass guidance, `.clear` is for controls over media;
+      // `.regular` is the variant for toolbars/nav bars/standard controls.
+      self.glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
     } else {
       self.background(
         .regularMaterial,
@@ -70,6 +73,32 @@ extension View {
     }
     #else
     self.background(.bar)
+    #endif
+  }
+
+  /// Scroll-edge effect (macOS 26): as transcript content scrolls beneath the
+  /// window toolbar and the floating input bar, the system fades/blurs it at the
+  /// edges so the glass chrome stays legible and content doesn't hard-clip
+  /// against it. Per the HIG (Toolbars → "use a ScrollEdgeEffectStyle … to
+  /// distinguish the toolbar area from the content area") and the
+  /// `scrollEdgeEffectStyle(_:for:)` API. `.soft` is a gradual blur transition;
+  /// no-op fallback on older toolchains/OSes.
+  @ViewBuilder
+  func motifScrollEdgeSoft() -> some View {
+    #if compiler(>=6.2)
+    if #available(macOS 26.0, *) {
+      // `.hard` at the top gives a firm blur cutoff so transcript content is
+      // masked where it meets the toolbar (a `.soft` gradient let sharp text
+      // bleed through above the header). `.soft` at the bottom keeps a gentle
+      // fade into the floating input bar.
+      self
+        .scrollEdgeEffectStyle(.hard, for: .top)
+        .scrollEdgeEffectStyle(.soft, for: .bottom)
+    } else {
+      self
+    }
+    #else
+    self
     #endif
   }
 

@@ -103,6 +103,8 @@ private struct SidebarView: View {
                             .labelStyle(.iconOnly)
                     }
                     .buttonStyle(.borderless)
+                    // Keep the + off the sidebar's right edge.
+                    .padding(.trailing, 8)
                 }
             }
         }
@@ -148,76 +150,134 @@ private struct ChatView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            ChatHeaderBar(store: store, showingImporter: $showingModelDirImporter)
-            chatSurface
-        }
-        .navigationTitle("Motif Chat")
-        .fileImporter(
-            isPresented: $showingModelDirImporter,
-            allowedContentTypes: [.folder],
-            allowsMultipleSelection: false
-        ) { result in
-            switch result {
-            case .success(let urls):
-                guard let url = urls.first else { return }
-                let scoped = url.startAccessingSecurityScopedResource()
-                defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-                store.selectNativeModelDirectory(url)
-            case .failure(let error):
-                store.lastError = error.localizedDescription
+        chatSurface
+            .navigationTitle("Motif Chat")
+            // The backend selector + live readout live in the unified window
+            // toolbar (one top bar) instead of a second header row below it —
+            // otherwise the visible window toolbar reserves an empty strip above
+            // a separate header bar, which reads as stray top padding.
+            .toolbar {
+                // The backend/model selector identifies *what you're talking to*
+                // — the view's context — so per the HIG (Toolbars) it leads,
+                // like Xcode's scheme selector, rather than sitting centered.
+                ToolbarItem(placement: .navigation) {
+                    BackendMenu(store: store, showingImporter: $showingModelDirImporter)
+                }
+                ToolbarItemGroup(placement: .primaryAction) {
+                    if store.isGenerating {
+                        HStack(spacing: 5) {
+                            Image(systemName: "bolt.fill").font(.caption2).foregroundStyle(.yellow)
+                            Text("\(store.liveTokensPerSecond, specifier: "%.0f") tok/s · \(store.liveTokenEstimate) tok")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .accessibilityIdentifier("motif.chat.tokrate")
+                    }
+                    ContextMeter(store: store)
+                }
+            }
+            // Give the unified toolbar a visible (glass on macOS 26) background so
+            // transcript content scrolling up behind it is masked, not bleeding
+            // through as raw text above the header controls.
+            .toolbarBackground(.visible, for: .windowToolbar)
+            .fileImporter(
+                isPresented: $showingModelDirImporter,
+                allowedContentTypes: [.folder],
+                allowsMultipleSelection: false
+            ) { result in
+                switch result {
+                case .success(let urls):
+                    guard let url = urls.first else { return }
+                    let scoped = url.startAccessingSecurityScopedResource()
+                    defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+                    store.selectNativeModelDirectory(url)
+                case .failure(let error):
+                    store.lastError = error.localizedDescription
+                }
+            }
+    }
+
+    // Stable id for an invisible element pinned to the very bottom of the
+    // transcript. Scrolling to it (rather than to the last message) keeps the
+    // view pinned even as trailing content — a streaming message or the captured
+    // reasoning disclosure — grows.
+    private static let bottomAnchor = "motif.chat.bottomAnchor"
+
+    private var chatSurface: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                if visibleMessages.isEmpty {
+                    EmptyChatState(store: store)
+                        .frame(maxWidth: .infinity, minHeight: 420)
+                } else {
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        ForEach(visibleMessages) { message in
+                            MessageBubble(
+                                store: store,
+                                message: message,
+                                isStreaming: store.isGenerating
+                                    && message.id == visibleMessages.last?.id
+                                    && message.role == .assistant,
+                                isLast: message.id == visibleMessages.last?.id
+                            )
+                            .id(message.id)
+                        }
+
+                        if !store.capturedReasoning.isEmpty {
+                            ReasoningDisclosure(text: store.capturedReasoning)
+                        }
+
+                        // Bottom scroll target. The input bar's height is handled
+                        // by `.safeAreaInset` below, so no magic bottom padding is
+                        // needed here — content is measured, never guessed.
+                        Color.clear
+                            .frame(height: 1)
+                            .id(Self.bottomAnchor)
+                    }
+                    .padding(20)
+                }
+            }
+            // Let the behind-window vibrancy show through the transcript.
+            .scrollContentBackground(.hidden)
+            // Start pinned to the newest message (scrollview skill: Controlling
+            // Scroll Position).
+            .defaultScrollAnchor(.bottom)
+            // Fade transcript content cleanly under the toolbar / input bar glass
+            // (Liquid Glass: scrollEdgeEffectStyle).
+            .motifScrollEdgeSoft()
+            // Follow the transcript to the bottom both when a new message is
+            // appended AND while a single assistant message streams token by
+            // token — `liveTokenEstimate` ticks on every decoded token, so the
+            // view tracks the growing text instead of only reacting to the
+            // messages array changing.
+            .onChange(of: store.messages) { _, _ in
+                scrollToBottom(proxy, animated: true)
+            }
+            .onChange(of: store.liveTokenEstimate) { _, _ in
+                scrollToBottom(proxy, animated: false)
+            }
+            // The input bar is a real bottom inset of the scroll view: content is
+            // inset by the bar's measured height (never hidden under it), yet the
+            // scroll content still passes *behind* the floating glass bar so the
+            // Liquid Glass has live, scrolling content to refract.
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                InputBar(store: store)
             }
         }
     }
 
-    private var chatSurface: some View {
-        ZStack(alignment: .bottom) {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    if visibleMessages.isEmpty {
-                        EmptyChatState(store: store)
-                            .frame(maxWidth: .infinity, minHeight: 420)
-                    } else {
-                        LazyVStack(alignment: .leading, spacing: 16) {
-                            ForEach(visibleMessages) { message in
-                                MessageBubble(
-                                    store: store,
-                                    message: message,
-                                    isStreaming: store.isGenerating
-                                        && message.id == visibleMessages.last?.id
-                                        && message.role == .assistant,
-                                    isLast: message.id == visibleMessages.last?.id
-                                )
-                                .id(message.id)
-                            }
-
-                            if !store.capturedReasoning.isEmpty {
-                                ReasoningDisclosure(text: store.capturedReasoning)
-                            }
-                        }
-                        .padding(20)
-                        // leave room so the floating glass input bar doesn't cover
-                        // the last message.
-                        .padding(.bottom, 96)
-                    }
-                }
-                // Let the behind-window vibrancy show through the transcript.
-                .scrollContentBackground(.hidden)
-                .onChange(of: store.messages) { _, messages in
-                    if let last = messages.last {
-                        withAnimation(.easeOut(duration: 0.2)) {
-                            proxy.scrollTo(last.id, anchor: .bottom)
-                        }
-                    }
-                }
+    /// Pin the transcript to its bottom anchor. Animated for discrete message
+    /// changes; unanimated while streaming so rapid per-token updates don't stack
+    /// competing animations (which reads as jitter).
+    private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
+        guard !visibleMessages.isEmpty else { return }
+        if animated {
+            withAnimation(.easeOut(duration: 0.18)) {
+                proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
             }
-
-            // The input bar floats over the transcript so the Liquid Glass has
-            // real (scrolling, tinted) content behind it to refract — glass over
-            // a flat solid color is nearly invisible by design.
-            InputBar(store: store)
+        } else {
+            proxy.scrollTo(Self.bottomAnchor, anchor: .bottom)
         }
-        .navigationTitle("Motif Chat")
     }
 }
 
@@ -274,7 +334,7 @@ private struct ReasoningDisclosure: View {
     var body: some View {
         DisclosureGroup {
             Text(text)
-                .font(.system(.body, design: .monospaced))
+                .font(.body)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 6)
@@ -323,41 +383,48 @@ private struct InputBar: View {
                     .foregroundStyle(.red)
             }
 
-            HStack(alignment: .bottom, spacing: 8) {
-                ThinkModeMenu(store: store)
-                ToolsToggle(store: store)
-
+            // Claude-style layout: the text field spans the full bar width, and
+            // the controls live in a row UNDER it — mode icons on the left,
+            // send/stop on the right — instead of crowding the field inline.
+            VStack(alignment: .leading, spacing: 10) {
                 TextField("Ask Motif…", text: $store.prompt, axis: .vertical)
                     .textFieldStyle(.plain)
-                    .lineLimit(2...8)
+                    .lineLimit(1...8)
                     .onSubmit { store.send() }
                     .accessibilityLabel("Message Motif")
                     .accessibilityIdentifier("motif.chat.input")
 
-                if store.isGenerating {
-                    Button(role: .cancel, action: store.cancel) {
-                        Label("Stop", systemImage: "stop.fill").labelStyle(.iconOnly)
+                HStack(spacing: 14) {
+                    ThinkModeMenu(store: store)
+                    ToolsToggle(store: store)
+
+                    Spacer()
+
+                    if store.isGenerating {
+                        Button(role: .cancel, action: store.cancel) {
+                            Label("Stop", systemImage: "stop.fill").labelStyle(.iconOnly)
+                        }
+                        .motifGlassButton()
+                        .tint(.red)
+                        .keyboardShortcut(".", modifiers: [.command])
+                        .accessibilityIdentifier("motif.chat.stop")
+                    } else {
+                        Button(action: store.send) {
+                            Label("Send", systemImage: "arrow.up").labelStyle(.iconOnly)
+                        }
+                        .motifGlassButton()
+                        .tint(.accentColor)
+                        .keyboardShortcut(.return, modifiers: [.command])
+                        .disabled(store.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .accessibilityIdentifier("motif.chat.send")
                     }
-                    .motifGlassButton()
-                    .tint(.red)
-                    .keyboardShortcut(".", modifiers: [.command])
-                    .accessibilityIdentifier("motif.chat.stop")
-                } else {
-                    Button(action: store.send) {
-                        Label("Send", systemImage: "arrow.up").labelStyle(.iconOnly)
-                    }
-                    .motifGlassButton()
-                    .tint(.accentColor)
-                    .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(store.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    .accessibilityIdentifier("motif.chat.send")
                 }
             }
             // Floating glass chrome (Part 5) — the input bar is container chrome,
             // not content. Inset padding + a rounded surface let the glass read
             // as a distinct floating bar over the scrolling transcript behind it.
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
             .motifGlassSurface(cornerRadius: 22)
             .motifGlassGroup()
         }
@@ -380,74 +447,79 @@ private struct MessageBubble: View {
     private var isAssistant: Bool { message.role == .assistant }
 
     var body: some View {
-        HStack(alignment: .top) {
-            if isUser { Spacer(minLength: 80) }
-
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 6) {
-                    Text(message.role.rawValue.capitalized)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    if isHovering {
-                        Button {
-                            copyToPasteboard(message.content)
-                            didCopy = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { didCopy = false }
-                        } label: {
-                            Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
-                                .font(.caption2)
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Copy message")
+        // ONE alignment mechanism (hstack/vstack + ui-patterns skills): the
+        // bubble hugs its content up to a consistent max width, then a single
+        // trailing `.frame(maxWidth: .infinity, alignment:)` positions it on the
+        // correct side of the transcript — no HStack+Spacer *and* outer frame
+        // fighting each other.
+        VStack(alignment: bubbleAlignment, spacing: 6) {
+            HStack(spacing: 6) {
+                Text(message.role.rawValue.capitalized)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if isHovering {
+                    Button {
+                        copyToPasteboard(message.content)
+                        didCopy = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { didCopy = false }
+                    } label: {
+                        Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                            .font(.caption2)
                     }
-                }
-
-                if let call = store.toolCalls[message.id] {
-                    ToolCallCard(call: call)
-                } else if isStreaming && message.content.contains("\"tool_call\"") {
-                    HStack(spacing: 6) {
-                        Image(systemName: "wrench.and.screwdriver.fill")
-                            .foregroundStyle(.orange)
-                        Text("calling a tool…")
-                            .foregroundStyle(.secondary)
-                    }
-                    .font(.callout)
-                } else if message.content.isEmpty && !isStreaming {
-                    Text("…")
-                        .foregroundStyle(.secondary)
-                } else {
-                    HStack(alignment: .bottom, spacing: 4) {
-                        if isStreaming {
-                            StreamingCaret()
-                        }
-                        MarkdownMessageView(content: message.content)
-                    }
-                }
-
-                // Dev-tool decode metrics under finished assistant turns.
-                if isAssistant, let m = store.metrics[message.id] {
-                    MetricsLine(metrics: m)
-                }
-
-                // Per-message actions on assistant turns. Revealed on hover (kept
-                // mounted but hidden so layout doesn't jump) and never while the
-                // message is mid-stream. Materials/plain controls only — no glass
-                // on message content.
-                if isAssistant && !isStreaming {
-                    actionsRow
-                        .opacity(isHovering ? 1 : 0)
-                        .allowsHitTesting(isHovering)
+                    .buttonStyle(.borderless)
+                    .help("Copy message")
                 }
             }
-            .padding(12)
-            .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-            .frame(maxWidth: 680, alignment: isUser ? .trailing : .leading)
 
-            if message.role == .assistant { Spacer(minLength: 80) }
+            if let call = store.toolCalls[message.id] {
+                ToolCallCard(call: call)
+            } else if isStreaming && message.content.contains("\"tool_call\"") {
+                HStack(spacing: 6) {
+                    Image(systemName: "wrench.and.screwdriver.fill")
+                        .foregroundStyle(.orange)
+                    Text("calling a tool…")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.callout)
+            } else if message.content.isEmpty && !isStreaming {
+                Text("…")
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(alignment: .bottom, spacing: 4) {
+                    if isStreaming {
+                        StreamingCaret()
+                    }
+                    MarkdownMessageView(content: message.content)
+                }
+            }
+
+            // Dev-tool decode metrics under finished assistant turns.
+            if isAssistant, let m = store.metrics[message.id] {
+                MetricsLine(metrics: m)
+            }
+
+            // Per-message actions on assistant turns. Revealed on hover (kept
+            // mounted but hidden so layout doesn't jump) and never while the
+            // message is mid-stream. Materials/plain controls only — no glass
+            // on message content.
+            if isAssistant && !isStreaming {
+                actionsRow
+                    .opacity(isHovering ? 1 : 0)
+                    .allowsHitTesting(isHovering)
+            }
         }
+        .padding(12)
+        .background(bubbleBackground, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        // Consistent max bubble width; the bubble hugs shorter content.
+        .frame(maxWidth: 680, alignment: isUser ? .trailing : .leading)
+        // Single alignment step: push the bubble to its side of the transcript.
         .frame(maxWidth: .infinity, alignment: isUser ? .trailing : .leading)
         .onHover { isHovering = $0 }
     }
+
+    /// Content alignment inside the bubble: user turns hang from the trailing
+    /// edge, assistant turns from the leading edge.
+    private var bubbleAlignment: HorizontalAlignment { isUser ? .trailing : .leading }
 
     private var actionsRow: some View {
         HStack(spacing: 12) {
@@ -650,7 +722,7 @@ private struct RuntimeView: View {
 /// Header above the transcript: backend/model selector on the left (dev-tool —
 /// which model you're talking to is never hidden), live decode readout and the
 /// context meter on the right.
-private struct ChatHeaderBar: View {
+private struct BackendMenu: View {
     @ObservedObject var store: ChatStore
     @Binding var showingImporter: Bool
 
@@ -679,7 +751,7 @@ private struct ChatHeaderBar: View {
                     Section("Checkpoint") {
                         ForEach(store.discoveredModelDirectories, id: \.self) { dir in
                             Button {
-                                store.nativeModelDirectory = dir
+                                store.selectNativeModelDirectoryPath(dir)
                             } label: {
                                 Label(
                                     (dir as NSString).lastPathComponent,
@@ -705,30 +777,40 @@ private struct ChatHeaderBar: View {
                     }
                     Image(systemName: "chevron.down").font(.caption2).foregroundStyle(.secondary)
                 }
+                // Breathing room inside the toolbar's auto glass pill — without
+                // this the label sits flush against the capsule edge.
+                .padding(.horizontal, 16)
+                .padding(.vertical, 5)
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .fixedSize()
             .accessibilityIdentifier("motif.chat.model")
 
-            Spacer()
-
-            if store.isGenerating {
-                HStack(spacing: 5) {
-                    Image(systemName: "bolt.fill").font(.caption2).foregroundStyle(.yellow)
-                    Text("\(store.liveTokensPerSecond, specifier: "%.0f") tok/s · \(store.liveTokenEstimate) tok")
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.secondary)
+            // Endpoint mode edits its host + model id inline in the header — the
+            // active target is a dev-tool detail that shouldn't require opening
+            // the Runtime panel.
+            if store.backendMode == .openAICompatible {
+                HStack(spacing: 6) {
+                    Image(systemName: "network").font(.caption2).foregroundStyle(.secondary)
+                    TextField("endpoint", text: $store.endpoint)
+                        .textFieldStyle(.plain)
+                        .font(.caption)
+                        .frame(minWidth: 150, maxWidth: 240)
+                        .accessibilityIdentifier("motif.chat.endpoint")
+                    Divider().frame(height: 12)
+                    TextField("model", text: $store.model)
+                        .textFieldStyle(.plain)
+                        .font(.caption)
+                        .frame(minWidth: 60, maxWidth: 120)
+                        .accessibilityIdentifier("motif.chat.modelid")
                 }
-                .accessibilityIdentifier("motif.chat.tokrate")
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.quaternary.opacity(0.5), in: Capsule())
             }
 
-            ContextMeter(store: store)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial)
-        .overlay(alignment: .bottom) { Divider() }
     }
 }
 
@@ -760,9 +842,13 @@ private struct ContextMeter: View {
                 .frame(width: 56)
                 .tint(amber ? .orange : .accentColor)
             Text("\(compact(store.currentContextTokens)) / \(compact(store.contextTokenBudget))")
-                .font(.system(.caption2, design: .monospaced))
+                .font(.caption2)
                 .foregroundStyle(amber ? .orange : .secondary)
         }
+        // Breathing room inside the toolbar's auto glass pill (matches the
+        // model-selector pill).
+        .padding(.horizontal, 16)
+        .padding(.vertical, 5)
         .help("Context usage (estimated tokens) vs budget")
         .accessibilityIdentifier("motif.chat.context")
     }
@@ -826,7 +912,7 @@ private struct MetricsLine: View {
                 Text("(est.)").foregroundStyle(.tertiary)
             }
         }
-        .font(.system(.caption2, design: .monospaced))
+        .font(.caption2)
         .foregroundStyle(.secondary)
         .accessibilityIdentifier("motif.chat.metrics")
     }
@@ -842,19 +928,19 @@ private struct ToolCallCard: View {
             HStack(spacing: 6) {
                 Image(systemName: "wrench.and.screwdriver.fill").foregroundStyle(.orange)
                 Text("Tool call").font(.caption).foregroundStyle(.secondary)
-                Text(call.name).font(.system(.callout, design: .monospaced)).fontWeight(.semibold)
+                Text(call.name).font(.callout).fontWeight(.semibold)
             }
             ForEach(call.arguments.keys.sorted(), id: \.self) { key in
                 HStack(alignment: .top, spacing: 6) {
                     Text(key + ":")
-                        .font(.system(.caption, design: .monospaced)).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(.secondary)
                     Text(displayValue(call.arguments[key]))
                         .font(.system(.caption, design: .monospaced)).textSelection(.enabled)
                 }
             }
             DisclosureGroup(isExpanded: $showRaw) {
                 Text(rawJSON)
-                    .font(.system(.caption2, design: .monospaced))
+                    .font(.caption2)
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.top, 4)

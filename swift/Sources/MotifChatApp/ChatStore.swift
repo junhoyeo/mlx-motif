@@ -148,6 +148,14 @@ final class ChatStore: ObservableObject {
     @Published var toolsEnabled: Bool = ChatStore.storedBool(.toolsEnabled, defaultValue: false) {
         didSet { ChatStore.defaults.set(toolsEnabled, forKey: DefaultsKey.toolsEnabled.rawValue) }
     }
+    /// Recently-selected native checkpoint directories (most-recent first),
+    /// persisted so a folder picked via the header stays in the quick list even
+    /// when it lives outside ~/.models. Seeded from ~/.models on first launch.
+    @Published var recentNativeModelDirectories: [String] = ChatStore.storedRecentNativeModelDirectories() {
+        didSet {
+            ChatStore.defaults.set(recentNativeModelDirectories, forKey: DefaultsKey.recentNativeModelDirectories.rawValue)
+        }
+    }
     /// Live decode readout while a turn streams (updated as text arrives).
     @Published var liveTokensPerSecond: Double = 0
     @Published var liveTokenEstimate: Int = 0
@@ -188,23 +196,45 @@ final class ChatStore: ObservableObject {
         return Double(currentContextTokens) / Double(contextTokenBudget)
     }
 
-    /// Checkpoint directories under ~/.models (folders containing config.json),
-    /// plus the current selection — seeds the header's native-model picker.
+    /// Quick-pick checkpoint directories for the header's native-model menu:
+    /// the current selection first, then the persisted recently-used list, then
+    /// any ~/.models folders that contain a config.json (deduped, order-stable).
     var discoveredModelDirectories: [String] {
+        var seen = Set<String>()
         var dirs: [String] = []
+        func add(_ path: String) {
+            let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seen.insert(trimmed).inserted else { return }
+            dirs.append(trimmed)
+        }
+
+        add(nativeModelDirectory)
+        for recent in recentNativeModelDirectories { add(recent) }
+        for path in Self.modelsDirectoryCheckpoints() { add(path) }
+        return dirs
+    }
+
+    /// Folders under ~/.models that contain a config.json (a converted checkpoint).
+    private static func modelsDirectoryCheckpoints() -> [String] {
         let fm = FileManager.default
         let root = fm.homeDirectoryForCurrentUser.appendingPathComponent(".models")
-        if let entries = try? fm.contentsOfDirectory(
+        guard let entries = try? fm.contentsOfDirectory(
             at: root, includingPropertiesForKeys: [.isDirectoryKey]
-        ) {
-            for url in entries.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
-            where fm.fileExists(atPath: url.appendingPathComponent("config.json").path) {
-                dirs.append(url.path)
-            }
-        }
-        let current = nativeModelDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !current.isEmpty, !dirs.contains(current) { dirs.insert(current, at: 0) }
-        return dirs
+        ) else { return [] }
+        return entries
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .filter { fm.fileExists(atPath: $0.appendingPathComponent("config.json").path) }
+            .map(\.path)
+    }
+
+    /// Records a directory at the head of the recently-used list (deduped, capped).
+    private func rememberNativeModelDirectory(_ path: String) {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        var updated = recentNativeModelDirectories.filter { $0 != trimmed }
+        updated.insert(trimmed, at: 0)
+        if updated.count > 8 { updated = Array(updated.prefix(8)) }
+        recentNativeModelDirectories = updated
     }
 
     /// Short label for the active backend, shown in the header selector.
@@ -492,9 +522,20 @@ final class ChatStore: ObservableObject {
 
     func selectNativeModelDirectory(_ url: URL) {
         nativeModelDirectory = url.path
+        rememberNativeModelDirectory(url.path)
         persistSecurityScopedBookmark(for: url)
         backendMode = .nativeMLX
         runtimeStatus = "Native checkpoint selected"
+        lastError = nil
+    }
+
+    /// Selects an already-known checkpoint path (from the header's quick list),
+    /// promoting it in the recently-used list. No file picker / bookmark here —
+    /// ~/.models entries are readable without a scoped bookmark in dev builds.
+    func selectNativeModelDirectoryPath(_ path: String) {
+        nativeModelDirectory = path
+        rememberNativeModelDirectory(path)
+        backendMode = .nativeMLX
         lastError = nil
     }
 
@@ -538,6 +579,7 @@ final class ChatStore: ObservableObject {
         temperature = 0.6
         contextTokenBudget = 12000
         toolsEnabled = false
+        recentNativeModelDirectories = Self.modelsDirectoryCheckpoints()
         runtimeStatus = "Settings reset"
         lastError = nil
     }
@@ -699,6 +741,15 @@ final class ChatStore: ObservableObject {
         storedString(.nativeModelDirectory, defaultValue: defaultNativeModelDirectory)
     }
 
+    /// Loads the persisted recently-used list, seeding it from ~/.models on first
+    /// launch so the quick list is populated before any manual selection.
+    private static func storedRecentNativeModelDirectories() -> [String] {
+        if let stored = defaults.stringArray(forKey: DefaultsKey.recentNativeModelDirectories.rawValue) {
+            return stored
+        }
+        return modelsDirectoryCheckpoints()
+    }
+
     private static func storedString(_ key: DefaultsKey, defaultValue: String) -> String {
         defaults.string(forKey: key.rawValue) ?? defaultValue
     }
@@ -730,6 +781,7 @@ private enum DefaultsKey: String, CaseIterable {
     case temperature = "motif.chat.temperature"
     case contextTokenBudget = "motif.chat.contextTokenBudget"
     case toolsEnabled = "motif.chat.toolsEnabled"
+    case recentNativeModelDirectories = "motif.chat.recentNativeModelDirectories"
     case conversations = "motif.chat.conversations"
 }
 

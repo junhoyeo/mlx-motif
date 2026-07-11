@@ -191,7 +191,20 @@ public final class MotifMLXAttentionScaffold: Module {
     /// never treats the cache as a model parameter.
     private final class LambdaScalarCache {
         var fp32: MLXArray?
+        // Memoized downcast of the fp32 lambda to the activation dtype, so the
+        // per-token `base.asType(dtype)` (fp32 -> fp16) is materialized once
+        // instead of re-inserted into the graph every layer every decoded token
+        // (mirrors Python `_lambda_full`'s per-dtype memoization). Frozen at
+        // inference, same validity contract as `fp32`.
+        var casted: (dtype: DType, value: MLXArray)?
     }
+    // Memoized downcast of the SubLN weight to the activation dtype (Finding 3):
+    // avoids a per-token `.asType` graph node in `forwardVanilla`. A no-op cast
+    // when the weight already matches, but the guard removes even that node.
+    private final class WeightCastCache {
+        var casted: (dtype: DType, value: MLXArray)?
+    }
+    private let sublnWeightCache = WeightCastCache()
 
     private let lambdaScalarCache = LambdaScalarCache()
 
@@ -207,7 +220,26 @@ public final class MotifMLXAttentionScaffold: Module {
     /// not change (inference / `training == false`).
     func lambdaFull(dtype: DType) -> MLXArray {
         let base = cachedLambdaFullFP32()
-        return dtype == .float32 ? base : base.asType(dtype)
+        if dtype == .float32 { return base }
+        if let cached = lambdaScalarCache.casted, cached.dtype == dtype {
+            return cached.value
+        }
+        let value = base.asType(dtype)
+        eval(value)
+        lambdaScalarCache.casted = (dtype, value)
+        return value
+    }
+
+    /// SubLN weight in `dtype`, memoized (Finding 3). Frozen at inference.
+    private func sublnWeight(_ dtype: DType) -> MLXArray {
+        if subLayerNorm.weight.dtype == dtype { return subLayerNorm.weight }
+        if let cached = sublnWeightCache.casted, cached.dtype == dtype {
+            return cached.value
+        }
+        let value = subLayerNorm.weight.asType(dtype)
+        eval(value)
+        sublnWeightCache.casted = (dtype, value)
+        return value
     }
 
     private func cachedLambdaFullFP32() -> MLXArray {
@@ -586,7 +618,7 @@ public final class MotifMLXAttentionScaffold: Module {
         let differential = concatenated([o1a - lam * o2a, o1b - lam * o2b], axis: -1)
         let normalized = MLXFast.rmsNorm(
             differential,
-            weight: subLayerNorm.weight.asType(differential.dtype),
+            weight: sublnWeight(differential.dtype),
             eps: Float(configuration.attnRMSNormEps)
         ) * Float(1.0 - lambdaInit)
         return outputProjection(

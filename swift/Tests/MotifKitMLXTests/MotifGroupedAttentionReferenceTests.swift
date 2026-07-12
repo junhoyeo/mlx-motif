@@ -135,6 +135,18 @@ final class MotifGroupedAttentionReferenceTests: XCTestCase {
         XCTAssertEqual(cache.offset, 0)
     }
 
+    func testGroupedCachesIgnoreNegativeTrimCounts() {
+        let fpCache = MotifGroupedKVCache()
+        fpCache.offset = 7
+        XCTAssertEqual(fpCache.trim(-3), 0)
+        XCTAssertEqual(fpCache.offset, 7)
+
+        let quantizedCache = MotifGroupedQuantizedKVCache()
+        quantizedCache.offset = 7
+        XCTAssertEqual(quantizedCache.trim(-3), 0)
+        XCTAssertEqual(quantizedCache.offset, 7)
+    }
+
     func testQuantizedGroupedKVCacheProvidesPackedAndDequantizedPaths() throws {
         try requireMLXRuntime()
         // group size must be one of MLX's supported sizes (32/64/128) and divide

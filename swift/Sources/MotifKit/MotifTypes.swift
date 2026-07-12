@@ -358,17 +358,41 @@ public struct MotifModelConfiguration: Codable, Equatable, Sendable {
     public var quantization: [String: MotifJSONValue]?
 
     public var isGroupedDifferentialAttention: Bool { numNoiseHeads != nil }
-    public var effectiveHeadDim: Int { headDim ?? hiddenSize / numAttentionHeads }
+    public var effectiveHeadDim: Int {
+        if let headDim {
+            return headDim > 0 ? headDim : 0
+        }
+        guard hiddenSize > 0, numAttentionHeads > 0 else { return 0 }
+        return hiddenSize / numAttentionHeads
+    }
     public var attentionVariant: MotifAttentionVariant {
         isGroupedDifferentialAttention ? .groupedDifferentialAttention : .vanillaDifferentialAttention
     }
     public var groupedRatio: Int? {
-        guard let numNoiseHeads else { return nil }
-        return (numAttentionHeads - numNoiseHeads) / numNoiseHeads
+        guard let numNoiseHeads, numNoiseHeads > 0 else { return nil }
+        let (originHeads, overflow) = numAttentionHeads.subtractingReportingOverflow(
+            numNoiseHeads
+        )
+        guard !overflow,
+              originHeads > 0,
+              originHeads.isMultiple(of: numNoiseHeads)
+        else {
+            return nil
+        }
+        return originHeads / numNoiseHeads
     }
     public var keyNoiseHeads: Int? {
-        guard isGroupedDifferentialAttention else { return nil }
-        return numKeyValueHeads / (kRatio + 1)
+        guard isGroupedDifferentialAttention,
+              numKeyValueHeads > 0,
+              kRatio > 0,
+              kRatio < Int.max
+        else {
+            return nil
+        }
+        let keySlots = kRatio + 1
+        guard numKeyValueHeads.isMultiple(of: keySlots) else { return nil }
+        let derivedHeads = numKeyValueHeads / keySlots
+        return derivedHeads > 0 ? derivedHeads : nil
     }
     public var requiredCustomKernelNames: [String] {
         if isGroupedDifferentialAttention {
@@ -383,6 +407,98 @@ public struct MotifModelConfiguration: Codable, Equatable, Sendable {
     public var eosTokenID: Int? {
         get { eosTokenId }
         set { eosTokenId = newValue }
+    }
+
+    /// Validates checkpoint-controlled dimensions before model construction performs
+    /// range or division arithmetic with them.
+    public func validateStructure() throws {
+        let positiveFields = [
+            ("hidden_size", hiddenSize),
+            ("num_hidden_layers", numHiddenLayers),
+            ("intermediate_size", intermediateSize),
+            ("num_attention_heads", numAttentionHeads),
+            ("num_key_value_heads", numKeyValueHeads),
+            ("vocab_size", vocabSize),
+            ("max_position_embeddings", maxPositionEmbeddings),
+        ]
+        for (field, value) in positiveFields where value <= 0 {
+            throw MotifModelConfigurationError.nonPositiveField(field, value)
+        }
+        if let headDim, headDim <= 0 {
+            throw MotifModelConfigurationError.nonPositiveField("head_dim", headDim)
+        }
+        if headDim == nil {
+            guard effectiveHeadDim > 0,
+                  hiddenSize.isMultiple(of: numAttentionHeads)
+            else {
+                throw MotifModelConfigurationError.invalidAttentionShape(
+                    "hidden_size must be divisible by num_attention_heads when head_dim is absent"
+                )
+            }
+        }
+
+        if let numNoiseHeads {
+            guard kRatio > 0 else {
+                throw MotifModelConfigurationError.nonPositiveField("k_ratio", kRatio)
+            }
+            guard numNoiseHeads > 0 else {
+                throw MotifModelConfigurationError.nonPositiveField(
+                    "num_noise_heads",
+                    numNoiseHeads
+                )
+            }
+            let originHeads = numAttentionHeads - numNoiseHeads
+            guard originHeads > 0, originHeads.isMultiple(of: numNoiseHeads) else {
+                throw MotifModelConfigurationError.invalidAttentionShape(
+                    "num_attention_heads - num_noise_heads must be a positive multiple of num_noise_heads"
+                )
+            }
+            let groupedRatio = originHeads / numNoiseHeads
+            guard groupedRatio.isMultiple(of: kRatio) else {
+                throw MotifModelConfigurationError.invalidAttentionShape(
+                    "derived grouped query ratio must be divisible by k_ratio"
+                )
+            }
+            guard kRatio < Int.max else {
+                throw MotifModelConfigurationError.invalidAttentionShape(
+                    "k_ratio is too large to derive grouped key slots"
+                )
+            }
+            let keySlots = kRatio + 1
+            guard numKeyValueHeads.isMultiple(of: keySlots) else {
+                throw MotifModelConfigurationError.invalidAttentionShape(
+                    "num_key_value_heads must be divisible by k_ratio + 1"
+                )
+            }
+            let keyNoiseHeads = numKeyValueHeads / keySlots
+            guard keyNoiseHeads > 0, numNoiseHeads.isMultiple(of: keyNoiseHeads) else {
+                throw MotifModelConfigurationError.invalidAttentionShape(
+                    "num_noise_heads must be divisible by derived key noise heads"
+                )
+            }
+        } else {
+            guard numAttentionHeads.isMultiple(of: 2), numKeyValueHeads.isMultiple(of: 2) else {
+                throw MotifModelConfigurationError.invalidAttentionShape(
+                    "num_attention_heads and num_key_value_heads must be even for vanilla differential attention"
+                )
+            }
+            let effectiveHeads = numAttentionHeads / 2
+            let effectiveKeyValueHeads = numKeyValueHeads / 2
+            guard effectiveHeads.isMultiple(of: effectiveKeyValueHeads) else {
+                throw MotifModelConfigurationError.invalidAttentionShape(
+                    "effective attention heads must be divisible by effective KV heads"
+                )
+            }
+            let resolvedHeadDim = headDim ?? hiddenSize / numAttentionHeads
+            let (projectedHiddenSize, overflow) = resolvedHeadDim.multipliedReportingOverflow(
+                by: numAttentionHeads
+            )
+            guard !overflow, projectedHiddenSize == hiddenSize else {
+                throw MotifModelConfigurationError.invalidAttentionShape(
+                    "head_dim * num_attention_heads must equal hidden_size for vanilla differential attention"
+                )
+            }
+        }
     }
 
     public init(

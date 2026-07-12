@@ -790,6 +790,7 @@ public final class MotifMLXModelInner: Module {
         configuration: MotifModelConfiguration,
         runtimeFeatures: MotifRuntimeFeatureFlags = .fromEnvironment()
     ) throws {
+        try configuration.validateStructure()
         self.configuration = configuration
         self.runtimeFeatures = runtimeFeatures
         self._embedTokens.wrappedValue = Embedding(
@@ -834,6 +835,7 @@ public final class MotifMLXModel: Module, LLMModel, KVCacheDimensionProvider {
         configuration: MotifModelConfiguration,
         runtimeFeatures: MotifRuntimeFeatureFlags = .fromEnvironment()
     ) throws {
+        try configuration.validateStructure()
         self.configuration = configuration
         self.runtimeFeatures = runtimeFeatures
         self.vocabularySize = configuration.vocabSize

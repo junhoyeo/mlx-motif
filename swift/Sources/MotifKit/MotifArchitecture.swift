@@ -37,6 +37,7 @@ public struct MotifAttentionLayout: Codable, Equatable, Sendable {
     public var outputProjectionInputSize: Int
 
     public init(configuration: MotifModelConfiguration) throws {
+        try configuration.validateStructure()
         let headDim = configuration.effectiveHeadDim
         if let noiseHeads = configuration.numNoiseHeads {
             let originHeads = configuration.numAttentionHeads - noiseHeads

@@ -73,6 +73,131 @@ class ModelArgs(BaseModelArgs):
     bos_token_id: int | None = None
     eos_token_id: int | None = None
 
+    def __post_init__(self) -> None:
+        """Reject checkpoint shapes that cannot form a Motif model.
+
+        ``config.json`` is untrusted input. Validate every value used as a
+        tensor dimension, divisor, or layer range before MLX allocates a
+        module so malformed checkpoints fail with a useful ``ValueError``
+        instead of an arithmetic error or a degenerate zero-layer model.
+        """
+        positive_fields = (
+            "hidden_size",
+            "num_hidden_layers",
+            "intermediate_size",
+            "num_attention_heads",
+            "num_key_value_heads",
+            "vocab_size",
+            "max_position_embeddings",
+        )
+        for field in positive_fields:
+            value = getattr(self, field)
+            if type(value) is not int:
+                raise ValueError(f"{field} must be an integer; got {value!r}")
+            if value <= 0:
+                raise ValueError(f"{field} must be greater than zero; got {value}")
+
+        if self.head_dim is not None:
+            if type(self.head_dim) is not int:
+                raise ValueError(f"head_dim must be an integer; got {self.head_dim!r}")
+            if self.head_dim <= 0:
+                raise ValueError(f"head_dim must be greater than zero; got {self.head_dim}")
+        elif self.hidden_size < self.num_attention_heads:
+            raise ValueError(
+                "derived head_dim must be greater than zero; "
+                f"got hidden_size {self.hidden_size} and "
+                f"num_attention_heads {self.num_attention_heads}"
+            )
+        elif self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                "hidden_size must be divisible by num_attention_heads when head_dim "
+                f"is omitted; got {self.hidden_size} and {self.num_attention_heads}"
+            )
+
+        if self.is_grouped:
+            self._validate_grouped_head_topology()
+        else:
+            self._validate_vanilla_head_topology()
+
+    def _validate_vanilla_head_topology(self) -> None:
+        if self.num_attention_heads % 2 != 0:
+            raise ValueError(
+                "num_attention_heads must be even for vanilla differential attention; "
+                f"got {self.num_attention_heads}"
+            )
+        if self.num_key_value_heads % 2 != 0:
+            raise ValueError(
+                "num_key_value_heads must be even for vanilla differential attention; "
+                f"got {self.num_key_value_heads}"
+            )
+        if self.num_attention_heads % self.num_key_value_heads != 0:
+            raise ValueError(
+                "num_attention_heads must be divisible by num_key_value_heads; "
+                f"got {self.num_attention_heads} and {self.num_key_value_heads}"
+            )
+
+        if (
+            self.head_dim is not None
+            and self.head_dim * self.num_attention_heads != self.hidden_size
+        ):
+            raise ValueError(
+                "head_dim * num_attention_heads must equal hidden_size for vanilla "
+                f"differential attention; got {self.head_dim} * "
+                f"{self.num_attention_heads} != {self.hidden_size}"
+            )
+
+    def _validate_grouped_head_topology(self) -> None:
+        if type(self.num_noise_heads) is not int:
+            raise ValueError(
+                f"num_noise_heads must be an integer when provided; got {self.num_noise_heads!r}"
+            )
+        if self.num_noise_heads <= 0:
+            raise ValueError(
+                f"num_noise_heads must be greater than zero; got {self.num_noise_heads}"
+            )
+        if type(self.k_ratio) is not int:
+            raise ValueError(f"k_ratio must be an integer; got {self.k_ratio!r}")
+        if self.k_ratio < 1:
+            raise ValueError(
+                f"k_ratio must be greater than or equal to 1 for grouped attention; got {self.k_ratio}"
+            )
+        if self.num_attention_heads <= self.num_noise_heads:
+            raise ValueError(
+                "num_attention_heads must be greater than num_noise_heads for grouped "
+                f"attention; got {self.num_attention_heads} and {self.num_noise_heads}"
+            )
+        if self.num_attention_heads % self.num_noise_heads != 0:
+            raise ValueError(
+                "num_attention_heads must be divisible by num_noise_heads; "
+                f"got {self.num_attention_heads} and {self.num_noise_heads}"
+            )
+
+        key_group_width = self.k_ratio + 1
+        if self.num_key_value_heads < key_group_width:
+            raise ValueError(
+                "num_key_value_heads must be at least k_ratio + 1 for grouped attention; "
+                f"got {self.num_key_value_heads} and {self.k_ratio}"
+            )
+        if self.num_key_value_heads % key_group_width != 0:
+            raise ValueError(
+                "num_key_value_heads must be divisible by k_ratio + 1; "
+                f"got {self.num_key_value_heads} and {self.k_ratio}"
+            )
+
+        key_noise_heads = self.num_key_value_heads // key_group_width
+        if self.num_noise_heads % key_noise_heads != 0:
+            raise ValueError(
+                "num_noise_heads must be divisible by num_key_value_heads / (k_ratio + 1); "
+                f"got {self.num_noise_heads}, {self.num_key_value_heads}, and {self.k_ratio}"
+            )
+
+        grouped_ratio = self.num_attention_heads // self.num_noise_heads - 1
+        if grouped_ratio % self.k_ratio != 0:
+            raise ValueError(
+                "the grouped attention ratio must be divisible by k_ratio; "
+                f"got grouped ratio {grouped_ratio} and k_ratio {self.k_ratio}"
+            )
+
     @property
     def is_grouped(self) -> bool:
         """True for GDA (12.7B), False for plain DiffAttention (2.6B)."""

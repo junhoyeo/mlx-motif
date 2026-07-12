@@ -13,7 +13,7 @@ from pathlib import Path
 
 import mlx.nn as nn
 from huggingface_hub import snapshot_download
-from mlx_lm.utils import TokenizerWrapper, load_tokenizer
+from mlx_lm.utils import TokenizerWrapper, load_config, load_tokenizer
 from mlx_lm.utils import load_model as _mlx_lm_load_model
 
 from mlx_motif.model import Model, ModelArgs
@@ -35,6 +35,11 @@ _HUB_ALLOW_PATTERNS = [
 
 def _get_motif_classes(config: dict):
     return Model, ModelArgs
+
+
+def _preflight_model_config(path: Path) -> None:
+    """Validate untrusted dimensions before mlx-lm opens any weight shard."""
+    ModelArgs.from_dict(load_config(path))
 
 
 def _resolve_model_path(path: str | Path, revision: str | None = None) -> Path:
@@ -106,6 +111,7 @@ def load(
             is a repo id.
     """
     path = _resolve_model_path(path, revision=revision)
+    _preflight_model_config(path)
     model, _ = _mlx_lm_load_model(path, get_model_classes=_get_motif_classes)
     if fuse_qkv and hasattr(model, "fuse_qkv"):
         model.fuse_qkv()

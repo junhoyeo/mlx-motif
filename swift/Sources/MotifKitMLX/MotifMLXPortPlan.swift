@@ -87,7 +87,8 @@ public struct MotifMLXLoadPlan: Equatable, Sendable {
             self.validationErrorDescription = nil
         } catch {
             self.layerPlan = nil
-            self.validationErrorDescription = String(describing: error)
+            self.validationErrorDescription = (error as? any LocalizedError)?.errorDescription
+                ?? String(describing: error)
         }
         if self.validationErrorDescription == nil {
             self.validationErrorDescription = directoryValidation?.blockingSummary

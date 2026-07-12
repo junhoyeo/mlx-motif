@@ -5,6 +5,18 @@ import MLX
 import XCTest
 
 final class MotifMetalKernelsTests: XCTestCase {
+    func testPackedQ4GeometryRejectsNonPositiveGroupSizeBeforeModulo() {
+        XCTAssertFalse(
+            MotifSDPADualVQ4.supportsPackedGeometry(headDim: 128, groupSize: 0, bits: 4)
+        )
+        XCTAssertFalse(
+            MotifSDPADualVQ4.supportsPackedGeometry(headDim: 128, groupSize: -64, bits: 8)
+        )
+        XCTAssertTrue(
+            MotifSDPADualVQ4.supportsPackedGeometry(headDim: 128, groupSize: 64, bits: 4)
+        )
+    }
+
     func testManifestEnablesHardParityKernelsByDefault() {
         let descriptors = MotifMetalKernels.descriptors
         XCTAssertEqual(descriptors.map(\.name), MotifMetalKernelName.allCases)

@@ -662,6 +662,24 @@ public enum MotifSDPADualV {
 }
 
 public enum MotifSDPADualVQ4 {
+    /// Returns whether the scalar head-dimension contract required by the
+    /// packed decode kernel is safe to evaluate. Keep the positivity check
+    /// before every modulo so malformed group sizes route to the reference
+    /// path instead of trapping in the wrapper guard.
+    static func supportsPackedGeometry(headDim: Int, groupSize: Int, bits: Int) -> Bool {
+        guard groupSize > 0,
+              bits == 4 || bits == 8,
+              headDim >= 32,
+              headDim % 32 == 0,
+              headDim % groupSize == 0
+        else {
+            return false
+        }
+        let qkPerThread = headDim / 32
+        return (32 / bits) % qkPerThread == 0
+            && groupSize % qkPerThread == 0
+    }
+
     private static let metalKernel = MLXFast.metalKernel(
         name: "motif_sdpa_dual_v_q4",
         inputNames: [
@@ -744,9 +762,9 @@ public enum MotifSDPADualVQ4 {
         guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode),
               mode == .affine,
               queries.dim(2) == 1,
-              queries.dim(3) % 32 == 0,
-              queries.dim(3) % groupSize == 0,
-              bits == 4 || bits == 8,
+              supportsPackedGeometry(
+                  headDim: queries.dim(3), groupSize: groupSize, bits: bits
+              ),
               // Live-region bounds (from the full-capacity cache-fetch path):
               // callers pass step-padded capacity triples plus a smaller live
               // length, so bound it before the kernel indexes the packed buffers.
@@ -769,8 +787,6 @@ public enum MotifSDPADualVQ4 {
               // next word with shifts 32/40 (>=32, UB in Metal). Route every
               // out-of-contract shape to reference() instead. Mirrors the Python
               // asserts in sdpa_dual_v_q4.
-              (32 / bits) % (queries.dim(3) / 32) == 0, // qk_per_thread | EL_PER_INT
-              groupSize % (queries.dim(3) / 32) == 0,   // qk_per_thread | GROUP_SIZE
               let keyBiases = quantizedKeys.biases,
               let value1Biases = quantizedValue1.biases,
               let value2Biases = quantizedValue2.biases,

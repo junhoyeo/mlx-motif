@@ -385,7 +385,18 @@ class MotifGroupedKVCache(MotifGroupedKVCacheBase):
 
     @meta_state.setter
     def meta_state(self, v):
-        self.offset = int(v[0])
+        # Same restore-boundary rule as the quantized variant: a negative or
+        # beyond-capacity offset would silently mis-slice the live region on
+        # every subsequent fetch, so reject it loudly here.
+        offset = int(v[0])
+        if offset < 0:
+            raise ValueError(f"restored cache offset must be non-negative; got {offset}")
+        if self.k1 is not None and offset > self._slot_capacity(self.k1):
+            raise ValueError(
+                f"restored cache offset {offset} exceeds the restored slot "
+                f"capacity {self._slot_capacity(self.k1)}"
+            )
+        self.offset = offset
 
     # ------------------------------------------------------------------
     # Conversion
@@ -416,16 +427,23 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
     """
 
     def __init__(self, group_size: int = 64, bits: int = 8):
+        self._validate_cache_params(group_size, bits)
+        self.k1 = self.k2 = self.v1 = self.v2 = None
+        self.offset = 0
+        self.group_size = group_size
+        self.bits = bits
+
+    @staticmethod
+    def _validate_cache_params(group_size, bits) -> None:
+        """Shared by ``__init__`` and the ``meta_state`` restore path: both
+        values later serve as divisors in ``_validate_head_dim`` /
+        ``_init_storage``, so bogus values must fail here, not there."""
         if type(group_size) is not int or group_size <= 0:
             raise ValueError(f"group_size must be a positive integer; got {group_size!r}")
         if type(bits) is not int or bits not in (2, 4, 8):
             raise ValueError(
                 f"bits must be one of (2, 4, 8) for the quantized 4-slot KV cache; got {bits!r}"
             )
-        self.k1 = self.k2 = self.v1 = self.v2 = None
-        self.offset = 0
-        self.group_size = group_size
-        self.bits = bits
 
     def _validate_head_dim(self, D: int) -> None:
         """Reject head dims the packed storage cannot represent exactly.
@@ -574,4 +592,19 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
 
     @meta_state.setter
     def meta_state(self, v):
-        self.offset, self.group_size, self.bits = map(int, v)
+        # A serialized meta_state is untrusted input (a corrupted or crafted
+        # prompt-cache file). Validate like ``__init__`` so a restored cache
+        # cannot later divide by zero in ``_init_storage`` or slice the live
+        # region with a bogus offset. ``_BaseCache.from_state`` assigns
+        # ``state`` before ``meta_state``, so the slots (and their capacity)
+        # are already in place when the offset arrives here.
+        offset, group_size, bits = map(int, v)
+        self._validate_cache_params(group_size, bits)
+        if offset < 0:
+            raise ValueError(f"restored cache offset must be non-negative; got {offset}")
+        if self.k1 is not None and offset > self._slot_capacity(self.k1):
+            raise ValueError(
+                f"restored cache offset {offset} exceeds the restored slot "
+                f"capacity {self._slot_capacity(self.k1)}"
+            )
+        self.offset, self.group_size, self.bits = offset, group_size, bits

@@ -78,6 +78,24 @@ final class MotifMLXNativeRuntimeEOSReconcileTests: XCTestCase {
         XCTAssertTrue(cache.allSatisfy { $0.offset == 5 })
     }
 
+    func testNegativeSurplusInvalidatesReuseAndDoesNotTrim() {
+        MotifMLXNativeRuntime.assertsOnUnreconcilableEOSCache = false
+        let cache: [KVCache] = [
+            FakeKVCache(offset: 5, trimmable: true),
+            FakeKVCache(offset: 5, trimmable: true),
+        ]
+
+        let reusable = MotifMLXNativeRuntime.reconcileEOSCacheSurplus(cache, surplus: -1)
+
+        XCTAssertFalse(reusable, "a cache behind the recorded token count is unsafe to reuse")
+        for layer in cache {
+            if let fake = layer as? FakeKVCache {
+                XCTAssertEqual(fake.trimCallCount, 0)
+                XCTAssertEqual(fake.offset, 5)
+            }
+        }
+    }
+
     func testNonTrimmableSurplusInvalidatesReuseAndDoesNotTrim() {
         // Disable the debug assertionFailure so the release-fallback (log +
         // invalidate) path is exercised without trapping the test process.

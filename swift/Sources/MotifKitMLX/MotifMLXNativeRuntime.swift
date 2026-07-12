@@ -365,6 +365,8 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
     /// Motif's caches (``MotifGroupedKVCache`` / ``MotifGroupedQuantizedKVCache``
     /// / mlx-lm's `KVCacheSimple`) are always trimmable, so the common path just
     /// trims every layer by `surplus` and returns `true` (safe to reuse). If a
+    /// negative surplus means the cache is already behind the recorded token
+    /// count, it cannot be repaired by trimming; invalidate reuse instead. If a
     /// non-trimmable cache ever routes through `streamResponse`, the surplus
     /// cannot be removed — silently skipping that layer (the previous behavior)
     /// would leave its offset one ahead and shift every RoPE position of the
@@ -374,16 +376,27 @@ public final class MotifMLXNativeRuntime: @unchecked Sendable {
     /// guard is unit-testable with a KVCache test double.
     @discardableResult
     static func reconcileEOSCacheSurplus(_ cache: [KVCache], surplus: Int) -> Bool {
-        guard surplus > 0 else { return true }
-        guard cache.allSatisfy(\.isTrimmable) else {
-            let message = "MotifMLXNativeRuntime: cannot reconcile EOS cache offset "
-                + "(surplus \(surplus)); a non-trimmable KV cache routed through streamResponse. "
-                + "Invalidating cross-turn reuse and forcing a clean prefill next turn."
+        func invalidateReuse(_ message: String) -> Bool {
             if assertsOnUnreconcilableEOSCache {
                 assertionFailure(message)
             }
             FileHandle.standardError.write(Data((message + "\n").utf8))
             return false
+        }
+
+        guard surplus >= 0 else {
+            let message = "MotifMLXNativeRuntime: cache offset is behind the recorded "
+                + "token count (surplus \(surplus)); cannot reconcile a negative EOS "
+                + "cache surplus. Invalidating cross-turn reuse and forcing a clean "
+                + "prefill next turn."
+            return invalidateReuse(message)
+        }
+        guard surplus > 0 else { return true }
+        guard cache.allSatisfy(\.isTrimmable) else {
+            let message = "MotifMLXNativeRuntime: cannot reconcile EOS cache offset "
+                + "(surplus \(surplus)); a non-trimmable KV cache routed through streamResponse. "
+                + "Invalidating cross-turn reuse and forcing a clean prefill next turn."
+            return invalidateReuse(message)
         }
         for kvCache in cache {
             kvCache.trim(surplus)

@@ -431,7 +431,7 @@ public final class MotifGroupedKVCache: KVCache, CustomDebugStringConvertible {
 
     @discardableResult
     public func trim(_ n: Int) -> Int {
-        let trimmed = min(offset, n)
+        let trimmed = max(0, min(offset, n))
         offset -= trimmed
         return trimmed
     }
@@ -706,7 +706,7 @@ public final class MotifGroupedQuantizedKVCache: KVCache, CustomDebugStringConve
 
     @discardableResult
     public func trim(_ n: Int) -> Int {
-        let trimmed = min(offset, n)
+        let trimmed = max(0, min(offset, n))
         offset -= trimmed
         return trimmed
     }

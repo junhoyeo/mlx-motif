@@ -67,6 +67,78 @@ def _grouped_args(**overrides) -> ModelArgs:
     return ModelArgs(**base)
 
 
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"num_attention_heads": 0}, "num_attention_heads must be greater than zero"),
+        ({"num_key_value_heads": 0}, "num_key_value_heads must be greater than zero"),
+        ({"num_noise_heads": 0}, "num_noise_heads must be greater than zero"),
+        ({"k_ratio": -1}, "k_ratio must be greater than or equal to 1"),
+        (
+            {"num_key_value_heads": 1, "k_ratio": 1},
+            r"num_key_value_heads must be at least k_ratio \+ 1",
+        ),
+        ({"num_hidden_layers": 0}, "num_hidden_layers must be greater than zero"),
+        ({"num_hidden_layers": -3}, "num_hidden_layers must be greater than zero"),
+        ({"hidden_size": 0}, "hidden_size must be greater than zero"),
+        ({"intermediate_size": 0}, "intermediate_size must be greater than zero"),
+        ({"vocab_size": 0}, "vocab_size must be greater than zero"),
+        ({"max_position_embeddings": 0}, "max_position_embeddings must be greater than zero"),
+        (
+            {"hidden_size": 1, "head_dim": None},
+            "derived head_dim must be greater than zero",
+        ),
+    ],
+)
+def test_model_args_rejects_unsafe_structural_values(overrides, message):
+    """Untrusted config values must fail before model shape arithmetic runs."""
+    with pytest.raises(ValueError, match=message):
+        _grouped_args(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("factory", "overrides", "message"),
+    [
+        (_vanilla_args, {"num_attention_heads": 3}, "num_attention_heads must be even"),
+        (_vanilla_args, {"num_key_value_heads": 3}, "num_key_value_heads must be even"),
+        (
+            _vanilla_args,
+            {"num_attention_heads": 6, "num_key_value_heads": 4},
+            "num_attention_heads must be divisible by num_key_value_heads",
+        ),
+        (
+            _vanilla_args,
+            {"head_dim": 8},
+            "head_dim \\* num_attention_heads must equal hidden_size",
+        ),
+        (
+            _grouped_args,
+            {"num_attention_heads": 9},
+            "num_attention_heads must be divisible by num_noise_heads",
+        ),
+        (
+            _grouped_args,
+            {"num_key_value_heads": 5},
+            r"num_key_value_heads must be divisible by k_ratio \+ 1",
+        ),
+        (
+            _grouped_args,
+            {"hidden_size": 65, "head_dim": None},
+            "hidden_size must be divisible by num_attention_heads",
+        ),
+        (
+            _grouped_args,
+            {"k_ratio": 3, "num_key_value_heads": 8},
+            "grouped attention ratio must be divisible by k_ratio",
+        ),
+    ],
+)
+def test_model_args_rejects_incompatible_head_topology(factory, overrides, message):
+    """Head counts that cannot be reshaped or repeated must fail actionably."""
+    with pytest.raises(ValueError, match=message):
+        factory(**overrides)
+
+
 def test_polynorm_shape_invariance():
     p = PolyNorm()
     x = mx.random.normal((2, 3, 8))

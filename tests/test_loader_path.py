@@ -9,7 +9,10 @@ while leaving existing local directories untouched. These tests exercise the
 resolver directly (no network — `snapshot_download` is monkeypatched).
 """
 
+import json
 from pathlib import Path
+
+import pytest
 
 from mlx_motif import loader
 
@@ -69,3 +72,27 @@ def test_allow_patterns_match_a_real_checkpoint_layout():
         assert any(fnmatch.fnmatch(name, pat) for pat in loader._HUB_ALLOW_PATTERNS), (
             f"{name} would not be downloaded by the allow-list"
         )
+
+
+def test_load_validates_config_before_upstream_weight_loading(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "motif",
+                "hidden_size": 64,
+                "num_hidden_layers": 1,
+                "intermediate_size": 128,
+                "num_attention_heads": 0,
+                "num_key_value_heads": 4,
+                "vocab_size": 128,
+            }
+        )
+    )
+
+    def _unexpected_upstream_load(*args, **kwargs):
+        raise AssertionError("upstream weight loading must not run for an invalid config")
+
+    monkeypatch.setattr(loader, "_mlx_lm_load_model", _unexpected_upstream_load)
+
+    with pytest.raises(ValueError, match="num_attention_heads must be greater than zero"):
+        loader.load(tmp_path)

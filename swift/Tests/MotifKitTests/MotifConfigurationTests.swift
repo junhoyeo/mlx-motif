@@ -390,6 +390,167 @@ final class MotifConfigurationTests: XCTestCase {
         )
     }
 
+    func testAttentionLayoutRejectsZeroHeadsBeforeComputingEffectiveHeadDimension() {
+        var configuration = makeValidGroupedConfiguration()
+        configuration.numAttentionHeads = 0
+        configuration.headDim = nil
+
+        XCTAssertThrowsError(try MotifAttentionLayout(configuration: configuration)) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .nonPositiveField("num_attention_heads", 0)
+            )
+        }
+    }
+
+    func testUnvalidatedDerivedAccessorsDoNotTrapOnInvalidDenominators() {
+        var configuration = makeValidGroupedConfiguration()
+        configuration.headDim = nil
+        configuration.numAttentionHeads = 0
+        XCTAssertEqual(configuration.effectiveHeadDim, 0)
+
+        configuration = makeValidGroupedConfiguration()
+        configuration.numNoiseHeads = 0
+        XCTAssertNil(configuration.groupedRatio)
+
+        configuration = makeValidGroupedConfiguration()
+        configuration.kRatio = -1
+        XCTAssertNil(configuration.keyNoiseHeads)
+
+        configuration.kRatio = Int.max
+        XCTAssertNil(configuration.keyNoiseHeads)
+    }
+
+    func testStructuralValidationRejectsNegativeLayerCount() {
+        var configuration = makeValidGroupedConfiguration()
+        configuration.numHiddenLayers = -3
+
+        XCTAssertThrowsError(try configuration.validateStructure()) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .nonPositiveField("num_hidden_layers", -3)
+            )
+        }
+    }
+
+    func testStructuralValidationRejectsLossyDerivedGroupedHeadDimension() {
+        var configuration = makeValidGroupedConfiguration()
+        configuration.hiddenSize = 65
+        configuration.headDim = nil
+
+        XCTAssertThrowsError(try configuration.validateStructure()) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .invalidAttentionShape(
+                    "hidden_size must be divisible by num_attention_heads when head_dim is absent"
+                )
+            )
+        }
+    }
+
+    func testStructuralValidationRejectsInvalidGroupedAttentionArithmetic() {
+        var zeroNoiseHeads = makeValidGroupedConfiguration()
+        zeroNoiseHeads.numNoiseHeads = 0
+        XCTAssertThrowsError(try zeroNoiseHeads.validateStructure()) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .nonPositiveField("num_noise_heads", 0)
+            )
+        }
+
+        var negativeKeyRatio = makeValidGroupedConfiguration()
+        negativeKeyRatio.kRatio = -1
+        XCTAssertThrowsError(try negativeKeyRatio.validateStructure()) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .nonPositiveField("k_ratio", -1)
+            )
+        }
+
+        var insufficientKeyValueHeads = makeValidGroupedConfiguration()
+        insufficientKeyValueHeads.kRatio = 4
+        insufficientKeyValueHeads.numKeyValueHeads = 2
+        XCTAssertThrowsError(try insufficientKeyValueHeads.validateStructure()) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .invalidAttentionShape(
+                    "num_key_value_heads must be divisible by k_ratio + 1"
+                )
+            )
+        }
+
+        var incompatibleKeyGroups = makeValidGroupedConfiguration()
+        incompatibleKeyGroups.numNoiseHeads = 4
+        incompatibleKeyGroups.numAttentionHeads = 12
+        incompatibleKeyGroups.numKeyValueHeads = 6
+        XCTAssertThrowsError(try incompatibleKeyGroups.validateStructure()) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .invalidAttentionShape(
+                    "num_noise_heads must be divisible by derived key noise heads"
+                )
+            )
+        }
+
+        var incompatibleGroupedRatio = makeValidGroupedConfiguration()
+        incompatibleGroupedRatio.kRatio = 3
+        incompatibleGroupedRatio.numKeyValueHeads = 8
+        XCTAssertThrowsError(try incompatibleGroupedRatio.validateStructure()) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .invalidAttentionShape(
+                    "derived grouped query ratio must be divisible by k_ratio"
+                )
+            )
+        }
+    }
+
+    func testStructuralValidationRejectsVanillaProjectionShapeMismatch() throws {
+        var configuration: MotifModelConfiguration = try decodeFixture(
+            "motif_config_vanilla.json"
+        )
+        configuration.headDim = 15
+
+        XCTAssertThrowsError(try configuration.validateStructure()) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .invalidAttentionShape(
+                    "head_dim * num_attention_heads must equal hidden_size for vanilla differential attention"
+                )
+            )
+        }
+    }
+
+    func testStructuralValidationPreservesValidVanillaAndGroupedVariants() throws {
+        let vanilla: MotifModelConfiguration = try decodeFixture("motif_config_vanilla.json")
+        let grouped: MotifModelConfiguration = try decodeFixture("motif_config_grouped.json")
+        var groupedWithLargerKeyRatio = makeValidGroupedConfiguration()
+        groupedWithLargerKeyRatio.kRatio = 2
+        groupedWithLargerKeyRatio.numKeyValueHeads = 6
+
+        XCTAssertNoThrow(try vanilla.validateStructure())
+        XCTAssertNoThrow(try grouped.validateStructure())
+        XCTAssertNoThrow(try groupedWithLargerKeyRatio.validateStructure())
+        XCTAssertEqual(
+            try MotifAttentionLayout(configuration: groupedWithLargerKeyRatio).keyRatio,
+            2
+        )
+    }
+
+    private func makeValidGroupedConfiguration() -> MotifModelConfiguration {
+        MotifModelConfiguration(
+            hiddenSize: 64,
+            numHiddenLayers: 2,
+            intermediateSize: 128,
+            numAttentionHeads: 10,
+            numKeyValueHeads: 4,
+            vocabSize: 128,
+            headDim: 16,
+            numNoiseHeads: 2,
+            kRatio: 1
+        )
+    }
+
     private func writeMinimalConfig(to directory: URL) throws {
         let configData = try Data(contentsOf: fixtureURL("motif_config_grouped.json"))
         try configData.write(to: directory.appendingPathComponent(MotifModelBundle.configFileName))

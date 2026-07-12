@@ -131,6 +131,69 @@ final class MotifMLXRegistryTests: XCTestCase {
         }
     }
 
+    func testLoadPlanReportsNegativeCheckpointLayerCountWithoutConstructingLayers() {
+        var configuration = makeGroupedConfiguration()
+        configuration.numHiddenLayers = -3
+
+        let plan = MotifMLXLoadPlan(configuration: configuration)
+
+        XCTAssertNil(plan.layerPlan)
+        XCTAssertEqual(
+            plan.validationErrorDescription,
+            "Motif config field num_hidden_layers must be positive; got -3"
+        )
+    }
+
+    func testModelRejectsZeroAttentionHeadsBeforeRangeOrDivisionArithmetic() {
+        var configuration = makeGroupedConfiguration()
+        configuration.numAttentionHeads = 0
+        configuration.headDim = nil
+
+        XCTAssertThrowsError(try MotifMLXModel(configuration: configuration)) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .nonPositiveField("num_attention_heads", 0)
+            )
+        }
+    }
+
+    func testModelRejectsNegativeLayerCountBeforeRangeConstruction() {
+        var configuration = makeGroupedConfiguration()
+        configuration.numHiddenLayers = -3
+
+        XCTAssertThrowsError(try MotifMLXModel(configuration: configuration)) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .nonPositiveField("num_hidden_layers", -3)
+            )
+        }
+        XCTAssertThrowsError(try MotifMLXModelInner(configuration: configuration)) { error in
+            XCTAssertEqual(
+                error as? MotifModelConfigurationError,
+                .nonPositiveField("num_hidden_layers", -3)
+            )
+        }
+    }
+
+    func testBackendSurfacesInvalidCheckpointStructureThroughLoadPlan() throws {
+        let directory = try makeModelDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var configuration = makeGroupedConfiguration()
+        configuration.numHiddenLayers = -3
+        try JSONEncoder().encode(configuration).write(
+            to: directory.appendingPathComponent(MotifModelBundle.configFileName)
+        )
+
+        let backend = try MotifMLXBackend(modelDirectory: directory)
+
+        XCTAssertNil(backend.loadPlan?.layerPlan)
+        XCTAssertEqual(
+            backend.loadPlan?.validationErrorDescription,
+            "Motif config field num_hidden_layers must be positive; got -3"
+        )
+        XCTAssertFalse(backend.capabilityLabels.contains(.runtimeGeneratedOutput))
+    }
+
     private func makeGroupedConfiguration() -> MotifModelConfiguration {
         MotifModelConfiguration(
             hiddenSize: 4_096,

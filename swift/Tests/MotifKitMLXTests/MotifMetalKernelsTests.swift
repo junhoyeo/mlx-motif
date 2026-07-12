@@ -5,6 +5,35 @@ import MLX
 import XCTest
 
 final class MotifMetalKernelsTests: XCTestCase {
+    func testGDAPostSplitShapeGuardRequiresMatchingBatchSequenceAndChannels() {
+        let origin = [1, 4, 2, 32]
+        let noise = [1, 2, 2, 32]
+
+        XCTAssertTrue(
+            MotifGDAPostSplit.supportsMetalShapeContract(
+                attnOriginShape: origin, attnNoiseShape: noise, groupedRatio: 2
+            )
+        )
+        XCTAssertFalse(
+            MotifGDAPostSplit.supportsMetalShapeContract(
+                attnOriginShape: [2, 4, 2, 32], attnNoiseShape: noise, groupedRatio: 2
+            ),
+            "batch mismatch must not enter the split kernel"
+        )
+        XCTAssertFalse(
+            MotifGDAPostSplit.supportsMetalShapeContract(
+                attnOriginShape: origin, attnNoiseShape: [1, 2, 1, 32], groupedRatio: 2
+            ),
+            "sequence mismatch must not enter the split kernel"
+        )
+        XCTAssertFalse(
+            MotifGDAPostSplit.supportsMetalShapeContract(
+                attnOriginShape: origin, attnNoiseShape: [1, 2, 2, 16], groupedRatio: 2
+            ),
+            "channel mismatch must not enter the split kernel"
+        )
+    }
+
     func testPackedQ4GeometryRejectsNonPositiveGroupSizeBeforeModulo() {
         XCTAssertFalse(
             MotifSDPADualVQ4.supportsPackedGeometry(headDim: 128, groupSize: 0, bits: 4)

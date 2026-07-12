@@ -917,6 +917,27 @@ public enum MotifSDPADualVQ4 {
 }
 
 public enum MotifGDAPostSplit {
+    /// The split kernel derives batch, sequence, and channel strides from the
+    /// origin tensor, so the corresponding noise axes must match exactly.
+    /// Keep this shape-only predicate separate from MLX execution so the
+    /// wrapper's OOB guard can be regression-tested without launching Metal.
+    static func supportsMetalShapeContract(
+        attnOriginShape: [Int],
+        attnNoiseShape: [Int],
+        groupedRatio: Int
+    ) -> Bool {
+        guard attnOriginShape.count == 4,
+              attnNoiseShape.count == 4,
+              groupedRatio > 0
+        else {
+            return false
+        }
+        return attnOriginShape[0] == attnNoiseShape[0]
+            && attnOriginShape[1] == attnNoiseShape[1] * groupedRatio
+            && attnOriginShape[2] == attnNoiseShape[2]
+            && attnOriginShape[3] == attnNoiseShape[3]
+    }
+
     private static let metalKernel = MLXFast.metalKernel(
         name: "motif_gda_post_split",
         inputNames: ["attn_o", "attn_n", "subln_w", "lambda_full", "scale_in", "eps_in"],
@@ -954,8 +975,11 @@ public enum MotifGDAPostSplit {
         executionMode: MotifMetalKernelExecutionMode = .metalPreferred
     ) -> MLXArray {
         guard MotifMetalKernels.shouldUseMetal(executionMode: executionMode),
-              groupedRatio > 0,
-              attnOrigin.dim(1) == attnNoise.dim(1) * groupedRatio
+              supportsMetalShapeContract(
+                  attnOriginShape: attnOrigin.shape,
+                  attnNoiseShape: attnNoise.shape,
+                  groupedRatio: groupedRatio
+              )
         else {
             MotifKernelFallbackTelemetry.recordFallback(.gdaPostSplit)
             return reference(

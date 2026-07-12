@@ -141,6 +141,18 @@ enum SafeArithmetic {
         var pos = 0
         init(_ chars: [Unicode.Scalar]) { self.chars = chars }
 
+        // Depth cap on the mutual recursion below (parseExpression -> parseTerm
+        // -> parseFactor -> parseFactor/parseExpression for unary minus / nested
+        // parens). `expression` is MODEL-EMITTED tool-call input — untrusted, and
+        // reachable via prompt injection. Unlike Python's `safe_arithmetic` twin,
+        // which raises a catchable RecursionError on the same adversarial shape,
+        // Swift has no recoverable stack overflow: an unbounded chain of `-`/`(`
+        // crashes the entire app (measured: debug builds SIGSEGV at 10-20k
+        // nested chars, release at ~55-60k). Left-associative chains of `+`/`*`
+        // etc. are iterative (the `while true` loops below), not recursive, so
+        // they never hit this cap regardless of length — only nesting depth does.
+        private static let maxDepth = 512
+
         var atEnd: Bool {
             var p = pos
             while p < chars.count, chars[p] == " " { p += 1 }
@@ -149,35 +161,38 @@ enum SafeArithmetic {
 
         mutating func skipSpaces() { while pos < chars.count, chars[pos] == " " { pos += 1 } }
 
-        mutating func parseExpression() -> Double? {
-            guard var lhs = parseTerm() else { return nil }
+        mutating func parseExpression(_ depth: Int = 0) -> Double? {
+            guard depth < Self.maxDepth else { return nil }
+            guard var lhs = parseTerm(depth + 1) else { return nil }
             while true {
                 skipSpaces()
                 guard pos < chars.count, chars[pos] == "+" || chars[pos] == "-" else { return lhs }
                 let op = chars[pos]; pos += 1
-                guard let rhs = parseTerm() else { return nil }
+                guard let rhs = parseTerm(depth + 1) else { return nil }
                 lhs = op == "+" ? lhs + rhs : lhs - rhs
             }
         }
 
-        mutating func parseTerm() -> Double? {
-            guard var lhs = parseFactor() else { return nil }
+        mutating func parseTerm(_ depth: Int = 0) -> Double? {
+            guard depth < Self.maxDepth else { return nil }
+            guard var lhs = parseFactor(depth + 1) else { return nil }
             while true {
                 skipSpaces()
                 guard pos < chars.count, chars[pos] == "*" || chars[pos] == "/" else { return lhs }
                 let op = chars[pos]; pos += 1
-                guard let rhs = parseFactor() else { return nil }
+                guard let rhs = parseFactor(depth + 1) else { return nil }
                 lhs = op == "*" ? lhs * rhs : lhs / rhs
             }
         }
 
-        mutating func parseFactor() -> Double? {
+        mutating func parseFactor(_ depth: Int = 0) -> Double? {
+            guard depth < Self.maxDepth else { return nil }
             skipSpaces()
             guard pos < chars.count else { return nil }
-            if chars[pos] == "-" { pos += 1; return parseFactor().map { -$0 } }
+            if chars[pos] == "-" { pos += 1; return parseFactor(depth + 1).map { -$0 } }
             if chars[pos] == "(" {
                 pos += 1
-                guard let inner = parseExpression() else { return nil }
+                guard let inner = parseExpression(depth + 1) else { return nil }
                 skipSpaces()
                 guard pos < chars.count, chars[pos] == ")" else { return nil }
                 pos += 1

@@ -157,6 +157,25 @@ def _make_handler(model, tokenizer, model_id: str, default_think_mode: str):
     from mlx_lm.generate import stream_generate
 
     class APIHandler(BaseHTTPRequestHandler):
+        # `HTTPServer` handles one connection at a time in the main thread with
+        # no timeout by default, so a client that connects and sends nothing (or
+        # drips a declared body one byte at a time) blocks `rfile.readline()`/
+        # `rfile.read()` forever and freezes the ENTIRE server for every other
+        # client. `socketserver.StreamRequestHandler.setup()` calls
+        # `self.connection.settimeout(self.timeout)` whenever this is set, and
+        # `handle_one_request()`'s existing `except socket.timeout` already
+        # closes the connection cleanly on expiry — this covers both the
+        # never-sends-anything case (header read) and the slow-loris body-drip
+        # case (`self.rfile.read(length)` in do_POST), with no change to the
+        # single-threaded execution model. Deliberately NOT switching to
+        # `ThreadingHTTPServer`: `do_POST` calls `stream_generate(model, ...)`
+        # directly with no lock/queue serializing access to the shared `model`,
+        # so concurrent requests would submit concurrent MLX generation calls
+        # against the same model object — unverified for thread-safety and a
+        # worse failure mode (possible silent corruption) than the freeze this
+        # fixes. Generation stays serialized; this only bounds idle/stalled I/O.
+        timeout = 60
+
         def log_message(self, fmt, *args):
             sys.stderr.write(f"[{self.address_string()}] {fmt % args}\n")
 

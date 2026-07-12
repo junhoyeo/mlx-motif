@@ -413,7 +413,12 @@ private struct HTTPRequest {
             if pieces.count == 2 { headers[pieces[0].lowercased()] = pieces[1].trimmingCharacters(in: .whitespaces) }
         }
         let bodyStart = marker.upperBound
-        let contentLength = Int(headers["content-length"] ?? "0") ?? 0
+        // A negative Content-Length (malformed or malicious) must never reach
+        // `prefix(_:)` below: `Collection.prefix(maxLength:)` preconditions
+        // `maxLength >= 0` and traps in release builds, which would crash the
+        // whole process on a single request. Clamp to 0, same as any other
+        // unparseable value.
+        let contentLength = max(0, Int(headers["content-length"] ?? "0") ?? 0)
         body = data[bodyStart...]
         isComplete = body.count >= contentLength
         if body.count > contentLength { body = body.prefix(contentLength) }

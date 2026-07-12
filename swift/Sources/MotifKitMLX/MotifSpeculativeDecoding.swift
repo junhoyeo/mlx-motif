@@ -106,6 +106,25 @@ struct MotifSpeculativeEngineOutcome {
 /// produce the output, never the output's distribution. Sampling draws use the
 /// MLX global RNG, so `MLXRandom.seed(_:)` makes a run reproducible.
 enum MotifSpeculativeEngine {
+    private static let residualMassEpsilon: Float = 1e-7
+
+    /// Draw the rejection correction from `max(target - draft, 0)` when its
+    /// mass is numerically meaningful. A near-tie can round the residual mass
+    /// to zero (or non-finite), so use the target argmax instead of normalizing
+    /// into NaN probabilities.
+    static func residualCorrectionToken(
+        target: MLXArray,
+        draft: MLXArray,
+        sampleIndex: (MLXArray) -> Int
+    ) -> Int {
+        let residual = maximum(target - draft, 0)
+        let residualMass = sum(residual).item(Float.self)
+        guard residualMass.isFinite, residualMass > residualMassEpsilon else {
+            return argMax(target, axis: -1).item(Int.self)
+        }
+        return sampleIndex(residual / residualMass)
+    }
+
     static func decode(
         targetModel: any LanguageModel,
         draftModel: any LanguageModel,
@@ -364,10 +383,11 @@ enum MotifSpeculativeEngine {
                 if u < acceptProbability {
                     accepted += 1
                 } else {
-                    let residual = maximum(targetDistributions[accepted] - draftDistributions[accepted], 0)
-                    // Residual mass is > 0 whenever a rejection occurs (p != q).
-                    let normalized = residual / sum(residual)
-                    correctionToken = sampleIndex(normalized)
+                    correctionToken = MotifSpeculativeEngine.residualCorrectionToken(
+                        target: targetDistributions[accepted],
+                        draft: draftDistributions[accepted],
+                        sampleIndex: sampleIndex
+                    )
                     rejected = true
                     break
                 }

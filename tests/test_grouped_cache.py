@@ -66,6 +66,50 @@ def test_mismatched_slot_heads_fail_fast(cache_factory):
         cache.update_and_fetch_4(k1, k2, v1, v2)
 
 
+@pytest.mark.parametrize("bits", [4, 8])
+def test_quantized_cache_rejects_head_dim_not_multiple_of_group_size(bits):
+    """head_dim=80 with group_size=64 would silently truncate the packed
+    scale/bias allocation (`80 // 64 == 1` group instead of 1.25) and then
+    fail opaquely inside mx.quantize at the first cache write. The cache must
+    reject the geometry loudly before allocating anything.
+    """
+    cache = MotifGroupedQuantizedKVCache(group_size=64, bits=bits)
+    slots = [_rand((1, 2, 1, 80)) for _ in range(4)]
+    with pytest.raises(ValueError, match="divisible by group_size"):
+        cache.update_and_fetch_4_quantized(*slots)
+    # The failed update must not leave partial storage behind.
+    assert cache.k1 is None
+    assert cache.offset == 0
+
+
+def test_quantized_cache_rejects_head_dim_not_multiple_of_packed_word():
+    """A head_dim that divides group_size but not the packed
+    elements-per-uint32 (32 // bits) hits the second geometry check."""
+    cache = MotifGroupedQuantizedKVCache(group_size=2, bits=4)  # el_per_int = 8
+    slots = [_rand((1, 2, 1, 6)) for _ in range(4)]
+    with pytest.raises(ValueError, match="packed elements per uint32"):
+        cache.update_and_fetch_4_quantized(*slots)
+
+
+def test_quantized_cache_rejects_invalid_group_size_and_bits():
+    with pytest.raises(ValueError, match="group_size must be a positive integer"):
+        MotifGroupedQuantizedKVCache(group_size=0, bits=8)
+    with pytest.raises(ValueError, match="group_size must be a positive integer"):
+        MotifGroupedQuantizedKVCache(group_size=-64, bits=8)
+    with pytest.raises(ValueError, match="bits must be one of"):
+        MotifGroupedQuantizedKVCache(group_size=64, bits=5)
+
+
+def test_to_quantized_rejects_head_dim_not_multiple_of_group_size():
+    """`to_quantized` quantizes live fp slots directly (no _init_storage on
+    that path), so it must run the same geometry check up front."""
+    cache = MotifGroupedKVCache()
+    slots = [_rand((1, 2, 1, 80)) for _ in range(4)]
+    cache.update_and_fetch_4(*slots)
+    with pytest.raises(ValueError, match="divisible by group_size"):
+        cache.to_quantized(group_size=64, bits=8)
+
+
 def test_unquantized_cache_roundtrip():
     mx.random.seed(0)
     B, H, D = 1, 8, 128

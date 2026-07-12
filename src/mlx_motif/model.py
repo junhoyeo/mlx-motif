@@ -966,6 +966,26 @@ class Model(nn.Module):
                     "model configuration."
                 )
             use_4slot = False
+        # The quantized 4-slot variants pack head_dim channels into fixed
+        # group_size=64 quantization groups; a non-multiple head_dim would
+        # silently truncate the packed scale/bias allocation in
+        # MotifGroupedQuantizedKVCache._init_storage and then fail opaquely
+        # inside mx.quantize on the first cache write. q4/q8 is always an
+        # EXPLICIT request (the default env value is "1"), so fail loudly at
+        # cache construction instead. (Swift mirror:
+        # MotifMLXModel.fourSlotCacheUnsupportedReason.)
+        if (
+            use_4slot
+            and self.args.is_grouped
+            and env in ("q4", "4", "q8", "8")
+            and self.head_dim % 64 != 0
+        ):
+            raise ValueError(
+                f"MLX_MOTIF_4SLOT_CACHE={raw} requires head_dim divisible by "
+                f"the quantization group size 64; got head_dim {self.head_dim}. "
+                "Unset MLX_MOTIF_4SLOT_CACHE (or use the unquantized 4-slot "
+                "cache) for this model configuration."
+            )
         caches = []
         for _layer in self.layers:
             if use_4slot and self.args.is_grouped:

@@ -242,6 +242,41 @@ def test_make_cache_allows_4slot_with_k_ratio_1(monkeypatch):
     assert type(caches[0]).__name__ == "MotifGroupedKVCache"
 
 
+def test_make_cache_rejects_quantized_4slot_with_nondivisible_head_dim(monkeypatch):
+    """The quantized 4-slot cache packs head_dim into fixed group_size=64
+    quantization groups; head_dim=80 would silently truncate the packed
+    scale/bias allocation and then fail opaquely inside mx.quantize on the
+    first cache write. q4/q8 is always an explicit request, so `make_cache`
+    must fail fast at construction instead of mid-forward.
+    """
+    model = Model(_grouped_args(head_dim=80))
+    for env in ("q4", "q8"):
+        monkeypatch.setenv("MLX_MOTIF_4SLOT_CACHE", env)
+        with pytest.raises(ValueError, match="head_dim"):
+            model.make_cache()
+
+    # The unquantized 4-slot cache has no group-size constraint: both the
+    # explicit fp request and the default-on case still work for head_dim=80.
+    monkeypatch.setenv("MLX_MOTIF_4SLOT_CACHE", "1")
+    assert type(model.make_cache()[0]).__name__ == "MotifGroupedKVCache"
+    monkeypatch.delenv("MLX_MOTIF_4SLOT_CACHE", raising=False)
+    assert type(model.make_cache()[0]).__name__ == "MotifGroupedKVCache"
+
+
+def test_make_cache_allows_quantized_4slot_with_divisible_head_dim(monkeypatch):
+    """head_dim divisible by the group size builds the quantized cache."""
+    model = Model(_grouped_args(head_dim=64))
+    monkeypatch.setenv("MLX_MOTIF_4SLOT_CACHE", "q4")
+    caches = model.make_cache()
+    assert type(caches[0]).__name__ == "MotifGroupedQuantizedKVCache"
+    assert caches[0].bits == 4
+
+    monkeypatch.setenv("MLX_MOTIF_4SLOT_CACHE", "q8")
+    caches = model.make_cache()
+    assert type(caches[0]).__name__ == "MotifGroupedQuantizedKVCache"
+    assert caches[0].bits == 8
+
+
 def _grouped_args_d64(**overrides) -> ModelArgs:
     """Same topology as `_grouped_args` but head_dim=64 — minimum viable size
     for the q4 attention kernel (`group_size=64` requires `head_dim >= 64`)."""

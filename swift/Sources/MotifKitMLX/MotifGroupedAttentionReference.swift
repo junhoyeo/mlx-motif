@@ -534,6 +534,20 @@ public final class MotifGroupedQuantizedKVCache: KVCache, CustomDebugStringConve
     private func initQuantizedStorage(batch: Int, heads: Int, sequenceLength: Int, headDim: Int, dtype: DType)
         -> MotifQuantizedTuple
     {
+        // A head_dim that doesn't divide into whole quantization groups (or
+        // whole packed uint32 words) would silently truncate `packedLast` /
+        // `groups` below and then fail opaquely inside `quantized(...)` at the
+        // first cache write. The model-level guard
+        // (`MotifMLXModel.fourSlotCacheUnsupportedReason`) rejects this before
+        // a cache is ever built; this precondition keeps direct constructions
+        // honest. (Python mirror: `MotifGroupedQuantizedKVCache
+        // ._validate_head_dim` in src/mlx_motif/cache.py.)
+        precondition(
+            groupSize > 0 && bits > 0 && headDim % groupSize == 0 && (headDim * bits) % 32 == 0,
+            "Quantized 4-slot KV cache requires head_dim divisible by group_size and "
+                + "by the packed uint32 word; got head_dim=\(headDim), "
+                + "groupSize=\(groupSize), bits=\(bits)"
+        )
         // Allocate the packed storage directly instead of materializing a full
         // fp zeros slab and running the quantize kernel over it just to obtain
         // correctly-shaped buffers. Quantizing zeros produces all-zero packed

@@ -241,6 +241,39 @@ final class MotifSpeculativeDecodingTests: XCTestCase {
         XCTAssertEqual(outcome.tokens.count, 8, "sampling must still honor the maxTokens budget")
     }
 
+    func testNearZeroResidualFallsBackToTargetArgmax() throws {
+        try requireMLXRuntime()
+
+        let target = MLXArray([Float(0.1), 0.2, 0.6, 0.1])
+        let nearTieDraft = MLXArray([Float(0.1) - Float(1e-8), 0.2, 0.6, 0.1])
+        var nearTieSamplerCalled = false
+        let fallbackToken = MotifSpeculativeEngine.residualCorrectionToken(
+            target: target,
+            draft: nearTieDraft,
+            sampleIndex: { _ in
+                nearTieSamplerCalled = true
+                return 0
+            }
+        )
+
+        XCTAssertEqual(fallbackToken, 2)
+        XCTAssertFalse(nearTieSamplerCalled, "near-zero residuals must not be normalized and sampled")
+
+        let ordinaryDraft = MLXArray([Float(0.05), 0.25, 0.6, 0.1])
+        var ordinarySamplerCalled = false
+        let sampledToken = MotifSpeculativeEngine.residualCorrectionToken(
+            target: target,
+            draft: ordinaryDraft,
+            sampleIndex: { _ in
+                ordinarySamplerCalled = true
+                return 3
+            }
+        )
+
+        XCTAssertEqual(sampledToken, 3)
+        XCTAssertTrue(ordinarySamplerCalled, "meaningful residuals must use the sampler")
+    }
+
     /// (ii) Self-draft (draft == target) means q == p at every position, so the
     /// accept probability min(1, p/q) is 1 and essentially every proposal is
     /// accepted. Assert acceptance rate > 0.95 over a run.

@@ -190,6 +190,34 @@ final class MotifGroupedAttentionReferenceTests: XCTestCase {
         )
     }
 
+    // A serialized metaState is untrusted input; a negative or beyond-capacity
+    // restored offset would silently mis-slice the live region on every fetch.
+    // The setter itself uses preconditionFailure (uncatchable in XCTest), so the
+    // boundary logic is factored into the pure `motifRestoredOffsetError` helper
+    // exercised directly here. (Python mirror: the meta_state setters in
+    // src/mlx_motif/cache.py / tests/test_grouped_cache.py.)
+    func testRestoredOffsetErrorAcceptsInRangeOffsets() {
+        XCTAssertNil(motifRestoredOffsetError(offset: 0, capacity: 256))
+        XCTAssertNil(motifRestoredOffsetError(offset: 3, capacity: 256))
+        XCTAssertNil(motifRestoredOffsetError(offset: 256, capacity: 256))
+        // No slots restored yet (capacity unknown) — only non-negativity applies.
+        XCTAssertNil(motifRestoredOffsetError(offset: 9, capacity: nil))
+    }
+
+    func testRestoredOffsetErrorRejectsNegativeOffset() {
+        let reason = motifRestoredOffsetError(offset: -1, capacity: 256)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason?.contains("non-negative") ?? false, reason ?? "nil")
+        // Rejected even when the capacity is not yet known.
+        XCTAssertNotNil(motifRestoredOffsetError(offset: -1, capacity: nil))
+    }
+
+    func testRestoredOffsetErrorRejectsBeyondCapacityOffset() {
+        let reason = motifRestoredOffsetError(offset: 257, capacity: 256)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason?.contains("exceeds") ?? false, reason ?? "nil")
+    }
+
     private func requireMLXRuntime(file: StaticString = #filePath, line: UInt = #line) throws {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["MOTIFKIT_RUN_MLX_RUNTIME_TESTS"] == "1",

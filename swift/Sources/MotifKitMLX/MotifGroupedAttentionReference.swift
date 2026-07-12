@@ -30,6 +30,25 @@ func motifAssertUniformSlotHeads(
     )
 }
 
+/// Validates an `offset` recovered from a serialized `metaState` against the
+/// (already-restored) slot capacity. Returns an error message when the offset
+/// is unusable, or `nil` when it is fine. A serialized cache is untrusted
+/// input (a corrupted or crafted prompt-cache file); a negative or
+/// beyond-capacity offset would silently mis-slice the live region on every
+/// subsequent fetch. Exposed as a pure helper because the `metaState` setter
+/// cannot throw, so the boundary check is unit-testable without tripping the
+/// `preconditionFailure` in the setter. (Python mirror: the `meta_state`
+/// setters in src/mlx_motif/cache.py.)
+func motifRestoredOffsetError(offset: Int, capacity: Int?) -> String? {
+    if offset < 0 {
+        return "restored cache offset must be non-negative; got \(offset)"
+    }
+    if let capacity, offset > capacity {
+        return "restored cache offset \(offset) exceeds the restored slot capacity \(capacity)"
+    }
+    return nil
+}
+
 public enum MotifGroupedAttentionReferenceError: Error, LocalizedError, Equatable, Sendable {
     case requiresGroupedDifferentialAttention
     case invalidShape(String)
@@ -397,7 +416,11 @@ public final class MotifGroupedKVCache: KVCache, CustomDebugStringConvertible {
         get { [String(offset), String(step)] }
         set {
             guard !newValue.isEmpty else { return }
-            offset = Int(newValue[0]) ?? 0
+            let restored = Int(newValue[0]) ?? 0
+            if let reason = motifRestoredOffsetError(offset: restored, capacity: kOrigin?.dim(2)) {
+                preconditionFailure(reason)
+            }
+            offset = restored
             if newValue.count > 1 {
                 step = Int(newValue[1]) ?? step
             }
@@ -665,7 +688,14 @@ public final class MotifGroupedQuantizedKVCache: KVCache, CustomDebugStringConve
         get { [String(offset), String(groupSize), String(bits), String(step)] }
         set {
             guard !newValue.isEmpty else { return }
-            offset = Int(newValue[0]) ?? 0
+            // groupSize/bits are immutable `let`s here, so — unlike the Python
+            // mirror — the restore path cannot corrupt them; only offset needs
+            // the boundary check (capacity lives on the packed triple's data).
+            let restored = Int(newValue[0]) ?? 0
+            if let reason = motifRestoredOffsetError(offset: restored, capacity: kOrigin?.data.dim(2)) {
+                preconditionFailure(reason)
+            }
+            offset = restored
             if newValue.count > 3 {
                 step = Int(newValue[3]) ?? step
             }

@@ -110,6 +110,53 @@ def test_to_quantized_rejects_head_dim_not_multiple_of_group_size():
         cache.to_quantized(group_size=64, bits=8)
 
 
+def test_quantized_meta_state_setter_rejects_bogus_group_size_and_bits():
+    """A serialized meta_state is untrusted input; restoring group_size=0 or
+    bits=0 would later divide by zero in _init_storage. The setter must reject
+    it at the restore boundary, exactly like __init__.
+    """
+    cache = MotifGroupedQuantizedKVCache(group_size=64, bits=8)
+    with pytest.raises(ValueError, match="group_size must be a positive integer"):
+        cache.meta_state = ("3", "0", "8")
+    with pytest.raises(ValueError, match="bits must be one of"):
+        cache.meta_state = ("3", "64", "0")
+    with pytest.raises(ValueError, match="bits must be one of"):
+        cache.meta_state = ("3", "64", "7")
+    # The rejected restore must not mutate the cache's live params.
+    assert cache.group_size == 64
+    assert cache.bits == 8
+    assert cache.offset == 0
+
+
+@pytest.mark.parametrize(
+    "cache_factory",
+    [
+        MotifGroupedKVCache,
+        lambda: MotifGroupedQuantizedKVCache(group_size=64, bits=8),
+    ],
+    ids=["fp16", "quantized"],
+)
+def test_meta_state_setter_rejects_out_of_range_offset(cache_factory):
+    """A negative or beyond-capacity restored offset would silently mis-slice
+    the live region on every subsequent fetch. Reject both at restore time."""
+    cache = cache_factory()
+    B, H, D = 1, 4, 128
+    for _ in range(3):
+        t = _rand((B, H, 1, D))
+        cache.update_and_fetch_4(t, t, t, t)
+    capacity = cache._slot_capacity(cache.k1)  # step-padded (256)
+
+    good = cache.meta_state  # (offset=3, [group_size, bits])
+    with pytest.raises(ValueError, match="non-negative"):
+        cache.meta_state = ("-1",) + tuple(good[1:])
+    with pytest.raises(ValueError, match="exceeds the restored slot capacity"):
+        cache.meta_state = (str(capacity + 1),) + tuple(good[1:])
+
+    # A valid offset within capacity still restores cleanly.
+    cache.meta_state = good
+    assert cache.offset == 3
+
+
 def test_unquantized_cache_roundtrip():
     mx.random.seed(0)
     B, H, D = 1, 8, 128

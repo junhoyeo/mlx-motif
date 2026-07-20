@@ -395,6 +395,7 @@ class MotifGroupedKVCache(MotifGroupedKVCacheBase):
         """Switch to the quantized variant — keeps the 4 slots, quantizes them."""
         new = MotifGroupedQuantizedKVCache(group_size=group_size, bits=bits)
         if self.offset > 0:
+            new._validate_head_dim(self.k1.shape[-1])
             o = self.offset
             new.k1 = mx.quantize(self.k1[..., :o, :], group_size=group_size, bits=bits)
             new.k2 = mx.quantize(self.k2[..., :o, :], group_size=group_size, bits=bits)
@@ -415,10 +416,40 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
     """
 
     def __init__(self, group_size: int = 64, bits: int = 8):
+        if type(group_size) is not int or group_size <= 0:
+            raise ValueError(f"group_size must be a positive integer; got {group_size!r}")
+        if type(bits) is not int or bits not in (2, 4, 8):
+            raise ValueError(
+                f"bits must be one of (2, 4, 8) for the quantized 4-slot KV cache; got {bits!r}"
+            )
         self.k1 = self.k2 = self.v1 = self.v2 = None
         self.offset = 0
         self.group_size = group_size
         self.bits = bits
+
+    def _validate_head_dim(self, D: int) -> None:
+        """Reject head dims the packed storage cannot represent exactly.
+
+        `_init_storage` sizes the scale/bias buffers as `D // group_size` and
+        the packed words as `D // el_per_int`; a non-multiple `D` would
+        silently truncate those allocations and then fail opaquely inside
+        `mx.quantize` at the first cache write. head_dim comes from the
+        (untrusted) checkpoint config, so fail loudly with the geometry
+        instead. (Swift mirror: `initQuantizedStorage` in
+        MotifGroupedAttentionReference.swift.)
+        """
+        if D % self.group_size != 0:
+            raise ValueError(
+                "head_dim must be divisible by group_size for the quantized "
+                f"4-slot KV cache; got head_dim {D} and group_size {self.group_size}"
+            )
+        el_per_int = 8 * mx.uint32.size // self.bits
+        if D % el_per_int != 0:
+            raise ValueError(
+                "head_dim must be divisible by the packed elements per uint32 "
+                f"(32 // bits = {el_per_int}) for the quantized 4-slot KV cache; "
+                f"got head_dim {D} and bits {self.bits}"
+            )
 
     # ------------------------------------------------------------------
     # Storage hooks (quantized triples)
@@ -428,6 +459,7 @@ class MotifGroupedQuantizedKVCache(MotifGroupedKVCacheBase):
         return slot[0].shape[2]
 
     def _init_storage(self, B: int, H: int, n: int, D: int, dtype):
+        self._validate_head_dim(D)
         el_per_int = 8 * mx.uint32.size // self.bits
         return (
             mx.zeros((B, H, n, D // el_per_int), dtype=mx.uint32),

@@ -885,9 +885,12 @@ public final class MotifMLXModel: Module, LLMModel, KVCacheDimensionProvider {
         // the default-on case (env var unset) quietly falls back to the stock
         // cache so unsupported configs still run. (Python mirror:
         // Model.make_cache.)
+        let quantizedGroupSize = parameters?.kvGroupSize ?? 64
         if let reason = Self.fourSlotCacheUnsupportedReason(
             mode: runtimeFeatures.fourSlotCacheMode,
-            kRatio: configuration.kRatio
+            kRatio: configuration.kRatio,
+            headDim: configuration.effectiveHeadDim,
+            groupSize: quantizedGroupSize
         ) {
             guard runtimeFeatures.fourSlotCache != nil else {
                 return Self.defaultCaches(
@@ -903,11 +906,11 @@ public final class MotifMLXModel: Module, LLMModel, KVCacheDimensionProvider {
             return (0 ..< configuration.numHiddenLayers).map { _ in MotifGroupedKVCache() }
         case .q4:
             return (0 ..< configuration.numHiddenLayers).map { _ in
-                MotifGroupedQuantizedKVCache(groupSize: parameters?.kvGroupSize ?? 64, bits: 4)
+                MotifGroupedQuantizedKVCache(groupSize: quantizedGroupSize, bits: 4)
             }
         case .q8:
             return (0 ..< configuration.numHiddenLayers).map { _ in
-                MotifGroupedQuantizedKVCache(groupSize: parameters?.kvGroupSize ?? 64, bits: 8)
+                MotifGroupedQuantizedKVCache(groupSize: quantizedGroupSize, bits: 8)
             }
         }
     }
@@ -919,16 +922,38 @@ public final class MotifMLXModel: Module, LLMModel, KVCacheDimensionProvider {
     /// The four-slot grouped caches allocate every slot with kOrigin's head
     /// count; with `kRatio > 1` the kOrigin slot has `keyGroups*kRatio` heads
     /// while kNoise/value1/value2 have `keyGroups` heads, so the combination is
-    /// unsupported. (Python mirror: `Model.make_cache`.)
+    /// unsupported. The quantized modes additionally require `headDim` to
+    /// divide into whole `groupSize` quantization groups — a non-multiple
+    /// would silently truncate the packed scale/bias allocation in
+    /// `initQuantizedStorage` and then fail opaquely inside `quantized(...)`
+    /// at the first cache write. (Python mirror: `Model.make_cache`.)
     static func fourSlotCacheUnsupportedReason(
         mode: MotifRuntimeFeatureFlags.FourSlotCacheMode,
-        kRatio: Int
+        kRatio: Int,
+        headDim: Int,
+        groupSize: Int
     ) -> String? {
-        guard mode != .disabled, kRatio != 1 else { return nil }
-        return "Four-slot grouped KV cache is not supported with kRatio > 1 "
-            + "(got kRatio=\(kRatio)): every slot is allocated with kOrigin's head "
-            + "count, which differs from kNoise/value1/value2 when kRatio > 1. "
-            + "Disable the four-slot cache for this configuration."
+        guard mode != .disabled else { return nil }
+        if kRatio != 1 {
+            return "Four-slot grouped KV cache is not supported with kRatio > 1 "
+                + "(got kRatio=\(kRatio)): every slot is allocated with kOrigin's head "
+                + "count, which differs from kNoise/value1/value2 when kRatio > 1. "
+                + "Disable the four-slot cache for this configuration."
+        }
+        if mode == .q4 || mode == .q8 {
+            guard groupSize > 0 else {
+                return "Four-slot quantized KV cache requires a positive quantization "
+                    + "group size; got groupSize=\(groupSize)."
+            }
+            if headDim % groupSize != 0 {
+                return "Four-slot quantized KV cache requires head_dim divisible by "
+                    + "the quantization group size (got head_dim=\(headDim), "
+                    + "groupSize=\(groupSize)): the packed scale/bias allocation would "
+                    + "silently truncate and quantization would fail mid-forward. "
+                    + "Disable the four-slot cache for this configuration."
+            }
+        }
+        return nil
     }
 
     private static func defaultCaches(count: Int, parameters: GenerateParameters?) -> [KVCache] {

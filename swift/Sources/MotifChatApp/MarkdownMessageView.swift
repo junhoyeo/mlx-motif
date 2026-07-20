@@ -18,6 +18,8 @@ struct MarkdownMessageView: View {
           ProseView(text: text)
         case .code(let code, let language):
           CodeBlockView(code: code, language: language)
+        case .displayMath(let math):
+          DisplayMathView(math: math)
         }
       }
     }
@@ -51,7 +53,7 @@ private struct ProseView: View {
   private func blockView(_ block: MarkdownProseBlock) -> some View {
     switch block.kind {
     case .paragraph(let text):
-      inlineText(text)
+      InlineContentView(text: text)
     case .heading(let level, let text):
       inlineText(text)
         .font(headingFont(level))
@@ -88,7 +90,7 @@ private struct ProseView: View {
                 .monospacedDigit()
                 .frame(minWidth: 20, alignment: .trailing)
             }
-            inlineText(item.text)
+            InlineContentView(text: item.text)
           }
           .accessibilityElement(children: .combine)
           .accessibilityLabel(listItemAccessibilityLabel(item, style: style))
@@ -141,10 +143,7 @@ private struct ProseView: View {
   }
 
   private func inlineAttributedString(_ line: String) -> AttributedString {
-    (try? AttributedString(
-      markdown: line,
-      options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
-    )) ?? AttributedString(line)
+    inlineMarkdownAttributedString(line)
   }
 
   /// Heading sizes step down with level; H4+ clamp to headline-weight body.
@@ -162,6 +161,50 @@ private struct ProseView: View {
     Text(inlineAttributedString(line))
       .textSelection(.enabled)
       .fixedSize(horizontal: false, vertical: true)
+  }
+}
+
+/// Inline markdown for a single line, falling back to plain text on parse
+/// failure. Shared between prose rendering and the math-aware line view.
+func inlineMarkdownAttributedString(_ line: String) -> AttributedString {
+  (try? AttributedString(
+    markdown: line,
+    options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+  )) ?? AttributedString(line)
+}
+
+/// Renders paragraph/list text line-by-line, switching a line to the wrapping
+/// math renderer when it contains inline `\(…\)` / `$…$`, and otherwise keeping
+/// the plain inline-markdown path (bold/italic/inline-code).
+private struct InlineContentView: View {
+  let text: String
+
+  var body: some View {
+    let lines = text.components(separatedBy: "\n")
+    VStack(alignment: .leading, spacing: 2) {
+      ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+        if MathInline.hasMath(line) {
+          MathInlineView(line: line)
+        } else {
+          Text(inlineMarkdownAttributedString(line))
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+      }
+    }
+  }
+}
+
+/// A centered display-math block (`\[…\]` / `$$…$$`).
+private struct DisplayMathView: View {
+  let math: String
+
+  var body: some View {
+    MathView(nodes: LaTeXMath.parse(math), display: true)
+      .padding(.vertical, 6)
+      .frame(maxWidth: .infinity, alignment: .center)
+      .accessibilityElement()
+      .accessibilityLabel(Text("Math: \(math)"))
   }
 }
 
@@ -387,17 +430,36 @@ private struct CodeBlockView: View {
 enum MarkdownSegment: Equatable {
   case prose(String)
   case code(String, language: String?)
+  /// A block-level display-math region (`\[…\]` / `$$…$$`), possibly spanning
+  /// several source lines.
+  case displayMath(String)
 
   /// Returns segments with source-line identities that remain stable as new
   /// lines and tokens are appended during streaming.
   static func identifiedSegments(from content: String) -> [IdentifiedMarkdownSegment] {
-    guard content.contains("```") else {
+    let hasFence = content.contains("```")
+    let hasDisplayMath = content.contains("\\[") || content.contains("$$")
+    guard hasFence || hasDisplayMath else {
       let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
       return trimmed.isEmpty ? [] : [.init(id: 0, segment: .prose(content))]
     }
 
     var segments: [IdentifiedMarkdownSegment] = []
     let lines = content.components(separatedBy: "\n")
+
+    // Segment identity is the source line where it starts, which stays stable as
+    // an append-only response streams. A single line can emit two segments
+    // (same-line display math + trailing prose); disambiguate the collision with
+    // a fixed high offset so IDs stay unique for `ForEach` without depending on
+    // total length (which would shift every token).
+    var usedIDs = Set<Int>()
+    func uniqueID(_ base: Int) -> Int {
+      var id = base
+      while usedIDs.contains(id) { id += 1_000_000 }
+      usedIDs.insert(id)
+      return id
+    }
+
     var proseBuffer: [String] = []
     var proseStartLine: Int?
     var codeBuffer: [String] = []
@@ -405,19 +467,29 @@ enum MarkdownSegment: Equatable {
     var codeLanguage: String?
     var inCode = false
 
+    // Display-math accumulation across lines (`\[ … \]`, `$$ … $$`).
+    var displayBuffer: [String] = []
+    var displayStartLine: Int?
+    var displayCloser: String?
+
     func flushProse() {
       let joined = proseBuffer.joined(separator: "\n")
       if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        segments.append(.init(id: proseStartLine ?? 0, segment: .prose(joined)))
+        segments.append(.init(id: uniqueID(proseStartLine ?? 0), segment: .prose(joined)))
       }
       proseBuffer.removeAll(keepingCapacity: true)
       proseStartLine = nil
     }
 
+    func appendProse(_ line: String, at lineNumber: Int) {
+      if proseStartLine == nil { proseStartLine = lineNumber }
+      proseBuffer.append(line)
+    }
+
     func flushCode() {
       segments.append(
         .init(
-          id: codeStartLine ?? 0,
+          id: uniqueID(codeStartLine ?? 0),
           segment: .code(codeBuffer.joined(separator: "\n"), language: codeLanguage)
         ))
       codeBuffer.removeAll(keepingCapacity: true)
@@ -425,33 +497,91 @@ enum MarkdownSegment: Equatable {
       codeLanguage = nil
     }
 
-    for (lineNumber, line) in lines.enumerated() {
-      if line.hasPrefix("```") {
-        if inCode {
-          // Closing fence.
-          flushCode()
-          inCode = false
-        } else {
-          // Opening fence — capture optional language tag.
-          flushProse()
-          codeStartLine = lineNumber
-          let lang = line.dropFirst(3).trimmingCharacters(in: .whitespaces)
-          codeLanguage = lang.isEmpty ? nil : lang
-          inCode = true
+    func flushDisplayMath() {
+      let math = displayBuffer.joined(separator: "\n")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      segments.append(.init(id: uniqueID(displayStartLine ?? 0), segment: .displayMath(math)))
+      displayBuffer.removeAll(keepingCapacity: true)
+      displayStartLine = nil
+      displayCloser = nil
+    }
+
+    /// Opens display math on `line`; closes immediately if the closer is on the
+    /// same line, otherwise arms multi-line accumulation.
+    func openDisplayMath(afterOpen: String, closer: String, at lineNumber: Int) {
+      flushProse()
+      displayStartLine = lineNumber
+      if let r = afterOpen.range(of: closer) {
+        displayBuffer = [String(afterOpen[afterOpen.startIndex..<r.lowerBound])]
+        flushDisplayMath()
+        let suffix = String(afterOpen[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+        if !suffix.isEmpty {
+          appendProse(suffix, at: lineNumber)
         }
-        continue
-      }
-      if inCode {
-        codeBuffer.append(line)
       } else {
-        if proseStartLine == nil { proseStartLine = lineNumber }
-        proseBuffer.append(line)
+        displayCloser = closer
+        let head = afterOpen.trimmingCharacters(in: .whitespaces)
+        displayBuffer = head.isEmpty ? [] : [afterOpen]
       }
     }
 
-    // Streaming: an unterminated code fence still renders its partial content.
+    for (lineNumber, line) in lines.enumerated() {
+      // Fenced code takes priority and is unaffected by math delimiters.
+      if inCode {
+        if line.hasPrefix("```") {
+          flushCode()
+          inCode = false
+        } else {
+          codeBuffer.append(line)
+        }
+        continue
+      }
+
+      // Inside a multi-line display-math block, scan for its closer.
+      if let closer = displayCloser {
+        if let r = line.range(of: closer) {
+          let prefix = String(line[line.startIndex..<r.lowerBound])
+          if !prefix.trimmingCharacters(in: .whitespaces).isEmpty {
+            displayBuffer.append(prefix)
+          }
+          flushDisplayMath()
+          let suffix = String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+          if !suffix.isEmpty {
+            appendProse(suffix, at: lineNumber)
+          }
+        } else {
+          displayBuffer.append(line)
+        }
+        continue
+      }
+
+      if line.hasPrefix("```") {
+        flushProse()
+        codeStartLine = lineNumber
+        let lang = line.dropFirst(3).trimmingCharacters(in: .whitespaces)
+        codeLanguage = lang.isEmpty ? nil : lang
+        inCode = true
+        continue
+      }
+
+      let trimmed = line.trimmingCharacters(in: .whitespaces)
+      if trimmed.hasPrefix("\\[") {
+        openDisplayMath(afterOpen: String(trimmed.dropFirst(2)), closer: "\\]", at: lineNumber)
+        continue
+      }
+      if trimmed.hasPrefix("$$") {
+        openDisplayMath(afterOpen: String(trimmed.dropFirst(2)), closer: "$$", at: lineNumber)
+        continue
+      }
+
+      appendProse(line, at: lineNumber)
+    }
+
+    // Streaming: unterminated code / display-math still renders partial content.
     if inCode {
       flushCode()
+    } else if displayCloser != nil {
+      flushDisplayMath()
     } else {
       flushProse()
     }

@@ -159,7 +159,10 @@ private struct MathParser {
     case "boxed", "fbox":
       return (.boxed(parseGroupArgument()), false)
     case "text", "mathrm", "operatorname", "mathbf", "mathsf", "mathtt", "mathit", "textbf", "textit", "mathcal", "mathbb":
-      return (.text(flatten(parseGroupArgument())), false)
+      // Text-like commands hold ordinary prose ("for all"), so read the brace
+      // body verbatim rather than through the math-row parser (which drops
+      // whitespace between atoms).
+      return (.text(parseRawGroup()), false)
     case "left", "right":
       // Keep the delimiter that follows; `.` means an invisible fence.
       if let d = current {
@@ -224,17 +227,36 @@ private struct MathParser {
     }
   }
 
-  /// Collapses a node list to plain text (for `\text{…}` and friends).
-  private func flatten(_ nodes: [MathNode]) -> String {
-    nodes.map { node -> String in
-      switch node {
-      case .run(let s, _): return s
-      case .text(let s): return s
-      case .space: return " "
-      case .row(let inner): return flatten(inner)
-      default: return ""
+  /// Reads a `{…}` brace body verbatim (whitespace preserved, nested braces
+  /// balanced, `\{`/`\}` unescaped), for text-like commands. Falls back to a
+  /// single following character when there is no brace group.
+  private mutating func parseRawGroup() -> String {
+    while let c = current, c == " " { i += 1 }
+    guard current == "{" else {
+      if let c = current { i += 1; return String(c) }
+      return ""
+    }
+    i += 1  // consume "{"
+    var depth = 1
+    var out = ""
+    while let c = current {
+      if c == "\\" {
+        i += 1
+        if let escaped = current { out.append(escaped); i += 1 }
+        continue
       }
-    }.joined()
+      if c == "{" { depth += 1; out.append(c); i += 1; continue }
+      if c == "}" {
+        depth -= 1
+        i += 1
+        if depth == 0 { break }
+        out.append(c)
+        continue
+      }
+      out.append(c)
+      i += 1
+    }
+    return out
   }
 }
 
@@ -555,6 +577,26 @@ enum MathInline {
     while i < chars.count {
       let c = chars[i]
 
+      // Markdown inline code spans win over math: a `…` run keeps its content
+      // literal so `` `$x$` `` renders as code, not an equation. Multi-backtick
+      // fences (``code``) are matched by run length.
+      if c == "`" {
+        var runLength = 0
+        var j = i
+        while j < chars.count, chars[j] == "`" { runLength += 1; j += 1 }
+        if let closeStart = findBacktickRun(chars, from: j, length: runLength) {
+          let end = closeStart + runLength
+          text.append(contentsOf: chars[i..<end])
+          i = end
+          continue
+        } else {
+          // Unterminated fence — keep the backticks literal and move on.
+          text.append(contentsOf: chars[i..<j])
+          i = j
+          continue
+        }
+      }
+
       // \( … \)  and inline \[ … \]  (unambiguous LaTeX delimiters).
       if c == "\\", i + 1 < chars.count, chars[i + 1] == "(" || chars[i + 1] == "[" {
         let closer: Character = chars[i + 1] == "(" ? ")" : "]"
@@ -586,6 +628,24 @@ enum MathInline {
 
     flushText()
     return spans
+  }
+
+  /// Finds the start index of a backtick run of exactly `length` (the closing
+  /// fence of an inline code span). A longer run does not close it.
+  private static func findBacktickRun(_ chars: [Character], from: Int, length: Int) -> Int? {
+    var i = from
+    while i < chars.count {
+      if chars[i] == "`" {
+        var run = 0
+        var j = i
+        while j < chars.count, chars[j] == "`" { run += 1; j += 1 }
+        if run == length { return i }
+        i = j
+      } else {
+        i += 1
+      }
+    }
+    return nil
   }
 
   /// Finds the start index of a `\<closer>` escaped delimiter (e.g. `\)`).
@@ -638,46 +698,64 @@ struct MathLineToken: Identifiable, Equatable {
   let id: Int
   let kind: Kind
 
+  /// Sentinel (Unicode private-use) standing in for a math span while the whole
+  /// line is parsed as Markdown once, so emphasis that brackets math (e.g.
+  /// `**energy $E$ is conserved**`) resolves instead of leaving unmatched
+  /// markers on either side of the split.
+  private static let mathPlaceholder: Character = "\u{E000}"
+
   static func tokens(from line: String) -> [MathLineToken] {
-    var out: [MathLineToken] = []
-    var id = 0
+    // Replace each math span with a placeholder, parse the combined line as
+    // Markdown once, then split back into words + math atoms.
+    var combined = ""
+    var mathSources: [String] = []
     for span in MathInline.spans(line) {
       switch span {
-      case .math(let src):
-        out.append(.init(id: id, kind: .math(src)))
-        id += 1
       case .text(let text):
-        // Parse markdown for the whole text run first, then split into words so
-        // emphasis spanning multiple words (e.g. **Final Answer**) survives.
-        for word in splitAttributedWords(inlineMarkdownAttributedString(text)) {
-          out.append(.init(id: id, kind: .word(word)))
-          id += 1
-        }
+        combined += text
+      case .math(let source):
+        combined.append(mathPlaceholder)
+        mathSources.append(source)
       }
     }
-    return out
-  }
 
-  /// Splits an attributed run into word tokens, each keeping its trailing space
-  /// and its character attributes, so wrapping preserves both spacing and
-  /// bold/italic/inline-code styling.
-  private static func splitAttributedWords(_ attr: AttributedString) -> [AttributedString] {
-    var words: [AttributedString] = []
+    let attr = inlineMarkdownAttributedString(combined)
+    var out: [MathLineToken] = []
+    var id = 0
+    var mathIndex = 0
     var current = AttributedString()
+
+    func flushWord() {
+      if !current.characters.isEmpty {
+        out.append(.init(id: id, kind: .word(current)))
+        id += 1
+        current = AttributedString()
+      }
+    }
+
     let characters = attr.characters
     var idx = characters.startIndex
     while idx < characters.endIndex {
       let next = characters.index(after: idx)
       let ch = characters[idx]
-      current.append(AttributedString(attr[idx..<next]))
-      if ch == " " {
-        words.append(current)
-        current = AttributedString()
+      if ch == mathPlaceholder {
+        flushWord()
+        if mathIndex < mathSources.count {
+          out.append(.init(id: id, kind: .math(mathSources[mathIndex])))
+          id += 1
+          mathIndex += 1
+        }
+        idx = next
+        continue
       }
+      current.append(AttributedString(attr[idx..<next]))
+      // Break word tokens on spaces so wrapping stays word-granular; each token
+      // keeps its trailing space and its Markdown attributes.
+      if ch == " " { flushWord() }
       idx = next
     }
-    if !current.characters.isEmpty { words.append(current) }
-    return words
+    flushWord()
+    return out
   }
 }
 

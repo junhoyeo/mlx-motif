@@ -446,6 +446,20 @@ enum MarkdownSegment: Equatable {
 
     var segments: [IdentifiedMarkdownSegment] = []
     let lines = content.components(separatedBy: "\n")
+
+    // Segment identity is the source line where it starts, which stays stable as
+    // an append-only response streams. A single line can emit two segments
+    // (same-line display math + trailing prose); disambiguate the collision with
+    // a fixed high offset so IDs stay unique for `ForEach` without depending on
+    // total length (which would shift every token).
+    var usedIDs = Set<Int>()
+    func uniqueID(_ base: Int) -> Int {
+      var id = base
+      while usedIDs.contains(id) { id += 1_000_000 }
+      usedIDs.insert(id)
+      return id
+    }
+
     var proseBuffer: [String] = []
     var proseStartLine: Int?
     var codeBuffer: [String] = []
@@ -461,7 +475,7 @@ enum MarkdownSegment: Equatable {
     func flushProse() {
       let joined = proseBuffer.joined(separator: "\n")
       if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        segments.append(.init(id: proseStartLine ?? 0, segment: .prose(joined)))
+        segments.append(.init(id: uniqueID(proseStartLine ?? 0), segment: .prose(joined)))
       }
       proseBuffer.removeAll(keepingCapacity: true)
       proseStartLine = nil
@@ -475,7 +489,7 @@ enum MarkdownSegment: Equatable {
     func flushCode() {
       segments.append(
         .init(
-          id: codeStartLine ?? 0,
+          id: uniqueID(codeStartLine ?? 0),
           segment: .code(codeBuffer.joined(separator: "\n"), language: codeLanguage)
         ))
       codeBuffer.removeAll(keepingCapacity: true)
@@ -486,7 +500,7 @@ enum MarkdownSegment: Equatable {
     func flushDisplayMath() {
       let math = displayBuffer.joined(separator: "\n")
         .trimmingCharacters(in: .whitespacesAndNewlines)
-      segments.append(.init(id: displayStartLine ?? 0, segment: .displayMath(math)))
+      segments.append(.init(id: uniqueID(displayStartLine ?? 0), segment: .displayMath(math)))
       displayBuffer.removeAll(keepingCapacity: true)
       displayStartLine = nil
       displayCloser = nil
@@ -500,8 +514,8 @@ enum MarkdownSegment: Equatable {
       if let r = afterOpen.range(of: closer) {
         displayBuffer = [String(afterOpen[afterOpen.startIndex..<r.lowerBound])]
         flushDisplayMath()
-        let suffix = String(afterOpen[r.upperBound...])
-        if !suffix.trimmingCharacters(in: .whitespaces).isEmpty {
+        let suffix = String(afterOpen[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+        if !suffix.isEmpty {
           appendProse(suffix, at: lineNumber)
         }
       } else {
@@ -531,8 +545,8 @@ enum MarkdownSegment: Equatable {
             displayBuffer.append(prefix)
           }
           flushDisplayMath()
-          let suffix = String(line[r.upperBound...])
-          if !suffix.trimmingCharacters(in: .whitespaces).isEmpty {
+          let suffix = String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+          if !suffix.isEmpty {
             appendProse(suffix, at: lineNumber)
           }
         } else {

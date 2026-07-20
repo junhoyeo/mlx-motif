@@ -144,4 +144,45 @@ final class LaTeXMathTests: XCTestCase {
         let complete = MarkdownSegment.identifiedSegments(from: "Intro\n\\[\na+b\n\\]")
         XCTAssertEqual(partial.map(\.id), complete.map(\.id))
     }
+
+    // MARK: Regressions from adversarial review
+
+    func testSameLineDisplayMathAndTrailingProseGetUniqueIDs() {
+        let segments = MarkdownSegment.identifiedSegments(from: "$$x$$ trailing")
+        XCTAssertEqual(segments.map(\.segment), [.displayMath("x"), .prose("trailing")])
+        XCTAssertEqual(Set(segments.map(\.id)).count, segments.count, "Segment IDs must be unique for ForEach")
+    }
+
+    func testInlineCodeSpanSuppressesMathDelimiters() {
+        XCTAssertFalse(MathInline.hasMath("use `$x$` literally"))
+        XCTAssertEqual(MathInline.spans("use `$x$` literally"), [.text("use `$x$` literally")])
+        // Math outside the code span still parses.
+        XCTAssertTrue(MathInline.hasMath("code `$x$` then \\(y\\)"))
+    }
+
+    func testTextCommandPreservesInteriorWhitespace() {
+        XCTAssertEqual(LaTeXMath.parse("\\text{for all}"), [.text("for all")])
+        XCTAssertEqual(LaTeXMath.parse("\\operatorname{arg max}"), [.text("arg max")])
+    }
+
+    func testMarkdownEmphasisSurvivesAcrossInlineMath() {
+        let tokens = MathLineToken.tokens(from: "**energy \\(E\\) is conserved**")
+
+        // No literal emphasis markers leak into any word token.
+        for token in tokens {
+            if case .word(let w) = token.kind {
+                XCTAssertFalse(String(w.characters).contains("*"), "Unmatched markdown marker leaked")
+            }
+        }
+        // The math atom is preserved in place.
+        XCTAssertTrue(tokens.contains { if case .math("E") = $0.kind { return true } else { return false } })
+        // Emphasis is applied to the surrounding words (single parse context).
+        let anyStrong = tokens.contains { token in
+            if case .word(let w) = token.kind {
+                return w.runs.contains { $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true }
+            }
+            return false
+        }
+        XCTAssertTrue(anyStrong, "Bold spanning the math boundary should survive")
+    }
 }
